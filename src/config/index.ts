@@ -403,6 +403,10 @@ interface ConfigCoercions {
 
   // True when captureMode is not "ffmpeg" and must be forced. Chrome's native fMP4 MediaRecorder produces corrupt output after 20-30 minutes of recording.
   readonly forceFfmpegMode: boolean;
+
+  // True when the VAAPI capture backend is selected with a concurrency ceiling above one. That backend grabs a screen rectangle rather than a tab, and PrismCast
+  // shows one tab at a time in a shared window, so a second simultaneous capture would silently record the first one's video.
+  readonly pinSingleStream: boolean;
 }
 
 /**
@@ -430,7 +434,8 @@ function collectCoercions(config: Config): ConfigCoercions {
   return {
 
     captureCodecs: captureCodecsChanged ? normalizedCodecs : null,
-    forceFfmpegMode: config.streaming.captureMode !== "ffmpeg"
+    forceFfmpegMode: config.streaming.captureMode !== "ffmpeg",
+    pinSingleStream: (config.streaming.captureBackend === "vaapi") && (config.streaming.maxConcurrentStreams !== 1)
   };
 }
 
@@ -441,7 +446,7 @@ function collectCoercions(config: Config): ConfigCoercions {
  */
 function hasCoercions(coercions: ConfigCoercions): boolean {
 
-  return (coercions.captureCodecs !== null) || coercions.forceFfmpegMode;
+  return (coercions.captureCodecs !== null) || coercions.forceFfmpegMode || coercions.pinSingleStream;
 }
 
 /**
@@ -462,6 +467,13 @@ function applyCoercions(config: Config, coercions: ConfigCoercions): void {
     LOG.warn("Native capture mode is disabled due to a Chrome fMP4 MediaRecorder bug. Forcing FFmpeg capture mode.");
 
     config.streaming.captureMode = "ffmpeg";
+  }
+
+  if(coercions.pinSingleStream) {
+
+    LOG.warn("VAAPI capture records a screen region rather than a tab and cannot run concurrent captures. Limiting to a single concurrent stream.");
+
+    config.streaming.maxConcurrentStreams = 1;
   }
 }
 

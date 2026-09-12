@@ -2,13 +2,13 @@
  *
  * setup.ts: Common stream setup logic for PrismCast.
  */
+import type { AcquireCaptureStreamContext, CaptureStream, CaptureStreamOptions } from "../browser/index.ts";
 import type { Browser, Frame, Page } from "puppeteer-core";
 import { BrowserCaptureImpairedError, BrowserSupersededError, BrowserUnavailableError, acquireCaptureStream, confirmSharedWindowPlacement,
   emulateCaptureSurface, emulateLayoutSurface, getBrowserInstance, getCaptureImpairment, getCurrentBrowser, installActivationHeal,
   noteBrowserCaptureImpaired, registerManagedPage, resolveSharedWindowCarrier, setCaptureProbe, syncWindowVisibility,
   unregisterManagedPage } from "../browser/index.ts";
 import { CaptureAbandonedError, CaptureTurnTimeoutError, createCaptureLock } from "./captureLock.ts";
-import type { CaptureStream, CaptureStreamOptions } from "../browser/index.ts";
 import type { Clock, FFmpegProcess } from "../utils/index.ts";
 import { FINALIZE_SETTLE_DELAY, installManifestInterceptor } from "../browser/manifestInterceptor.ts";
 import { LOG, chromeFetch, delay, extractDomain, formatError, getStreamContext, maxRetryDuration, realClock, registerAbortController,
@@ -25,6 +25,7 @@ import type { CaptureSession } from "./captureSession.ts";
 import type { InitializePlaybackOptions } from "../browser/video.ts";
 import type { MonitorStreamInfo } from "./monitor.ts";
 import type { ProbeCacheIdentity } from "../native/probe.ts";
+import { acquireVaapiCaptureStream } from "../browser/vaapiCapture.ts";
 import { createCaptureSession } from "./captureSession.ts";
 import { getCachedEncryption } from "../native/probe.ts";
 import { getCaptureMimeType } from "./codec.ts";
@@ -549,8 +550,22 @@ export interface CreatePageWithCaptureDeps {
   readonly syncWindowVisibility: typeof syncWindowVisibility;
 }
 
-const defaultCreatePageWithCaptureDeps: CreatePageWithCaptureDeps = { acquireCaptureStream, emulateCaptureSurface, getCurrentBrowser, installActivationHeal,
-  openSharedWindowTab, reaffirmCaptureSurface, spawnFFmpeg, startOverlayHandling, syncWindowVisibility };
+/**
+ * Acquires a capture through whichever backend the configuration selects. Both satisfy the same contract, so nothing downstream of this call branches on the
+ * choice. The decision is made per acquisition rather than captured at module load, because a configuration save can change the backend while the process runs.
+ * @param page - The page to capture.
+ * @param options - What the capture is asked for.
+ * @param context - The clock, collaborators, and caller abort signal.
+ * @returns The started capture.
+ */
+async function acquireConfiguredCaptureStream(page: Page, options: CaptureStreamOptions,
+  context: AcquireCaptureStreamContext = {}): Promise<CaptureStream> {
+
+  return (CONFIG.streaming.captureBackend === "vaapi") ? acquireVaapiCaptureStream(page, options, context) : acquireCaptureStream(page, options, context);
+}
+
+const defaultCreatePageWithCaptureDeps: CreatePageWithCaptureDeps = { acquireCaptureStream: acquireConfiguredCaptureStream, emulateCaptureSurface,
+  getCurrentBrowser, installActivationHeal, openSharedWindowTab, reaffirmCaptureSurface, spawnFFmpeg, startOverlayHandling, syncWindowVisibility };
 
 /* The window-topology answers the open primitive needs and cannot reach for itself: tabSelection.ts speaks to the capture extension alone, so the CDP-side carrier
  * resolution and placement confirmation arrive from here, where both modules are already in view. One record, referenced by both call sites, because the two call

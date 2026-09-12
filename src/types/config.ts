@@ -305,6 +305,18 @@ export interface ServerConfig {
 export type CaptureMode = "ffmpeg" | "native";
 
 /**
+ * Which mechanism produces capture bytes.
+ *
+ * - "extension": Chrome's tab capture through the puppeteer-stream extension, encoded by MediaRecorder. Captures per tab, so several can run concurrently.
+ * - "vaapi": FFmpeg grabs the capture window off the X server and encodes it with VAAPI on the GPU. Captures a screen rectangle, so only one can run at a time.
+ *
+ * "vaapi" exists because Chrome's in-browser encoders are software-only on Linux - neither MediaRecorder nor WebCodecs will accept a hardware H.264 encoder there,
+ * whatever chrome://gpu reports - so the only way to reach the GPU's video engine is to encode outside the browser. It requires an X display, a VAAPI-capable GPU,
+ * and an FFmpeg built with both x11grab and h264_vaapi, and it pins maxConcurrentStreams to 1.
+ */
+export type CaptureBackend = "extension" | "vaapi";
+
+/**
  * Media streaming configuration controlling video capture quality, timeouts, and concurrency limits.
  */
 export interface StreamingConfig {
@@ -312,6 +324,11 @@ export interface StreamingConfig {
   // Audio bitrate in bits per second for the captured stream. Higher values improve audio quality but increase bandwidth requirements. 256kbps provides high-quality
   // stereo audio; lower values (128kbps) work for speech-heavy content. Environment variable: AUDIO_BITRATE. Default: 256000. Valid range: 32000-512000.
   audioBitsPerSecond: number;
+
+  // Which mechanism produces capture bytes. "extension" uses Chrome's tab capture and MediaRecorder, which encodes in software on Linux. "vaapi" grabs the capture
+  // window off the X server and encodes it on the GPU with FFmpeg, which is dramatically cheaper on CPU but captures a screen rectangle rather than a tab and so
+  // supports only one concurrent stream. Environment variable: CAPTURE_BACKEND. Default: "extension".
+  captureBackend: CaptureBackend;
 
   // Codecs allowed for browser capture. H.264 is always available as the universal baseline. HEVC provides better compression at the same bitrate when GPU hardware
   // encoding is available. The system selects the highest-priority allowed codec that the GPU supports. Environment variable: CAPTURE_CODECS. Default: ["h264", "hevc"].
@@ -345,6 +362,23 @@ export interface StreamingConfig {
   // Video quality preset that determines capture resolution. The preset controls the browser viewport dimensions used for video capture. Valid values: "480p",
   // "720p", "720p-high", "1080p", "1080p-high", "4k". Bitrate and frame rate can be customized independently. Environment variable: QUALITY_PRESET. Default: "720p-high".
   qualityPreset: string;
+
+  // PulseAudio source the VAAPI backend records audio from. "default" follows the system default sink's monitor, which on a dedicated capture display carries the
+  // browser's output. Ignored unless captureBackend is "vaapi". Environment variable: VAAPI_AUDIO_SOURCE. Default: "default".
+  vaapiAudioSource: string;
+
+  // FFmpeg binary the VAAPI backend grabs and encodes with, when it must differ from the one used to remux. The bundled Channels DVR build carries h264_vaapi but
+  // no x11grab, so on a system where that build is what gets resolved, screen capture needs a fuller FFmpeg named here. Empty means use the resolved binary.
+  // Ignored unless captureBackend is "vaapi". Environment variable: VAAPI_FFMPEG_PATH. Default: "".
+  vaapiFfmpegPath: string;
+
+  // DRM render node the VAAPI backend encodes on. Ignored unless captureBackend is "vaapi". Environment variable: VAAPI_DEVICE. Default: "/dev/dri/renderD128".
+  vaapiDevice: string;
+
+  // Constant quantizer for the VAAPI encoder, where lower is higher quality and larger output. The Gen9.5 low-power H.264 entrypoint supports no bitrate-targeted
+  // rate control, so quality is expressed as a quantizer rather than as a bitrate; videoBitsPerSecond does not apply to this backend. Ignored unless captureBackend
+  // is "vaapi". Environment variable: VAAPI_QP. Default: 23. Valid range: 1-51.
+  vaapiQp: number;
 
   // Video bitrate in bits per second for browser capture. This controls the quality of the stream captured by puppeteer-stream. For HLS output, FFmpeg copies
   // the video stream directly without re-encoding, preserving this quality. 8Mbps is suitable for 720p content; 15-20Mbps is recommended for 1080p. The actual

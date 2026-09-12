@@ -1124,6 +1124,15 @@ export function buildLaunchOptions(): LaunchOptions & { defaultViewport: null } 
       "--disable-background-networking",
       "--disable-background-timer-throttling",
       "--disable-backgrounding-occluded-windows",
+
+      /* Occlusion throttling has to be off for the same reason backgrounding does, and --disable-backgrounding-occluded-windows alone does not turn it off. On
+       * X11, CalculateNativeWinOcclusion stops the compositor producing frames for a window it judges covered or minimized - which the capture window is by
+       * design, since it is minimized whenever no capture is running and can sit behind other windows even while one is. Both capture paths read the compositor's
+       * output, so a throttled window yields roughly one frame every three to four seconds while audio keeps flowing: undersized segments, stall warnings, and
+       * choppy playback downstream. --disable-renderer-backgrounding covers the renderer-side half of the same behavior.
+       */
+      "--disable-features=CalculateNativeWinOcclusion",
+      "--disable-renderer-backgrounding",
       "--disable-blink-features=AutomationControlled",
       "--disable-notifications",
       "--hide-crash-restore-bubble",
@@ -2575,4 +2584,5 @@ export async function prepareExtension(): Promise<void> {
  * asks it for a browser.
  */
 export { acquireCaptureStream } from "./tabCapture.ts";
-export type { CaptureStream, CaptureStreamOptions } from "./tabCapture.ts";
+export type { AcquireCaptureStreamContext, CaptureStream, CaptureStreamOptions } from "./tabCapture.ts";
+export { acquireVaapiCaptureStream } from "./vaapiCapture.ts";

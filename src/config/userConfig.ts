@@ -567,6 +567,55 @@ export const CONFIG_METADATA: Record<string, SettingMetadata[]> = {
     },
     {
 
+      description: "Which mechanism produces capture bytes. Extension capture uses Chrome's tab capture, which encodes video in software on Linux. VAAPI capture " +
+        "grabs the capture window off the X server and encodes it on the GPU, using far less CPU, but records a screen rectangle rather than a tab and therefore " +
+        "supports only one concurrent stream. VAAPI requires an X display, a VAAPI-capable GPU, and an FFmpeg built with x11grab and h264_vaapi.",
+      envVar: "CAPTURE_BACKEND",
+      label: "Capture Backend",
+      path: "streaming.captureBackend",
+      type: "string",
+      validValues: [ "extension", "vaapi" ]
+    },
+    {
+
+      description: "PulseAudio source the VAAPI capture backend records audio from. \"default\" follows the system default sink's monitor. Only used when the " +
+        "capture backend is VAAPI.",
+      envVar: "VAAPI_AUDIO_SOURCE",
+      label: "VAAPI Audio Source",
+      path: "streaming.vaapiAudioSource",
+      type: "string"
+    },
+    {
+
+      description: "DRM render node the VAAPI capture backend encodes on. Only used when the capture backend is VAAPI.",
+      envVar: "VAAPI_DEVICE",
+      label: "VAAPI Device",
+      path: "streaming.vaapiDevice",
+      type: "string"
+    },
+    {
+
+      description: "FFmpeg binary the VAAPI capture backend grabs and encodes with, when it must differ from the binary used to remux. The FFmpeg bundled with " +
+        "Channels DVR includes the VAAPI encoder but not the X11 screen grabber, so on systems where that build is the one found, screen capture needs a fuller " +
+        "FFmpeg named here. Leave empty to use the same binary everything else does. Only used when the capture backend is VAAPI.",
+      envVar: "VAAPI_FFMPEG_PATH",
+      label: "VAAPI FFmpeg Path",
+      path: "streaming.vaapiFfmpegPath",
+      type: "string"
+    },
+    {
+
+      description: "Constant quantizer for the VAAPI encoder - lower means higher quality and a larger stream. The hardware low-power H.264 encoder supports no " +
+        "bitrate-targeted rate control, so VAAPI capture quality is set here rather than by the video bitrate. Only used when the capture backend is VAAPI.",
+      envVar: "VAAPI_QP",
+      label: "VAAPI Quantizer",
+      max: 51,
+      min: 1,
+      path: "streaming.vaapiQp",
+      type: "integer"
+    },
+    {
+
       description: "Video codecs allowed for browser capture. H.264 is always available as the universal baseline. Additional codecs require GPU hardware " +
         "encoding support - codecs without hardware support are shown as disabled.",
       envVar: "CAPTURE_CODECS",
@@ -1221,6 +1270,7 @@ export const DEFAULTS: Config = {
   streaming: {
 
     audioBitsPerSecond: 256000,
+    captureBackend: "extension",
     captureCodecs: [ "h264", "hevc" ],
     captureMode: "ffmpeg",
     frameRate: 60,
@@ -1228,6 +1278,10 @@ export const DEFAULTS: Config = {
     maxNavigationRetries: 4,
     navigationTimeout: 10000,
     qualityPreset: "720p-high",
+    vaapiAudioSource: "default",
+    vaapiDevice: "/dev/dri/renderD128",
+    vaapiFfmpegPath: "",
+    vaapiQp: 23,
     videoBitsPerSecond: 12000000,
     videoTimeout: 11000
   }
@@ -1607,7 +1661,7 @@ const SETTINGS_TAB_SECTIONS: { displayName: string; id: string; paths: string[] 
     displayName: "Capture",
     id: "capture",
     paths: [ "streaming.captureMode", "streaming.captureCodecs", "streaming.qualityPreset", "streaming.videoBitsPerSecond", "streaming.audioBitsPerSecond",
-      "streaming.frameRate" ]
+      "streaming.frameRate", "streaming.captureBackend", "streaming.vaapiDevice", "streaming.vaapiFfmpegPath", "streaming.vaapiQp", "streaming.vaapiAudioSource" ]
   },
   {
 

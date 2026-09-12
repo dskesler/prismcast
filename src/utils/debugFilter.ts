@@ -213,6 +213,7 @@ export interface DebugCategory {
  */
 export const DEBUG_CATEGORIES: readonly DebugCategory[] = [
 
+  { category: "browser:capture", description: "Capture backend selection and acquisition: VAAPI grab geometry, frame rate, display, and encoder start." },
   { category: "browser:consent", description: "Automatic consent/overlay handling: cookie-banner rejects, embed-gate accepts, per-site modal dismissals." },
   { category: "browser:lifecycle", description: "Browser lifecycle: launch, close, stale page cleanup, restart, per-capture-page surface emulation and re-affirmation." },
   { category: "browser:tabObserver", description: "Tab network observer: root CDP session creation, per-target attach and detach, disposal." },
