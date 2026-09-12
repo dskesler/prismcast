@@ -10,10 +10,11 @@ import type { Nullable } from "../types/index.ts";
 /* The Chrome DevTools Protocol (CDP) provides low-level access to Chrome's internal state and capabilities. While Puppeteer abstracts most common operations, some
  * features require direct CDP access:
  *
- * - Window presentation: moving the shared browser window between its normal and minimized states, and reading the state Chrome reports for it. That state is the
- *   only window property this application drives, and it is not cosmetic: Chrome's tab capture consumes the compositor's output for the shared window, and a
- *   minimized window's output is not composed for capture to read. Which state the window should be in is decided in one place, by decideWindowVisibility in
- *   windowSync.ts; these primitives only carry it out and report back what Chrome says came of it.
+ * - Window presentation: moving the shared browser window between its normal, minimized and full screen states, and reading the state Chrome reports for it. That
+ *   state is the only window property this application drives, and it is not cosmetic: Chrome's tab capture consumes the compositor's output for the shared
+ *   window, and a minimized window's output is not composed for capture to read, while the VAAPI capture backend records the display the window is presented on
+ *   and so needs it full screen. Which state the window should be in between streams is decided in one place, by decideWindowVisibility in windowSync.ts; these
+ *   primitives only carry it out and report back what Chrome says came of it.
  *
  * - Capture surface re-affirmation: re-issuing a capture page's own declared device metrics, which is what moves that capture's composition target back to the
  *   emulated surface.
@@ -199,7 +200,8 @@ export async function readWindowPlacement(page: Page): Promise<Nullable<WindowPl
 }
 
 /**
- * Minimizes the browser window, which keeps the desktop clear and the GPU idle while nothing is capturing. Only the window-visibility executor should call this:
+ * Minimizes the browser window, which keeps the desktop clear and the GPU idle while nothing is capturing. A window left full screen by a display-grabbing capture
+ * is restored first, because Chrome refuses a minimize issued straight at one. Only the window-visibility executor should call this:
  * the window has to stay on screen for as long as any capture stream is reading the compositor, and that decision belongs to decideWindowVisibility in
  * windowSync.ts.
  * @param page - The Puppeteer page object.
@@ -219,6 +221,15 @@ export async function minimizeWindow(page: Page): Promise<void> {
      * issued into that unfinished transition can be dropped, leaving the window on screen.
      */
     await delay(100);
+
+    /* A full screen window cannot be minimized directly - Chrome answers that command with "To minimize a fullscreen window, restore it to normal state first" -
+     * and the display-grabbing capture backend leaves the window full screen for the length of every stream, so the state this is asked to leave is routinely
+     * that one. The restore is issued blind rather than confirmed: the minimize that follows is what matters, and it carries its own settle.
+     */
+    if(await readWindowStateWith(session, windowId) === "fullscreen") {
+
+      await session.send("Browser.setWindowBounds", { bounds: { windowState: "normal" }, windowId });
+    }
 
     await session.send("Browser.setWindowBounds", {
 
@@ -275,6 +286,64 @@ export async function unminimizeWindow(page: Page, clock: Clock = realClock): Pr
       LOG.debug("browser:lifecycle", "The window reported its restore complete after %dms (%d reads).", clock.now() - startedAt, outcome.reads);
     }
   });
+}
+
+/**
+ * Presents the browser window full screen, which is what a display grab has to see. The VAAPI capture backend records the X display rather than the tab, so the
+ * page's presentation on that display is the capture: a window carrying its profile's persisted placement - small, offset, wearing its tab strip and toolbar -
+ * puts a shrunken page and a stretch of desktop into every frame. Full screen is the one window state that presents the page at the screen's own dimensions with
+ * no browser chrome around it, which on a display sized to the capture surface makes the grab a pixel-for-pixel read of the page.
+ *
+ * A window in a state Chrome will not leave directly is restored first: the protocol rejects a move out of minimized or maximized that does not pass through
+ * normal, and the capture window is routinely minimized between streams.
+ *
+ * The contract matches unminimizeWindow's - a confirmed state, or a warning and whatever state Chrome does report. A lapse leaves the capture running against a
+ * window that is merely not presented well, which is worth a warning and not worth failing a stream over.
+ * @param page - The Puppeteer page object.
+ * @param clock - Clock driving the confirmation cadence and its elapsed measurement. Defaults to realClock; tests inject a fake.
+ * @returns True when Chrome confirmed the window full screen, false when the confirmation lapsed or the page was gone.
+ */
+export async function fullscreenWindow(page: Page, clock: Clock = realClock): Promise<boolean> {
+
+  // Early exit if the page is already closed.
+  if(page.isClosed()) {
+
+    return false;
+  }
+
+  return (await withCDPSession(page, async (session, windowId) => {
+
+    /* Chrome will not move a window from minimized or maximized straight into another state, so the transition is staged through normal. The read costs one round
+     * trip and the restore is skipped for a window already in a state full screen can be reached from.
+     */
+    if([ "maximized", "minimized" ].includes(await readWindowStateWith(session, windowId) ?? "")) {
+
+      await unminimizeWindow(page, clock);
+    }
+
+    await session.send("Browser.setWindowBounds", {
+
+      bounds: { windowState: "fullscreen" },
+      windowId
+    });
+
+    // Confirm against Chrome's own report: the window manager is still working when the acknowledgement above arrives.
+    const startedAt = clock.now();
+    const outcome = await pollUntil({ cadenceMs: WINDOW_STATE_POLL_MS, ceilingMs: WINDOW_RESTORE_CEILING_MS, clock,
+      read: (): Promise<Nullable<string>> => readWindowStateWith(session, windowId), until: (state: Nullable<string>): boolean => state === "fullscreen" });
+
+    if(outcome.lapsed) {
+
+      LOG.warn("The browser window did not report itself full screen within %dms; the capture will include whatever the display shows instead.",
+        WINDOW_RESTORE_CEILING_MS, { windowState: outcome.value });
+
+      return false;
+    }
+
+    LOG.debug("browser:lifecycle", "The window reported itself full screen after %dms (%d reads).", clock.now() - startedAt, outcome.reads);
+
+    return true;
+  })) ?? false;
 }
 
 /**

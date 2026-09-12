@@ -7,9 +7,11 @@ import { LOG, formatError, realClock, resolveFFmpegPath, startTimer } from "../u
 import { CAPTURE_SOURCE_UNAVAILABLE_MESSAGE } from "../types/index.ts";
 import { CONFIG } from "../config/index.ts";
 import type { ChildProcess } from "node:child_process";
+import type { Clock } from "../utils/index.ts";
 import type { Nullable } from "../types/index.ts";
 import type { Page } from "puppeteer-core";
 import { PassThrough } from "node:stream";
+import { fullscreenWindow } from "./cdp.ts";
 import { spawn } from "node:child_process";
 
 /* This module is the second implementation of the capture contract that tabCapture.ts defines, and it exists because the first one cannot reach the GPU.
@@ -27,9 +29,11 @@ import { spawn } from "node:child_process";
  *
  * It captures a DISPLAY, not a tab. The whole screen is grabbed rather than a rectangle derived from the window, because a capture page's emulated surface and its
  * on-screen window are independent - Chrome renders the page at the emulated viewport whatever size the window happens to be - so a rectangle composed from the
- * window's origin and the surface's dimensions describes no real region and is rejected outright once it crosses a screen edge. What is actually on screen is the
- * browser, full-screened by the capture path, on a display the operator sized. So the display is what gets grabbed, and the deployment requirement is that the
- * browser owns it: a dedicated Xvfb or equivalent, not a desktop where other windows can overlap the capture.
+ * window's origin and the surface's dimensions describes no real region and is rejected outright once it crosses a screen edge. What is on screen instead is
+ * arranged to be the page and nothing else: presentCaptureDisplay puts the window full screen and brings the capture page to the front of it before the grab
+ * starts, and the window-visibility policy keeps it there for the length of the stream. So the display is what gets grabbed, and the deployment requirement is
+ * that the browser owns it - a display sized to the capture surface, with nothing else contending for the screen, screen blanking off, and no second window that
+ * can stack above the capture.
  *
  * It admits one capture at a time. PrismCast shows one tab at a time in a shared window, so a second simultaneous grab would record the first one's video. Config
  * validation pins maxConcurrentStreams to 1 whenever this backend is selected rather than letting that failure happen silently at the second tune.
@@ -118,6 +122,40 @@ export function buildVaapiCaptureArgs(options: CaptureStreamOptions, display: st
 }
 
 /**
+ * Presents a page as the display's whole content, which is the precondition every frame of this backend's output depends on.
+ *
+ * Two things have to be true, and neither is true of the window PrismCast keeps for tab capture. The window has to be full screen, or the grab returns a page
+ * shrunken into the profile's persisted placement with a tab strip above it and desktop around it. And the page has to be the front tab of a raised window, which
+ * is what activation buys: a fullscreen window the desktop stacks below its other windows returns those windows in the frames, and - measured on this hardware -
+ * a capture page that is not the visible tab never reaches a playable video at all, because the page is hidden and a provider's player will not start against a
+ * hidden document. Both were observed as distinct failures of the same tune: black frames from a fullscreen window nothing had raised, and a video that stayed at
+ * readyState 0 for the whole eleven-second wait until the tab was brought forward.
+ *
+ * Activation is this backend's own business rather than the window-visibility executor's, because it is the page that gets activated and only the caller holding
+ * the capture page knows which page that is. The executor resolves whatever page it can reach for its CDP session, which is routinely another one.
+ *
+ * Neither step is allowed to fail the capture. A grab against a badly presented display is a bad stream where a thrown error is no stream, and both primitives
+ * report their own faults.
+ * @param page - The capture page, which becomes the front tab of the full screen window.
+ * @param clock - Clock driving the full screen confirmation. Defaults to realClock; tests inject a fake.
+ */
+export async function presentCaptureDisplay(page: Page, clock: Clock = realClock): Promise<void> {
+
+  await fullscreenWindow(page, clock);
+
+  /* Raises the window and selects this tab within it. Puppeteer's activation is Page.bringToFront, which is the page-level command the tab-selection executor
+   * cannot express: that executor hands the selection back when its body ends, and this selection has to outlive the acquisition and hold for the stream.
+   */
+  try {
+
+    await page.bringToFront();
+  } catch(error) {
+
+    LOG.warn("VAAPI capture could not bring the capture page to the front; the grab will record whatever the display shows instead: %s.", formatError(error));
+  }
+}
+
+/**
  * Acquires a hardware-encoded screen capture for a page: an FFmpeg child grabbing the X display the browser is full-screened on and encoding it on the GPU, its
  * Matroska output arriving as a readable stream, and the two controls that end it.
  *
@@ -146,6 +184,16 @@ export async function acquireVaapiCaptureStream(page: Page, options: CaptureStre
   }
 
   const display = process.env["DISPLAY"] ?? ":0";
+
+  /* The grab reads the display, so the page's presentation on it is the capture. Left alone, the window wears the placement Chrome persisted for the profile -
+   * small, offset, and framed by a tab strip and toolbar - and the grab returns a shrunken page surrounded by desktop. Full screen presents the page at the
+   * screen's dimensions with no chrome around it, which on a display sized to the capture surface is the pixel-for-pixel read this backend is for.
+   *
+   * A window that will not confirm is not a reason to abandon the capture: a badly presented stream is still a stream, and the warning the presentation logs
+   * names the fault where a stream failure would not.
+   */
+  await presentCaptureDisplay(page, clock);
+
   const args = buildVaapiCaptureArgs(options, display);
   const stream = new PassThrough();
   const stopped = Promise.withResolvers<undefined>();

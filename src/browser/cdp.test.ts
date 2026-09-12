@@ -2,7 +2,8 @@
  *
  * cdp.test.ts: Unit tests for the Chrome DevTools Protocol helpers in cdp.ts. The module exports withCDPSession (the lifecycle wrapper around a CDP session
  * that surfaces the browser window ID), minimizeWindow (the one-shot that puts the shared window into its minimized state), unminimizeWindow (which commands the
- * restore and then confirms it against Chrome's own report), readWindowState (that report, read for a page), readWindowPlacement (the window's frame and state
+ * restore and then confirms it against Chrome's own report), fullscreenWindow (which stages the window out of a state Chrome will not leave directly, commands
+ * full screen, and confirms that the same way), readWindowState (that report, read for a page), readWindowPlacement (the window's frame and state
  * together, for a caller opening a second window in the same spot), and reaffirmCaptureSurface (the raw re-issue of a capture page's declared device metrics).
  * The tests use plain stub objects shaped per the Page and CDPSession contracts - no real browser is launched, and the window's dimensions enter the picture
  * only through the placement read, because the two window primitives drive presentation state alone. Which state the window should be in is decided in
@@ -10,8 +11,8 @@
  * the report it gets.
  */
 import type { CDPSession, Page } from "puppeteer-core";
-import { WINDOW_RESTORE_CEILING_MS, WINDOW_STATE_POLL_MS, minimizeWindow, readWindowPlacement, readWindowState, reaffirmCaptureSurface, unminimizeWindow,
-  withCDPSession } from "./cdp.ts";
+import { WINDOW_RESTORE_CEILING_MS, WINDOW_STATE_POLL_MS, fullscreenWindow, minimizeWindow, readWindowPlacement, readWindowState, reaffirmCaptureSurface,
+  unminimizeWindow, withCDPSession } from "./cdp.ts";
 import { describe, test } from "node:test";
 import { makeAdvancingClock, makeFakeClock } from "../utils/clock.helpers.ts";
 import type { LogEntry } from "../utils/logEmitter.ts";
@@ -254,15 +255,21 @@ describe("minimizeWindow", () => {
     assert.deepEqual(bounds, { windowState: "minimized" }, "the call carries the minimized state and nothing else");
   });
 
-  test("never reads the window bounds back (nothing is being verified)", async () => {
+  test("reads the window state once, and never reads it back to verify the minimize", async () => {
 
-    // A read-back would only be worth its round trip if there were a resize to confirm. There is not: the command carries a window state and nothing else, so a
-    // getWindowBounds call here would cost latency on every pass and tell the caller nothing.
+    /* The one read is the state the command has to leave, not a confirmation of where it lands: Chrome refuses a minimize aimed at a full screen window, so the
+     * restore ahead of it is conditioned on that read. Nothing is verified afterwards - the command carries a window state and no dimensions, so a read-back
+     * would cost latency on every pass and tell the caller nothing.
+     */
     const cdpStub = makeCdpStub();
 
     await minimizeWindow(makePageStub({ cdpStub }));
 
-    assert.equal(cdpStub.calls.filter((c) => c.method === "Browser.getWindowBounds").length, 0, "no bounds read-back");
+    const reads = cdpStub.calls.filter((call) => call.method === "Browser.getWindowBounds");
+    const lastCall = cdpStub.calls.at(-1);
+
+    assert.equal(reads.length, 1, "exactly one state read, taken before the command");
+    assert.equal(lastCall?.method, "Browser.setWindowBounds", "the minimize is the last thing issued: nothing is read back after it");
   });
 
   test("never measures the page (the window's content size is not an input)", async () => {
@@ -319,6 +326,38 @@ describe("minimizeWindow", () => {
     });
 
     await assert.doesNotReject(() => minimizeWindow(makePageStub({ cdpStub })), "minimizeWindow should swallow CDP errors");
+  });
+});
+
+describe("minimizeWindow - leaving full screen", () => {
+
+  test("restores a full screen window to normal before minimizing it", async () => {
+
+    /* Chrome refuses a minimize issued straight at a full screen window, and the display-grabbing capture backend leaves the window full screen for the length of
+     * every stream - so the state this has to leave is routinely that one, and the restore ahead of it is what makes the minimize land.
+     */
+    const router = windowStateRouter(["fullscreen"]);
+    const cdpStub = makeCdpStub({ overrideSend: router.send });
+
+    await minimizeWindow(makePageStub({ cdpStub }));
+
+    const states = cdpStub.calls.filter((call) => call.method === "Browser.setWindowBounds")
+      .map((call) => (call.params as { bounds?: { windowState?: string } }).bounds?.windowState);
+
+    assert.deepEqual(states, [ "normal", "minimized" ], "the restore precedes the minimize");
+  });
+
+  test("minimizes a window already on screen with one command", async () => {
+
+    // The read is what the restore is conditioned on, so a window in any other state pays for it and nothing else.
+    const cdpStub = makeCdpStub();
+
+    await minimizeWindow(makePageStub({ cdpStub }));
+
+    const states = cdpStub.calls.filter((call) => call.method === "Browser.setWindowBounds")
+      .map((call) => (call.params as { bounds?: { windowState?: string } }).bounds?.windowState);
+
+    assert.deepEqual(states, ["minimized"], "no restore is issued for a window that is not full screen");
   });
 });
 
@@ -474,6 +513,93 @@ describe("unminimizeWindow", () => {
     assert.equal(reads, 2, "the poll reached the rejecting read");
     assert.equal(warnings.length, 1, "exactly one warning");
     assert.match(warnings[0]?.message ?? "", /CDP operation failed/, "the rejection took the existing swallow-with-warn path");
+  });
+});
+
+describe("fullscreenWindow", () => {
+
+  test("returns false for an already closed page, with no CDP traffic", async () => {
+
+    const cdpStub = makeCdpStub();
+
+    assert.equal(await fullscreenWindow(makePageStub({ cdpStub, isClosedReturn: true })), false, "a closed page cannot be presented");
+    assert.equal(cdpStub.calls.length, 0, "no CDP calls for a closed page");
+  });
+
+  test("commands full screen and confirms it against Chrome's report", async () => {
+
+    // The window is already in a state full screen can be reached from, so the staging restore is skipped and the command goes out on its own.
+    const router = windowStateRouter([ "normal", "fullscreen" ]);
+    const cdpStub = makeCdpStub({ overrideSend: router.send });
+    const { clock, sleeps } = makeFakeClock();
+
+    assert.equal(await fullscreenWindow(makePageStub({ cdpStub }), clock), true, "a confirmed presentation reports true");
+
+    const setBoundsCalls = cdpStub.calls.filter((call) => call.method === "Browser.setWindowBounds");
+
+    assert.equal(setBoundsCalls.length, 1, "exactly one setWindowBounds call");
+    assert.equal((setBoundsCalls[0]?.params as { bounds?: { windowState?: string } }).bounds?.windowState, "fullscreen", "windowState: fullscreen applied");
+    assert.deepEqual(sleeps, [], "no cadence sleep is paid when the first confirmation read already reports full screen");
+  });
+
+  test("stages a minimized window through normal before commanding full screen", async () => {
+
+    /* Chrome refuses a move out of minimized that does not pass through normal, and the capture window is minimized between streams - so this is the ordinary
+     * path, not an edge case. The two commands and their order are what the row locks.
+     */
+    const router = windowStateRouter([ "minimized", "normal", "fullscreen" ]);
+    const cdpStub = makeCdpStub({ overrideSend: router.send });
+    const { clock } = makeFakeClock();
+
+    assert.equal(await fullscreenWindow(makePageStub({ cdpStub }), clock), true, "the staged transition still confirms");
+
+    const states = cdpStub.calls.filter((call) => call.method === "Browser.setWindowBounds")
+      .map((call) => (call.params as { bounds?: { windowState?: string } }).bounds?.windowState);
+
+    assert.deepEqual(states, [ "normal", "fullscreen" ], "the restore precedes the full screen command");
+  });
+
+  test("stops at the ceiling, warns, and reports false", async () => {
+
+    /* A window manager that will not present the window full screen leaves the grab recording whatever the display shows. That is worth naming in the log and
+     * worth reporting to the backend, and not worth failing a stream over - so the call returns rather than throwing.
+     */
+    const router = windowStateRouter(["normal"]);
+    const cdpStub = makeCdpStub({ overrideSend: router.send });
+    const { clock } = makeAdvancingClock();
+
+    let presented: Nullable<boolean> = null;
+
+    const warnings = await captureWarnings(async () => {
+
+      presented = await fullscreenWindow(makePageStub({ cdpStub }), clock);
+    });
+
+    assert.equal(presented, false, "an unconfirmed presentation reports false");
+    assert.equal(warnings.length, 1, "exactly one warning");
+    assert.match(warnings[0]?.message ?? "", /did not report itself full screen within 2000ms/, "the warning names the presentation and its bound");
+    assert.match(warnings[0]?.message ?? "", /normal/, "the warning carries the state Chrome is reporting");
+  });
+
+  test("absorbs a CDP rejection and reports false", async () => {
+
+    const cdpStub = makeCdpStub({
+
+      overrideSend: async (method): Promise<unknown> => {
+
+        if(method === "Browser.getWindowForTarget") {
+
+          return { windowId: 7 };
+        }
+
+        throw new Error("synthetic CDP rejection");
+      }
+    });
+
+    await captureWarnings(async () => {
+
+      assert.equal(await fullscreenWindow(makePageStub({ cdpStub })), false, "a rejected command reports false rather than throwing");
+    });
   });
 });
 

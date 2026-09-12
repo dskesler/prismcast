@@ -7,11 +7,17 @@
  * window therefore stays visible for as long as any capture stream is alive, and returns to minimized once none are - which is also what login mode needs, for the
  * unrelated reason that a human has to interact with the window.
  *
- * The decision is a pure function over those two inputs, and every caller reaches it through one serialized executor. That shape is deliberate: window presentation
+ * A capture backend that records the display rather than the tab asks for more than presence: what that grab returns is whatever the screen shows, so the window
+ * has to be full screen for the frames to be the page and nothing else. The backend presents the window itself before its first frame, because a grab that starts
+ * against a restored window records the desktop until something else settles it - but every pass after that runs through here, and a policy that knew only
+ * "on screen" answered a mid-stream pass with a restore that shrank the window back out of full screen. Both halves of that are the same question, so both are
+ * answered by the same policy.
+ *
+ * The decision is a pure function over those inputs, and every caller reaches it through one serialized executor. That shape is deliberate: window presentation
  * is a single shared resource driven from every lifecycle transition there is (startup, establishment, teardown, recovery, precaching, login, restart, native
  * upgrade), and gating each of those call sites individually is what let a stale decision land after a fresh one. Here a decision cannot be older than the command
- * that carries it, because both inputs are read once inside the serialized loop, immediately before the commands that act on them. The asymmetric latencies of the
- * two window primitives - the minimize path waits for the window manager to settle, the un-minimize path does not - stop mattering for the same reason.
+ * that carries it, because every input is read once inside the serialized loop, immediately before the commands that act on them. The asymmetric latencies of
+ * the window primitives - the minimize path waits for the window manager to settle, the un-minimize path does not - stop mattering for the same reason.
  *
  * There is no timer and no polling. Triggers are events: a stream registers, a stream unregisters, a mode flips, login starts or ends. Convergence comes from the
  * drain loop, which keeps passing until no request is outstanding.
@@ -26,17 +32,23 @@ import type { Page } from "puppeteer-core";
 // Types.
 
 /**
- * The two presentation states this application drives the shared browser window between.
+ * The presentation states this application drives the shared browser window between.
  */
-export type WindowVisibility = "minimized" | "normal";
+export type WindowVisibility = "fullscreen" | "minimized" | "normal";
 
 /**
  * The collaborators the executor composes on. Every member is injected so the executor can be driven with fakes at its own boundary, with no browser in the process.
  */
 export interface WindowSyncDeps {
 
+  // Presents the window full screen, which is what a display-grabbing capture backend needs to see.
+  readonly fullscreen: (page: Page) => Promise<void>;
+
   // Reports whether any stream is currently in capture mode. Read fresh on every pass.
   readonly hasActiveCaptureStreams: () => boolean;
+
+  // Reports whether the configured capture backend records the display rather than the tab. Read fresh on every pass, alongside the other policy inputs.
+  readonly isDisplayCapture: () => boolean;
 
   // Reports whether a user is authenticating in the browser window. Read fresh on every pass.
   readonly isLoginModeActive: () => boolean;
@@ -61,17 +73,32 @@ export interface WindowSyncDeps {
 // Functions.
 
 /**
- * Decides how the shared browser window should be presented. This is the single owner of that policy: either reason to be on screen wins, and the window is
- * minimized only when neither holds.
- * @param options - The two live inputs the decision reads.
+ * Decides how the shared browser window should be presented. This is the single owner of that policy: any reason to be on screen wins, and the window is minimized
+ * only when none holds.
+ *
+ * Login outranks capture where the two disagree. A human completing a provider's sign-in needs the window's own chrome - its address bar, its dialogs, its other
+ * tabs - and full screen takes exactly that away, where a capture presented in a normal window is merely a worse capture for as long as the sign-in lasts.
+ * @param options - The live inputs the decision reads.
  * @param options.captureActive - Whether any capture stream is active. Capture reads the compositor's output for this window, which is only composed correctly
  * while the window is presented.
+ * @param options.displayCapture - Whether the capture backend grabs the display rather than the tab, which makes the window's presentation the capture itself
+ * rather than a precondition for it.
  * @param options.loginActive - Whether a user is authenticating in the window and needs to see and click it.
  * @returns The presentation state the window should be in.
  */
-export function decideWindowVisibility(options: { captureActive: boolean; loginActive: boolean }): WindowVisibility {
+export function decideWindowVisibility(options: { captureActive: boolean; displayCapture: boolean; loginActive: boolean }): WindowVisibility {
 
-  return (options.captureActive || options.loginActive) ? "normal" : "minimized";
+  if(options.loginActive) {
+
+    return "normal";
+  }
+
+  if(!options.captureActive) {
+
+    return "minimized";
+  }
+
+  return options.displayCapture ? "fullscreen" : "normal";
 }
 
 /**
@@ -141,15 +168,29 @@ export function createWindowVisibilitySync(deps: WindowSyncDeps): (page?: Page) 
          * screen costs a single state read.
          */
         const captureActive = deps.hasActiveCaptureStreams();
+        const displayCapture = deps.isDisplayCapture();
         const loginActive = deps.isLoginModeActive();
-        const visibility = decideWindowVisibility({ captureActive, loginActive });
+        const visibility = decideWindowVisibility({ captureActive, displayCapture, loginActive });
 
-        if(visibility === "normal") {
+        switch(visibility) {
 
-          await deps.unminimize(resolution.page);
-        } else {
+          case "fullscreen":
 
-          await deps.minimize(resolution.page);
+            await deps.fullscreen(resolution.page);
+
+            break;
+
+          case "normal":
+
+            await deps.unminimize(resolution.page);
+
+            break;
+
+          default:
+
+            await deps.minimize(resolution.page);
+
+            break;
         }
 
         /* A page that died under the command took the command with it - the CDP layer swallows anything issued into a detaching target, and a terminating stream

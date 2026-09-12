@@ -6,11 +6,13 @@
  * CPU-side pixel format conversion are the only combination the Gen9.5 low-power H.264 entrypoint accepts, so a change to either is a regression that would
  * otherwise surface only as a failed encoder open on real hardware.
  */
-import { VAAPI_PIXEL_FORMAT, VAAPI_RC_MODE, buildVaapiCaptureArgs, toX11GrabInput } from "./vaapiCapture.ts";
+import { VAAPI_PIXEL_FORMAT, VAAPI_RC_MODE, buildVaapiCaptureArgs, presentCaptureDisplay, toX11GrabInput } from "./vaapiCapture.ts";
 import { describe, test } from "node:test";
 import { CONFIG } from "../config/index.ts";
 import type { CaptureStreamOptions } from "./tabCapture.ts";
+import type { Page } from "puppeteer-core";
 import assert from "node:assert/strict";
+import { makeFakeClock } from "../utils/clock.helpers.ts";
 
 /* Reads the value FFmpeg would take for a flag, so an assertion names the flag it cares about rather than an index into the vector. Returns null when the flag is
  * absent, which is the distinction several tests below turn on.
@@ -130,5 +132,99 @@ describe("buildVaapiCaptureArgs", () => {
 
     assert.equal(valueOf(buildVaapiCaptureArgs(makeOptions({ audioBitsPerSecond: undefined }), ":0"), "-b:a"),
       String(CONFIG.streaming.audioBitsPerSecond));
+  });
+});
+
+/* A Page double carrying only what the presentation touches: the closed test both window primitives take first, the CDP session the full screen command goes out
+ * on, and the activation. Every call is recorded in order, because the order is the contract - a page brought to the front of a window that is not yet full screen
+ * is a raised small window, which is exactly the frame this backend must not produce.
+ */
+function makePresentationPage(options: { bringToFrontError?: Error; windowStates?: readonly string[] } = {}): { calls: string[]; page: Page } {
+
+  const calls: string[] = [];
+  const states = options.windowStates ?? [ "normal", "fullscreen" ];
+
+  let reads = 0;
+
+  const session = {
+
+    detach: async (): Promise<void> => undefined,
+    send: async (method: string, params?: unknown): Promise<unknown> => {
+
+      if(method === "Browser.getWindowForTarget") {
+
+        return { windowId: 7 };
+      }
+
+      if(method === "Browser.getWindowBounds") {
+
+        const state = states[Math.min(reads, states.length - 1)];
+
+        reads++;
+
+        return { bounds: { windowState: state } };
+      }
+
+      if(method === "Browser.setWindowBounds") {
+
+        calls.push("setWindowBounds:" + String((params as { bounds?: { windowState?: string } }).bounds?.windowState));
+      }
+
+      return undefined;
+    }
+  };
+
+  const page = {
+
+    bringToFront: async (): Promise<void> => {
+
+      calls.push("bringToFront");
+
+      if(options.bringToFrontError) {
+
+        throw options.bringToFrontError;
+      }
+    },
+    createCDPSession: async (): Promise<unknown> => session,
+    isClosed: (): boolean => false
+  };
+
+  return { calls, page: page as unknown as Page };
+}
+
+describe("presentCaptureDisplay", () => {
+
+  test("puts the window full screen before bringing the page to the front", async () => {
+
+    /* Both steps, in this order. The grab reads the display, so a page that is not the front tab of a raised full screen window puts something else in the frames
+     * - and a hidden capture page does not merely look wrong, it never reaches a playable video at all.
+     */
+    const { calls, page } = makePresentationPage();
+    const { clock } = makeFakeClock();
+
+    await presentCaptureDisplay(page, clock);
+
+    assert.deepEqual(calls, [ "setWindowBounds:fullscreen", "bringToFront" ], "the window is presented, then the page is raised into it");
+  });
+
+  test("stages a minimized window through normal on the way to full screen", async () => {
+
+    // The window is minimized between streams, and Chrome refuses a move out of that state that does not pass through normal.
+    const { calls, page } = makePresentationPage({ windowStates: [ "minimized", "normal", "fullscreen" ] });
+    const { clock } = makeFakeClock();
+
+    await presentCaptureDisplay(page, clock);
+
+    assert.deepEqual(calls, [ "setWindowBounds:normal", "setWindowBounds:fullscreen", "bringToFront" ], "the restore precedes the full screen command");
+  });
+
+  test("a failed activation warns and returns rather than failing the capture", async () => {
+
+    // A badly presented grab is a bad stream; a thrown error here is no stream. The fault is named in the log and the capture proceeds.
+    const { calls, page } = makePresentationPage({ bringToFrontError: new Error("synthetic activation failure") });
+    const { clock } = makeFakeClock();
+
+    await assert.doesNotReject(() => presentCaptureDisplay(page, clock), "the presentation absorbs an activation failure");
+    assert.deepEqual(calls, [ "setWindowBounds:fullscreen", "bringToFront" ], "the activation was attempted");
   });
 });

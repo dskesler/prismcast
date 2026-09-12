@@ -7,12 +7,12 @@ import type { BrowserLifecycle, BrowserPurpose, CaptureImpairment } from "./brow
 import type { Clock, ProcessInfo } from "../utils/index.ts";
 import { LOG, boundedWait, evaluateWithAbort, formatError, isProcessRunning, listProcesses, realClock, setChromeUserAgent, startTimer } from "../utils/index.ts";
 import { clearLoginState, isLoginModeActive, setBrowserAccessors } from "./login.ts";
+import { fullscreenWindow, minimizeWindow, readWindowPlacement, reaffirmCaptureSurface, unminimizeWindow, withCDPSession } from "./cdp.ts";
 import { getAllStreams, getStreamCount, hasActiveCaptureStreams, isCaptureIdentity } from "../streaming/registry.ts";
 import { getCachedTabId, installStrayOpenTabReaper, onTabActivation } from "./tabSelection.ts";
 import { getChromeDataDir, getDataDir, getExtensionDir } from "../config/paths.ts";
 import { getExtensionPage, launch } from "puppeteer-stream";
 import { getGpuCapabilities, setGpuCapabilities } from "./display.ts";
-import { minimizeWindow, readWindowPlacement, reaffirmCaptureSurface, unminimizeWindow, withCDPSession } from "./cdp.ts";
 import { CONFIG } from "../config/index.ts";
 import { EXTENSION_READY_EXPRESSION } from "./tabCapture.ts";
 import type { GpuCapabilities } from "./display.ts";
@@ -441,7 +441,19 @@ export type { BrowserPurpose, CaptureImpairment } from "./browserSupervisor.ts";
  */
 const windowVisibilitySync = createWindowVisibilitySync({
 
+  /* Wrapped rather than passed directly: the primitive reports whether Chrome confirmed the state, which its other caller - the VAAPI backend, presenting the
+   * window before its first frame - reads, and the executor has no use for. A pass that could not present the window has nothing further to do about it either
+   * way, and the primitive has already logged the fault.
+   */
+  fullscreen: async (page: Page): Promise<void> => {
+
+    await fullscreenWindow(page);
+  },
   hasActiveCaptureStreams,
+
+  // The VAAPI backend grabs the display, so its capture is the window's presentation rather than something composed behind it. Read fresh on every pass, because
+  // configuration can change under a running browser.
+  isDisplayCapture: (): boolean => CONFIG.streaming.captureBackend === "vaapi",
   isLoginModeActive,
   isShuttingDown: isGracefulShutdown,
   minimize: minimizeWindow,

@@ -7,11 +7,11 @@
  * builds an instance with recording fakes, and the primitives are held open with deferred promises where the order of "the command was issued" against "the caller's
  * promise resolved" is the thing under assertion - a microtask coincidence would otherwise let a broken drain look correct.
  */
+import type { WindowSyncDeps, WindowVisibility } from "./windowSync.ts";
 import { createWindowVisibilitySync, decideWindowVisibility } from "./windowSync.ts";
 import { describe, test } from "node:test";
 import type { Nullable } from "../types/index.ts";
 import type { Page } from "puppeteer-core";
-import type { WindowSyncDeps } from "./windowSync.ts";
 import assert from "node:assert/strict";
 
 /**
@@ -57,6 +57,7 @@ function makePage(name: string, closed = false): PageDouble {
 interface Harness {
 
   captureActive: boolean;
+  displayCapture: boolean;
   disposals: string[];
   loginActive: boolean;
   ops: string[];
@@ -69,6 +70,8 @@ interface Harness {
  * an input between passes exactly as production state does.
  * @param options - The resolver behavior and any starting input values.
  * @param options.captureActive - Whether the capture predicate starts out true.
+ * @param options.displayCapture - Whether the backend predicate starts out true, which is what takes an active capture to full screen rather than normal.
+ * @param options.fullscreen - Extra behavior to run after the fullscreen command is recorded, used to hold a pass open.
  * @param options.loginActive - Whether the login predicate starts out true.
  * @param options.minimize - Extra behavior to run after the minimize command is recorded, used to hold a pass open.
  * @param options.resolve - The page resolver, receiving the preferred page and the harness so it can record and steer.
@@ -77,6 +80,8 @@ interface Harness {
  */
 function makeHarness(options: {
   captureActive?: boolean;
+  displayCapture?: boolean;
+  fullscreen?: (page: Page, harness: Harness) => Promise<void>;
   loginActive?: boolean;
   minimize?: (page: Page, harness: Harness) => Promise<void>;
   resolve?: (preferred: Nullable<Page>, harness: Harness) => Nullable<{ dispose: Nullable<() => Promise<void>>; page: Page }>;
@@ -86,6 +91,7 @@ function makeHarness(options: {
   const harness: Harness = {
 
     captureActive: options.captureActive ?? false,
+    displayCapture: options.displayCapture ?? false,
     disposals: [],
     loginActive: options.loginActive ?? false,
     ops: [],
@@ -97,7 +103,17 @@ function makeHarness(options: {
 
   const deps: WindowSyncDeps = {
 
+    fullscreen: async (page: Page): Promise<void> => {
+
+      harness.ops.push("fullscreen:" + (page as unknown as PageDouble).name);
+
+      if(options.fullscreen) {
+
+        await options.fullscreen(page, harness);
+      }
+    },
     hasActiveCaptureStreams: (): boolean => harness.captureActive,
+    isDisplayCapture: (): boolean => harness.displayCapture,
     isLoginModeActive: (): boolean => harness.loginActive,
     isShuttingDown: (): boolean => harness.shuttingDown,
     minimize: async (page: Page): Promise<void> => {
@@ -143,11 +159,12 @@ function makeHarness(options: {
  */
 function assertResolvedHonored(harness: Harness, context: string): void {
 
-  const expected = decideWindowVisibility({ captureActive: harness.captureActive, loginActive: harness.loginActive });
+  const expected = decideWindowVisibility({ captureActive: harness.captureActive, displayCapture: harness.displayCapture, loginActive: harness.loginActive });
+  const commands: Record<WindowVisibility, string> = { fullscreen: "fullscreen", minimized: "minimize", normal: "unminimize" };
   const issued = harness.ops.at(-1);
 
   assert.ok(issued, context + ": a pass issued a command before the caller resolved");
-  assert.ok(issued.startsWith((expected === "normal") ? "unminimize" : "minimize"),
+  assert.ok(issued.startsWith(commands[expected]),
     context + ": the command issued last agrees with the decision for the inputs at resolution, not an older one");
 }
 
@@ -155,18 +172,21 @@ describe("decideWindowVisibility", () => {
 
   test("capture and login both active yields normal", () => {
 
-    assert.equal(decideWindowVisibility({ captureActive: true, loginActive: true }), "normal", "either reason alone suffices, so both certainly do");
+    assert.equal(decideWindowVisibility({ captureActive: true, displayCapture: false, loginActive: true }), "normal",
+      "either reason alone suffices, so both certainly do");
   });
 
   test("capture alone yields normal", () => {
 
     // Tab capture consumes the compositor's output for this window, which is only composed for capture to read while the window is presented.
-    assert.equal(decideWindowVisibility({ captureActive: true, loginActive: false }), "normal", "a capture stream holds the window on screen");
+    assert.equal(decideWindowVisibility({ captureActive: true, displayCapture: false, loginActive: false }), "normal",
+      "a capture stream holds the window on screen");
   });
 
   test("login alone yields normal", () => {
 
-    assert.equal(decideWindowVisibility({ captureActive: false, loginActive: true }), "normal", "a user authenticating holds the window on screen");
+    assert.equal(decideWindowVisibility({ captureActive: false, displayCapture: false, loginActive: true }), "normal",
+      "a user authenticating holds the window on screen");
   });
 
   test("neither yields minimized", () => {
@@ -175,7 +195,30 @@ describe("decideWindowVisibility", () => {
      * compositor, so hasActiveCaptureStreams reads false for them and the window stays minimized. A naive "any stream present" check would take this arm to normal
      * and hold the window on screen for streams that have no use for it.
      */
-    assert.equal(decideWindowVisibility({ captureActive: false, loginActive: false }), "minimized", "with no reason to be on screen the window minimizes");
+    assert.equal(decideWindowVisibility({ captureActive: false, displayCapture: false, loginActive: false }), "minimized",
+      "with no reason to be on screen the window minimizes");
+  });
+
+  test("a display-grabbing backend takes an active capture to full screen", () => {
+
+    // The grab returns what the screen shows, so a window merely on screen puts its own chrome and a stretch of desktop into every frame.
+    assert.equal(decideWindowVisibility({ captureActive: true, displayCapture: true, loginActive: false }), "fullscreen",
+      "a display grab needs the page presented at the screen's own dimensions");
+  });
+
+  test("login outranks a display-grabbing capture", () => {
+
+    /* Full screen hides the address bar, the dialogs and the other tabs a sign-in needs, so the human wins the window for as long as the sign-in lasts and the
+     * capture is merely presented worse.
+     */
+    assert.equal(decideWindowVisibility({ captureActive: true, displayCapture: true, loginActive: true }), "normal",
+      "a user authenticating gets the window's own chrome back");
+  });
+
+  test("a display-grabbing backend minimizes with no capture to present", () => {
+
+    assert.equal(decideWindowVisibility({ captureActive: false, displayCapture: true, loginActive: false }), "minimized",
+      "the backend changes how a capture is presented, not whether an idle window stays on screen");
   });
 });
 

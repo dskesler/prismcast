@@ -568,8 +568,10 @@ export const CONFIG_METADATA: Record<string, SettingMetadata[]> = {
     {
 
       description: "Which mechanism produces capture bytes. Extension capture uses Chrome's tab capture, which encodes video in software on Linux. VAAPI capture " +
-        "grabs the capture window off the X server and encodes it on the GPU, using far less CPU, but records a screen rectangle rather than a tab and therefore " +
-        "supports only one concurrent stream. VAAPI requires an X display, a VAAPI-capable GPU, and an FFmpeg built with x11grab and h264_vaapi.",
+        "grabs the browser's display off the X server and encodes it on the GPU, using far less CPU, but records a screen rather than a tab and therefore supports " +
+        "only one concurrent stream. VAAPI requires an X display, a VAAPI-capable GPU, and an FFmpeg built with x11grab and h264_vaapi - and the browser has to own " +
+        "that display: the window is presented full screen and brought to the front while a stream runs, so the display should be sized to the quality preset, " +
+        "carry nothing else that can stack above the capture, and never blank.",
       envVar: "CAPTURE_BACKEND",
       label: "Capture Backend",
       path: "streaming.captureBackend",
