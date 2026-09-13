@@ -2,7 +2,8 @@
  *
  * decrypt.ts: AES-128 key fetching and segment decryption for native HLS streaming.
  */
-import { LOG, chromeFetch } from "../utils/index.ts";
+import { LOG, chromeFetch, timeoutSignal } from "../utils/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import { createDecipheriv } from "node:crypto";
 
@@ -18,20 +19,34 @@ import { createDecipheriv } from "node:crypto";
 const KEY_FETCH_TIMEOUT = 10000;
 
 /**
+ * What a key fetch needs beyond the key's own URL: the time source its bound arms on, and the caller's own cancellation.
+ */
+export interface KeyFetchOptions {
+
+  // The clock the key fetch's bound arms on. Defaults to the system clock, so a caller that holds no clock of its own omits it.
+  readonly clock?: Clock;
+
+  // The caller's cancellation signal, composed with the bound so the fetch ends on whichever of the two fires first.
+  readonly signal?: AbortSignal;
+}
+
+/**
  * Fetches an AES-128 decryption key from the given URL. The caller may supply a cancellation signal, which is composed with this fetch's own timeout so the key
  * ends on whichever arrives first - the caller's teardown or the timeout. Cancellation is the caller's policy and the timeout is this fetcher's, so neither has
  * to know about the other: a caller with nothing to cancel simply omits the signal and gets the timeout alone.
  *
  * @param keyUrl - The key URL from the #EXT-X-KEY URI attribute.
- * @param abortSignal - Optional cancellation signal from the caller, composed with the key fetch timeout.
+ * @param options - The clock the key fetch's bound arms on and the caller's cancellation signal, composed with that bound.
  * @returns The 16-byte decryption key, or null if the fetch fails.
  */
-export async function fetchDecryptionKey(keyUrl: string, abortSignal?: AbortSignal): Promise<Nullable<Buffer>> {
+export async function fetchDecryptionKey(keyUrl: string, options: KeyFetchOptions = {}): Promise<Nullable<Buffer>> {
+
+  const { clock, signal } = options;
+  const bound = timeoutSignal(KEY_FETCH_TIMEOUT, { clock });
 
   try {
 
-    const timeout = AbortSignal.timeout(KEY_FETCH_TIMEOUT);
-    const response = await chromeFetch(keyUrl, { signal: abortSignal ? AbortSignal.any([ abortSignal, timeout ]) : timeout });
+    const response = await chromeFetch(keyUrl, { signal: signal ? AbortSignal.any([ signal, bound.signal ]) : bound.signal });
 
     if(!response.ok) {
 
@@ -57,6 +72,9 @@ export async function fetchDecryptionKey(keyUrl: string, abortSignal?: AbortSign
     LOG.debug("native:decrypt", "Decryption key fetch error: %s.", String(error));
 
     return null;
+  } finally {
+
+    bound.cancel();
   }
 }
 

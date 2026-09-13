@@ -6,10 +6,12 @@
  * fetchDecryptionKey to avoid real network I/O. Synthetic key/iv/ciphertext fixtures - never derived from production data - lock the binary contracts that
  * downstream HLS playback depends on.
  */
+import { TestClock, settle } from "homebridge-plugin-utils/testing";
 import { afterEach, describe, mock, test } from "node:test";
 import { createCipheriv, randomBytes } from "node:crypto";
 import { decryptSegment, deriveIvFromSequence, fetchDecryptionKey, parseExplicitIv } from "./decrypt.ts";
 import assert from "node:assert/strict";
+import { pendingBodyFetch } from "../testing.helpers.ts";
 
 /* aesEncrypt produces synthetic AES-128-CBC ciphertext from a plaintext, key, and IV. We use this to construct round-trip fixtures so decryptSegment can be
  * exercised against real encrypted bytes without depending on any HLS provider's segments. The function mirrors what an HLS service does at the encoder: encrypt
@@ -22,6 +24,9 @@ function aesEncrypt(plaintext: Buffer, key: Buffer, iv: Buffer): Buffer {
   return Buffer.concat([ cipher.update(plaintext), cipher.final() ]);
 }
 
+// The key fetch's own window, mirrored from decrypt.ts so a row advances exactly the bound the module arms rather than a number of its own.
+const KEY_FETCH_TIMEOUT = 10000;
+
 describe("fetchDecryptionKey", () => {
 
   afterEach(() => {
@@ -33,14 +38,16 @@ describe("fetchDecryptionKey", () => {
 
     // Happy path: HTTP 200 with a 16-byte body. We construct a deterministic key buffer so callers can assert the exact bytes round-trip through arrayBuffer/Buffer.
     const expectedKey = Buffer.from("0123456789abcdef", "utf8");
+    const clock = new TestClock();
 
     mock.method(globalThis, "fetch", async () => new Response(expectedKey, { status: 200 }));
 
-    const result = await fetchDecryptionKey("https://example.test/key.bin");
+    const result = await fetchDecryptionKey("https://example.test/key.bin", { clock });
 
     assert.ok(result, "key fetch should resolve to a Buffer, not null");
     assert.equal(result.length, 16, "the resolved buffer should be exactly 16 bytes");
     assert.equal(result.toString("utf8"), "0123456789abcdef", "the buffer contents survive the arrayBuffer/Buffer round trip");
+    assert.equal(clock.pending, 0, "the bound is disposed once the key arrives rather than left armed for its full window");
   });
 
   test("returns null when the response is not OK (HTTP 4xx)", async () => {
@@ -110,6 +117,53 @@ describe("fetchDecryptionKey", () => {
     await fetchDecryptionKey("https://example.test/keys/abc123.bin");
 
     assert.equal(capturedUrl, "https://example.test/keys/abc123.bin", "the URL passes through unchanged");
+  });
+
+  test("abandons an open body and returns null when the bound lapses", async () => {
+
+    /* The bound has to outlive the headers. A key response that arrives and then stalls mid-body is exactly the case the deadline exists for, and a bound
+     * cancelled the moment the headers land would leave that read pending forever. The stub answers headers at once and errors its body only when the request's
+     * signal aborts, so this row passes only while the bound still spans the arrayBuffer() read.
+     */
+    const clock = new TestClock();
+
+    mock.method(globalThis, "fetch", async (_url: string | URL, init?: RequestInit): Promise<Response> => pendingBodyFetch(init));
+
+    const resultPromise = fetchDecryptionKey("https://example.test/key.bin", { clock });
+
+    assert.equal(clock.pending, 1, "the bound is armed on the injected clock before anything is awaited");
+    assert.deepEqual(clock.requested, [KEY_FETCH_TIMEOUT], "and it waits the key fetch's own window");
+
+    // Let the headers land and the body read begin, so the advance below lapses a bound that is spanning an open body rather than an unstarted request.
+    await settle();
+
+    clock.advance(KEY_FETCH_TIMEOUT);
+
+    assert.equal(await resultPromise, null, "the lapsed bound abandons the open body and the key fetch surfaces as null");
+    assert.equal(clock.pending, 0, "and the bound was cancelled rather than left armed");
+  });
+
+  test("ends on the caller's signal when it aborts before the bound lapses", async () => {
+
+    /* The composed form. The caller's cancellation and this fetch's bound are one interrupt source, so whichever fires first ends the key fetch. Here the caller
+     * aborts well inside the window, which has to end the fetch without the bound coming due - and the bound still has to be disposed on the way out rather than
+     * left holding its full window.
+     */
+    const clock = new TestClock();
+    const controller = new AbortController();
+
+    mock.method(globalThis, "fetch", async (_url: string | URL, init?: RequestInit): Promise<Response> => pendingBodyFetch(init));
+
+    const resultPromise = fetchDecryptionKey("https://example.test/key.bin", { clock, signal: controller.signal });
+
+    assert.equal(clock.pending, 1, "the bound is armed alongside the caller's signal");
+
+    await settle();
+
+    controller.abort();
+
+    assert.equal(await resultPromise, null, "the caller's abort ends the key fetch");
+    assert.equal(clock.pending, 0, "and the bound is cancelled rather than left armed for its full window");
   });
 });
 

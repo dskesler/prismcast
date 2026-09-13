@@ -13,6 +13,7 @@ import type { Nullable } from "../types/index.ts";
 import type { StreamRegistryEntry } from "./registry.ts";
 import { StreamSetupError } from "./setup.ts";
 import { getChannelStreamId } from "./lifecycle.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* This module provides a continuous MPEG-TS byte stream for HDHomeRun-compatible clients (such as Plex) that expect raw MPEG-TS when tuning a channel. It supports
  * multiple delivery modes:
@@ -382,10 +383,14 @@ function connectMpegTsClient({ beforeCatchup, endDelivery, extraCleanup, logLabe
 
   const clientAddress = req.ip ?? req.socket.remoteAddress ?? "unknown";
 
+  // The connect instant, which the stream's access stamp and this client's last-seen both carry. This handler is a connection boundary, so it reads the system
+  // clock at each point it stamps rather than reusing one reading across the connection's lifetime.
+  const now = systemClock.now();
+
   // Increment the MPEG-TS client counter to prevent idle timeout while this client is connected.
   stream.mpegTsClientCount++;
-  updateLastAccess(streamId);
-  registerClient(streamId, clientAddress, "mpegts");
+  updateLastAccess(streamId, now);
+  registerClient(streamId, clientAddress, "mpegts", now);
 
   const streamLog = LOG.withStreamId(stream.streamIdStr);
 
@@ -407,7 +412,9 @@ function connectMpegTsClient({ beforeCatchup, endDelivery, extraCleanup, logLabe
 
     sentSegments.add(filename);
     writeSegment(data);
-    updateLastAccess(streamId);
+
+    // Each delivered segment refreshes the idle clock at its own delivery instant.
+    updateLastAccess(streamId, systemClock.now());
   };
 
   /* Brings the connection to a graceful end exactly once, whichever event asks first. Delivery stops the moment the flag is set, because a write
@@ -468,7 +475,7 @@ function connectMpegTsClient({ beforeCatchup, endDelivery, extraCleanup, logLabe
       // channel-surfing users time to switch back without the stream being torn down immediately.
       if(currentStream.mpegTsClientCount === 0) {
 
-        updateLastAccess(streamId);
+        updateLastAccess(streamId, systemClock.now());
       }
     }
 

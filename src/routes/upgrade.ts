@@ -11,6 +11,7 @@ import { closeBrowser } from "../browser/index.ts";
 import { createDefaultLifecycleContext } from "../upgrade/lifecycle.context.ts";
 import { detectInstallMethod } from "../upgrade/detection.ts";
 import { performUpgrade } from "../upgrade/lifecycle.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* These endpoints provide upgrade information and execution for the web UI. GET /upgrade/info returns the current install method and version status; POST /upgrade
  * dispatches the upgrade to the platform-aware upgrade lifecycle and answers with what happened.
@@ -60,7 +61,7 @@ export interface UpgradeDeps {
  */
 function scheduleShutdownAfterUpgrade(): void {
 
-  setTimeout(() => {
+  systemClock.schedule(() => {
 
     LOG.info("Exiting to complete the upgrade.");
 

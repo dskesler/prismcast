@@ -10,9 +10,14 @@
  * captures are large and carry CRC32-correct sections; the parser does not validate CRCs (parsing for codec inference is best-effort), so the fixtures omit
  * the CRC trailer to keep the test setup small while still exercising the production code path.
  */
+import { TestClock, settle } from "homebridge-plugin-utils/testing";
 import { afterEach, describe, mock, test } from "node:test";
 import { findFirstSegmentUrl, inferCodecFromTsBuffer, inferMediaCodec } from "./codecInference.ts";
 import assert from "node:assert/strict";
+import { pendingBodyFetch } from "../testing.helpers.ts";
+
+// The segment-prefix fetch's own window, mirrored from codecInference.ts so a row advances exactly the bound the module arms.
+const SEGMENT_PROBE_TIMEOUT_MS = 5000;
 
 /* Fills a 188-byte TS packet with sync byte, PID, payload-unit-start indicator, adaptation_field_control=01 (payload only), and a section payload preceded by
  * pointer_field=0. The remainder of the packet is padded with 0xFF bytes (TS stuffing convention) so the buffer is well-formed even though the parser does not
@@ -348,6 +353,7 @@ describe("inferMediaCodec (async orchestrator)", () => {
     // Happy path: the playlist references a .ts segment, the fetch returns synthetic TS bytes carrying an H264 PMT, and the orchestrator returns the H264 label.
     const ts = buildTsFixture([{ pid: 0x101, streamType: 0x1B }]);
     const segUrl = "https://cdn.test/path/seg.ts";
+    const clock = new TestClock();
 
     mock.method(globalThis, "fetch", async (url: string | URL): Promise<Response> => {
 
@@ -362,10 +368,41 @@ describe("inferMediaCodec (async orchestrator)", () => {
     const result = await inferMediaCodec({
 
       baseUrl: "https://cdn.test/path/playlist.m3u8",
+      clock,
       playlistBody: "#EXTM3U\n#EXTINF:2,\nseg.ts\n"
     });
 
     assert.equal(result.codec, "H264");
+    assert.equal(clock.pending, 0, "the bound is disposed once the prefix arrives rather than left armed for its full window");
+  });
+
+  test("returns a null codec when the bound lapses with the segment body still open", async () => {
+
+    /* The inference is best-effort, so a segment whose headers arrive and whose body then stalls has to end at the bound and fall back to a null label rather
+     * than holding the probe open. The bound therefore has to span the prefix read, not just the request: the stub errors its body only on the request signal's
+     * abort, so a bound cancelled at header arrival would leave this row waiting forever.
+     */
+    const clock = new TestClock();
+
+    mock.method(globalThis, "fetch", async (_url: string | URL, init?: RequestInit): Promise<Response> => pendingBodyFetch(init));
+
+    const resultPromise = inferMediaCodec({
+
+      baseUrl: "https://cdn.test/path/playlist.m3u8",
+      clock,
+      playlistBody: "#EXTM3U\n#EXTINF:2,\nseg.ts\n"
+    });
+
+    assert.equal(clock.pending, 1, "the segment-prefix bound is armed on the injected clock");
+    assert.deepEqual(clock.requested, [SEGMENT_PROBE_TIMEOUT_MS], "and it waits the segment probe's own window");
+
+    // Let the headers land and the prefix read begin, so the advance below lapses a bound that is spanning an open body.
+    await settle();
+
+    clock.advance(SEGMENT_PROBE_TIMEOUT_MS);
+
+    assert.equal((await resultPromise).codec, null, "the lapsed bound abandons the open body and the inference reports no codec");
+    assert.equal(clock.pending, 0, "and the bound was cancelled rather than left armed");
   });
 
   test("caps the read at 32 KB when the CDN ignores Range and streams the full segment (HTTP 200)", async () => {

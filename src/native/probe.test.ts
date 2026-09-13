@@ -10,6 +10,13 @@ import { afterEach, beforeEach, describe, mock, test } from "node:test";
 import { buildProbeCacheStamp, classifyHlsPlaylist, clearProbeCache, extractChildPlaylistUrls, getCachedEncryption, isLiveMediaPlaylist, probeManifest,
   resolveUrl } from "./probe.ts";
 import assert from "node:assert/strict";
+import { systemClock } from "homebridge-plugin-utils";
+
+/* The instant these rows read the probe cache at. The entries they assert on are stamped by a probe left on its own default reading, so one reading of
+ * the same source taken here is inside the TTL window of every one of them: a read at this instant reports whether the entry exists, which is what those rows
+ * ask. The TTL boundary itself has its own row, which states its stamp and every instant it reads at outright.
+ */
+const CACHE_READ_INSTANT_MS = systemClock.now();
 
 /* makeFetchRouter installs a mock for globalThis.fetch that dispatches to URL-keyed responses. Tests register their fixtures keyed by URL prefix; any request to
  * an unregistered URL returns a 404. This keeps each test focused on the single classification branch it exercises - master returns variant URL, variant returns
@@ -130,7 +137,7 @@ describe("getCachedEncryption", () => {
   test("returns null for a channel that has never been probed", () => {
 
     // Boundary: a fresh channel name with no cache entry must return null, not throw and not return a default classification.
-    assert.equal(getCachedEncryption(NEVER_PROBED_IDENTITY), null, "fresh channel returns null");
+    assert.equal(getCachedEncryption(NEVER_PROBED_IDENTITY, CACHE_READ_INSTANT_MS), null, "fresh channel returns null");
   });
 
   test("returns the cached encryption type after a successful DRM probe", async () => {
@@ -150,7 +157,7 @@ describe("getCachedEncryption", () => {
 
     assert.ok(result, "probe resolved with a result");
     assert.equal(result.encryption, "drm", "SAMPLE-AES classified as DRM");
-    assert.equal(getCachedEncryption(CHANNEL_1_IDENTITY), "drm", "cache holds the DRM classification");
+    assert.equal(getCachedEncryption(CHANNEL_1_IDENTITY, CACHE_READ_INSTANT_MS), "drm", "cache holds the DRM classification");
   });
 });
 
@@ -182,10 +189,10 @@ describe("clearProbeCache", () => {
     });
 
     await probeManifest(masterUrl, CLEAR_TEST_IDENTITY);
-    assert.equal(getCachedEncryption(CLEAR_TEST_IDENTITY), "drm", "cache populated after first probe");
+    assert.equal(getCachedEncryption(CLEAR_TEST_IDENTITY, CACHE_READ_INSTANT_MS), "drm", "cache populated after first probe");
 
     clearProbeCache("clear-test-channel");
-    assert.equal(getCachedEncryption(CLEAR_TEST_IDENTITY), null, "cache empty after clear");
+    assert.equal(getCachedEncryption(CLEAR_TEST_IDENTITY, CACHE_READ_INSTANT_MS), null, "cache empty after clear");
   });
 
   test("is a no-op when the channel has no cache entry", () => {

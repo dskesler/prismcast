@@ -7,15 +7,21 @@
  * Everything is faked here rather than mocked at the loader, in the shape browser/tuning's page doubles use: a context whose evaluate dispatches on the source
  * text of the callback it is handed, a page recording its clicks and keystrokes, and a selection primitive recording the hold's two boundaries. What each row
  * reads is the resulting timeline, because the question is where the selection sits relative to the sequence's own steps rather than what any one step returned.
+ *
+ * Time is faked at the same boundary: the collaborator carries the clock every settle pause, retry pause, and activation pause in the ladder runs on, and the
+ * native path's queue bound arms on it too. Each row drives its sequence to completion by draining that clock, and reads the windows the ladder asked for off
+ * the clock's own ledger - which is what tells a sleep that moved onto the port apart from one still waiting out real time.
  */
 import type { Frame, Page } from "puppeteer-core";
 import type { ResolvedSiteProfile, VideoSelectorType } from "../types/index.ts";
+import { TestClock, drainClock } from "homebridge-plugin-utils/testing";
 import { closePuppeteerStreamWssOnIdle, seedVideoSelector, withDocument } from "../testing.helpers.ts";
 import { describe, test } from "node:test";
+import { ensureFullscreen, ensurePlayback } from "./video.ts";
+import { CONFIG } from "../config/index.ts";
 import type { FullscreenDeps } from "./video.ts";
 import type { SelectedTab } from "./tabSelection.ts";
 import assert from "node:assert/strict";
-import { ensureFullscreen } from "./video.ts";
 
 // The module under test reaches puppeteer-stream through its own imports, which spawns a WebSocketServer at load and would otherwise hold the runner open.
 closePuppeteerStreamWssOnIdle();
@@ -83,6 +89,20 @@ function makeContext(timeline: string[],
         return { x: 10, y: 10 };
       }
 
+      if(source.includes("video.load()")) {
+
+        timeline.push("reload");
+
+        return undefined;
+      }
+
+      if(source.includes("video.play()")) {
+
+        timeline.push("play");
+
+        return undefined;
+      }
+
       // The two styling passes are told apart by the layer each lifts the video to: the ordinary pass names 999000, the escalation's !important pass 999999.
       if(source.includes("999999")) {
 
@@ -119,12 +139,14 @@ function makePage(timeline: string[]): Page {
  * Builds the injected selection primitive, recording the hold's two boundaries into the shared timeline.
  * @param timeline - The shared ordering record.
  * @param ceilings - The ceiling each hold was asked for, so a row can read that the fullscreen path passes its own.
+ * @param clock - The clock the ladder's pauses and the native path's queue bound run on.
  * @returns The deps.
  */
-function makeDeps(timeline: string[], ceilings: (number | undefined)[]): FullscreenDeps {
+function makeDeps(timeline: string[], ceilings: (number | undefined)[], clock: TestClock): FullscreenDeps {
 
   return {
 
+    clock,
     withTabSelected: async <T>(_page: Page, body: (tab: SelectedTab) => Promise<T>, context?: { ceilingMs?: number }): Promise<T> => {
 
       ceilings.push(context?.ceilingMs);
@@ -157,11 +179,15 @@ function makeDeps(timeline: string[], ceilings: (number | undefined)[]): Fullscr
  */
 async function captureAggressiveCallback(): Promise<AggressiveCallback> {
 
+  const clock = new TestClock();
   const timeline: string[] = [];
   const captured: AggressiveCallback[] = [];
 
-  await ensureFullscreen(makePage(timeline), makeContext(timeline, { aggressive: (callback) => captured.push(callback), verified: false }),
-    makeProfile({ useRequestFullscreen: false }), SELECTOR_TYPE, false, makeDeps(timeline, []));
+  const run = ensureFullscreen(makePage(timeline), makeContext(timeline, { aggressive: (callback) => captured.push(callback), verified: false }),
+    makeProfile({ useRequestFullscreen: false }), SELECTOR_TYPE, false, makeDeps(timeline, [], clock));
+
+  await drainClock(clock);
+  await run;
 
   const [callback] = captured;
 
@@ -177,39 +203,61 @@ describe("ensureFullscreen", () => {
     /* The selection is what makes the Fullscreen API grantable, so it has to be taken before the trigger and given back only once the sequence has confirmed
      * native fullscreen. The recorded order is the assertion: a sequence that selected per attempt, or released before its verification, reorders this log.
      */
+    const clock = new TestClock();
     const timeline: string[] = [];
     const ceilings: (number | undefined)[] = [];
 
-    await ensureFullscreen(makePage(timeline), makeContext(timeline), makeProfile(), SELECTOR_TYPE, false, makeDeps(timeline, ceilings));
+    const run = ensureFullscreen(makePage(timeline), makeContext(timeline), makeProfile(), SELECTOR_TYPE, false, makeDeps(timeline, ceilings, clock));
+
+    await drainClock(clock);
+    await run;
 
     assert.deepEqual(timeline, [ "select", "styles", "trigger", "verify", "native", "release" ],
       "the selection brackets the styling, the trigger, and both verifications");
     assert.deepEqual(ceilings, [6000], "the fullscreen path holds under its own ceiling rather than the capture start's default");
+
+    /* The windows the ladder asked for, in the order it asked: the queue bound arms before the queued sequence runs, and the sequence's one settle pause
+     * follows it. A pause left on real time is simply absent from this ledger.
+     */
+    assert.deepEqual(clock.requested, [ 10000, 200 ], "the queue bound is recorded first, then the sequence's settle pause");
+    assert.equal(clock.pending, 0, "and nothing is left armed for the rows that follow");
   });
 
   test("takes no selection at all on the recovery path", async () => {
 
     // Monitor recovery passes skipNativeFullscreen, which is the CSS-only path: no Fullscreen API call, so no reason to move the user's tab selection.
+    const clock = new TestClock();
     const timeline: string[] = [];
     const ceilings: (number | undefined)[] = [];
 
-    await ensureFullscreen(makePage(timeline), makeContext(timeline), makeProfile(), SELECTOR_TYPE, true, makeDeps(timeline, ceilings));
+    const run = ensureFullscreen(makePage(timeline), makeContext(timeline), makeProfile(), SELECTOR_TYPE, true, makeDeps(timeline, ceilings, clock));
+
+    await drainClock(clock);
+    await run;
 
     assert.equal(timeline.includes("select"), false, "the recovery path never selects a tab");
     assert.ok(timeline.includes("styles"), "while the CSS styling it does own still ran");
+    assert.deepEqual(clock.requested, [200], "the CSS-only path records its settle pause alone, with no queue bound before it");
+    assert.equal(clock.pending, 0, "and leaves nothing armed");
   });
 
   test("takes no selection for a profile that does not use the Fullscreen API", async () => {
 
     // The complementary control: the profile field, not the recovery flag, is what decides here. A CSS-only profile has nothing to ask Chrome for.
+    const clock = new TestClock();
     const timeline: string[] = [];
     const ceilings: (number | undefined)[] = [];
 
-    await ensureFullscreen(makePage(timeline), makeContext(timeline), makeProfile({ useRequestFullscreen: false }), SELECTOR_TYPE, false,
-      makeDeps(timeline, ceilings));
+    const run = ensureFullscreen(makePage(timeline), makeContext(timeline), makeProfile({ useRequestFullscreen: false }), SELECTOR_TYPE, false,
+      makeDeps(timeline, ceilings, clock));
+
+    await drainClock(clock);
+    await run;
 
     assert.equal(timeline.includes("select"), false, "a CSS-only profile never selects a tab");
     assert.deepEqual(ceilings, [], "and never asks for a hold");
+    assert.deepEqual(clock.requested, [200], "its ledger is the settle pause alone");
+    assert.equal(clock.pending, 0, "and leaves nothing armed");
   });
 
   test("escalates inside the SAME selection when the attempts never verify", async () => {
@@ -218,10 +266,15 @@ describe("ensureFullscreen", () => {
      * reads. All of it is one hold: releasing between the attempts and the escalation would hand the user their tab back and take it again mid-sequence, and
      * would leave the escalation's own Fullscreen API call running against a tab Chrome does not treat as selected.
      */
+    const clock = new TestClock();
     const timeline: string[] = [];
     const ceilings: (number | undefined)[] = [];
 
-    await ensureFullscreen(makePage(timeline), makeContext(timeline, { verified: false }), makeProfile(), SELECTOR_TYPE, false, makeDeps(timeline, ceilings));
+    const run = ensureFullscreen(makePage(timeline), makeContext(timeline, { verified: false }), makeProfile(), SELECTOR_TYPE, false,
+      makeDeps(timeline, ceilings, clock));
+
+    await drainClock(clock);
+    await run;
 
     assert.equal(timeline.filter((entry) => entry === "select").length, 1, "exactly one selection covers the escalation");
     assert.equal(timeline[0], "select", "taken before the first attempt");
@@ -233,6 +286,13 @@ describe("ensureFullscreen", () => {
     assert.ok(timeline.indexOf("click") < aggressive, "the activation click precedes the aggressive styling");
     assert.ok(timeline.lastIndexOf("verify") > aggressive, "and the final verification follows it, still inside the hold");
     assert.deepEqual(timeline.filter((entry) => entry.startsWith("type:")), [], "and the escalation sends no keypress for a profile that carries no key");
+
+    /* The whole ladder as a list of windows: the queue bound, then each attempt's settle pause, the retry pause between attempts, the activation pause every
+     * retry and the escalation pay, and the escalation's own final settle. One pause left on real time drops its entry and this comparison fails.
+     */
+    assert.deepEqual(clock.requested, [ 10000, 200, 500, 100, 200, 500, 100, 200, 100, 200 ],
+      "every pause the escalation walks through is registered on the injected clock, in order");
+    assert.equal(clock.pending, 0, "and the escalation leaves nothing armed");
   });
 
   test("the escalation presses no key for a profile without one", async () => {
@@ -240,28 +300,60 @@ describe("ensureFullscreen", () => {
     /* A profile with no fullscreenKey has keyboard fullscreen turned off, and the escalation honors that rather than typing "f" on its own behalf. The row
      * above is the same reading on the native path; this one is the CSS-only path, where the escalation is all that could send a keystroke.
      */
+    const clock = new TestClock();
     const timeline: string[] = [];
     const ceilings: (number | undefined)[] = [];
 
-    await ensureFullscreen(makePage(timeline), makeContext(timeline, { verified: false }), makeProfile({ useRequestFullscreen: false }), SELECTOR_TYPE, false,
-      makeDeps(timeline, ceilings));
+    const run = ensureFullscreen(makePage(timeline), makeContext(timeline, { verified: false }), makeProfile({ useRequestFullscreen: false }), SELECTOR_TYPE, false,
+      makeDeps(timeline, ceilings, clock));
+
+    await drainClock(clock);
+    await run;
 
     assert.ok(timeline.includes("aggressive"), "the sequence escalated");
     assert.deepEqual(timeline.filter((entry) => entry.startsWith("type:")), [], "and no keypress reached the page");
+    assert.deepEqual(clock.requested, [ 200, 500, 200, 500, 200, 200 ],
+      "the CSS-only escalation pays the settle and retry pauses and none of the activation ones");
+    assert.equal(clock.pending, 0, "and leaves nothing armed");
   });
 
   test("a profile that carries a key is still typed on every attempt, and never by the escalation", async () => {
 
     // The complement, so the row above reads as a policy the profile sets rather than a keypress the sequence lost: triggerFullscreen sends the key once per
     // simple retry, three times over the three of them, and the escalation adds none.
+    const clock = new TestClock();
     const timeline: string[] = [];
     const ceilings: (number | undefined)[] = [];
 
-    await ensureFullscreen(makePage(timeline), makeContext(timeline, { verified: false }), makeProfile({ fullscreenKey: "f", useRequestFullscreen: false }),
-      SELECTOR_TYPE, false, makeDeps(timeline, ceilings));
+    const run = ensureFullscreen(makePage(timeline), makeContext(timeline, { verified: false }), makeProfile({ fullscreenKey: "f", useRequestFullscreen: false }),
+      SELECTOR_TYPE, false, makeDeps(timeline, ceilings, clock));
+
+    await drainClock(clock);
+    await run;
 
     assert.equal(timeline.filter((entry) => (entry === "type:f")).length, 3, "one keypress per simple retry");
     assert.ok(timeline.lastIndexOf("type:f") < timeline.indexOf("aggressive"), "every keypress precedes the escalation");
+    assert.deepEqual(clock.requested, [ 200, 500, 200, 500, 200, 200 ], "a keypress adds no window of its own to the ladder's ledger");
+    assert.equal(clock.pending, 0, "and leaves nothing armed");
+  });
+
+  test("runs the level-2 source-reload wait on the clock ensurePlayback was handed", async () => {
+
+    /* Level 2 is the one escalation that waits outside the fullscreen ladder: it reloads the video source and then gives the player time to reinitialize. That
+     * wait is what this row reads off the ledger, because a wait left on real time drops its entry while every other count in the row still passes.
+     */
+    const clock = new TestClock();
+    const timeline: string[] = [];
+    const run = ensurePlayback(makePage(timeline), makeContext(timeline), makeProfile({ useRequestFullscreen: false }), { clock, recoveryLevel: 2 });
+
+    await drainClock(clock);
+    await run;
+
+    assert.ok(timeline.includes("reload"), "the level-2 escalation reloaded the video source");
+    assert.ok(timeline.includes("play"), "and went on to the basic play recovery below it");
+    assert.deepEqual(clock.requested, [ CONFIG.playback.sourceReloadDelay, 200 ],
+      "the source-reload wait leads the ledger, ahead of the ladder's own settle pause");
+    assert.equal(clock.pending, 0, "and nothing is left armed");
   });
 
   test("the escalation clears the box properties on the video and the containing-block ones on the container above it", async () => {

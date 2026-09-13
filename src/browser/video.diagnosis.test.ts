@@ -7,16 +7,22 @@
  */
 import type { BlockedPageClassification, ClassifyBlockedPageOptions } from "./blockedPage.ts";
 import type { ChannelSelectorResult, ProviderModule } from "../types/index.ts";
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
+import { afterEach, beforeEach, describe, test } from "node:test";
 import { LOG } from "../utils/index.ts";
 import type { OverlayPhase } from "./consent.ts";
 import type { Page } from "puppeteer-core";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import type { VideoTuneDeps } from "./video.ts";
 import assert from "node:assert/strict";
 import { getDomainAuthState } from "../config/health.ts";
 import { setImmediate as immediate } from "node:timers/promises";
 import { initializePlayback } from "./video.ts";
 import { makeProfile } from "../config/profiles.helpers.ts";
+import { systemClock } from "homebridge-plugin-utils";
+import { useHealthStoreOnClock } from "../config/health.helpers.ts";
+
+// The teardown for the health store establishment each describe below holds, assigned by that describe's setup.
+let disposeHealthStore: () => Promise<void>;
 
 // A record of one startOverlayHandling invocation, captured by the deps.startOverlayHandling double. abortedAtCall and priorTuneSetupAborted snapshot abort state AT
 // THE MOMENT of the call - the fields that assert the phase-poll lifecycle ordering (a post-hoc read of the signal is useless because every poll's finally
@@ -72,6 +78,7 @@ const deps: VideoTuneDeps = {
 
     return classifyResult();
   },
+  clock: systemClock,
   getProvidersForDomain: (): ProviderModule[] => mockDomainProviders,
   selectChannel: async (): Promise<ChannelSelectorResult> => mockSelectResult,
 
@@ -109,7 +116,7 @@ function makeStubPage(waitForSelector?: (selector: string, options?: unknown) =>
 
 describe("initializePlayback - failed-tune blocked-page diagnosis", () => {
 
-  beforeEach(() => {
+  beforeEach(async () => {
 
     classifyCalls = [];
     classifyResult = async (): Promise<BlockedPageClassification> => ({ kind: "unknown" });
@@ -118,13 +125,14 @@ describe("initializePlayback - failed-tune blocked-page diagnosis", () => {
     overlayCalls = [];
     classifyTuneSetupAborted = [];
 
-    // Suppress the health flush debounce timer so nothing fires against a real data directory during these diagnosis tests.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    // Establish the health store on a clock of its own so its flush debounce arms on virtual time and nothing fires against a real data directory during these
+    // diagnosis tests.
+    disposeHealthStore = await useHealthStoreOnClock(new TestClock());
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
-    mock.timers.reset();
+    await disposeHealthStore();
   });
 
   test("marks the domain, warns, and enriches the error when the wall sits on a registered provider's domain", async (t) => {
@@ -275,7 +283,7 @@ describe("initializePlayback - failed-tune blocked-page diagnosis", () => {
 
 describe("initializePlayback - phase-scoped overlay poll lifecycle", () => {
 
-  beforeEach(() => {
+  beforeEach(async () => {
 
     classifyCalls = [];
     classifyResult = async (): Promise<BlockedPageClassification> => ({ kind: "unknown" });
@@ -284,12 +292,12 @@ describe("initializePlayback - phase-scoped overlay poll lifecycle", () => {
     overlayCalls = [];
     classifyTuneSetupAborted = [];
 
-    mock.timers.enable({ apis: ["setTimeout"] });
+    disposeHealthStore = await useHealthStoreOnClock(new TestClock());
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
-    mock.timers.reset();
+    await disposeHealthStore();
   });
 
   test("launches the tuneSetup poll un-aborted, then the videoWait poll only after the tuneSetup poll is aborted", async (t) => {

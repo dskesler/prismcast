@@ -3,22 +3,23 @@
  * pretune.ts: Predictive channel pretuning from Channels DVR schedule.
  */
 import { LOG, formatError } from "../utils/index.ts";
-import { clearAllPretuneSafetyTimers, forgetPretuneSafetyTimer, setPretuneSafetyTimer } from "./pretuneTimers.ts";
+import { TimerRegistry, systemClock } from "homebridge-plugin-utils";
+import { clearAllPretuneSafetyTimers, setPretuneSafetyTimer, startPretuneSafetyTimers } from "./pretuneTimers.ts";
 import { fetchFromDvr, getDeviceMappings, getDvrHost } from "./showInfo.ts";
 import { getChannelStreamId, terminateStream } from "./lifecycle.ts";
 import { initializeStream, validateChannel } from "./hls.ts";
-import type { Clock } from "../utils/clock.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import { emitCurrentSystemStatus } from "../browser/index.ts";
 import { getStream } from "./registry.ts";
-import { realClock } from "../utils/clock.ts";
 
 /* This module polls the Channels DVR schedule API to discover upcoming recordings and pretunes channels 30 seconds before they start. When the DVR requests the
  * stream, it's already live with buffered segments - achieving near-instant tuning instead of 3-7 second cold starts.
  *
  * The polling loop runs every 60 seconds, checking for jobs starting within a 5-minute scheduling horizon. For each eligible job (PrismCast channel as the DVR's
- * preferred source), a precise setTimeout is scheduled for 30 seconds before the recording start time. When the timer fires, the module checks for conflicts,
- * validates the channel, and calls initializeStream() with the preTuned flag. A safety timeout tears down unclaimed streams 90 seconds after the scheduled start.
+ * preferred source), a per-job timer is armed on the scheduler's clock for 30 seconds before the recording start time. When the timer fires, the module checks
+ * for conflicts, validates the channel, and calls initializeStream() with the preTuned flag. A safety timeout tears down unclaimed streams 90 seconds after the
+ * scheduled start.
  *
  * Key design decisions:
  * - Only pretune when a PrismCast guide number is the FIRST entry in the job's channels array (DVR's preferred source).
@@ -84,29 +85,40 @@ export interface ScheduledJob {
 /* PretuneDeps is the external-I/O surface the pretune decision logic composes on: the DVR data-acquisition calls (getDvrHost, fetchFromDvr, getDeviceMappings) and the
  * expensive go-action (initializeStream). It is injected as a default parameter threaded from startPretunePolling so a test can substitute in-memory stubs at the same
  * injection boundary - no loader mock - while production uses the real defaultPretuneDeps. validateChannel, the registry, lifecycle, and the safety-timer registry stay
- * direct imports because they are not the substituted boundary. fetchFromDvr is narrowed to the ScheduledJob rows pretune actually reads. This mirrors the Clock port
- * (utils/clock.ts): a typed interface plus a module-const default, consumed through a defaulted parameter.
+ * direct imports because they are not the substituted boundary. fetchFromDvr is narrowed to the ScheduledJob rows pretune actually reads. The deps carry the
+ * library's Clock as one of their members.
  */
 export interface PretuneDeps {
 
-  // The time source for the retry loop's inter-attempt sleeps. Injected as a Clock (rather than a direct delay() call) so tests can supply a fake whose sleep
-  // resolves instantly - the retry loop's await-delay chain is exactly the shape mock.timers cannot deterministically resolve, which the Clock port exists to solve.
+  // The time source every read, the poll cadence, the per-job timers, and the safety timers run on. Injected as a Clock (rather than direct platform calls) so a
+  // test drives the whole schedule on one virtual timeline and asserts it instead of waiting it out.
   readonly clock: Clock;
-  readonly fetchFromDvr: (host: string, path: string) => Promise<ScheduledJob[]>;
+  readonly fetchFromDvr: (host: string, path: string, clock?: Clock) => Promise<ScheduledJob[]>;
   readonly getDeviceMappings: typeof getDeviceMappings;
   readonly getDvrHost: typeof getDvrHost;
   readonly initializeStream: typeof initializeStream;
 }
 
-const defaultPretuneDeps: PretuneDeps = { clock: realClock, fetchFromDvr, getDeviceMappings, getDvrHost, initializeStream };
+const defaultPretuneDeps: PretuneDeps = { clock: systemClock, fetchFromDvr, getDeviceMappings, getDvrHost, initializeStream };
 
 // State.
 
-// Interval handle for periodic job polling.
-let pollInterval: Nullable<ReturnType<typeof setInterval>> = null;
+/**
+ * The pair of timer registries a running scheduler owns: the poll cadence and its first poll, and one keyed one-shot per scheduled job.
+ */
+interface SchedulerRegistries {
 
-// Active pretune timers keyed by job ID. Used to avoid duplicate scheduling and to clear timers when jobs disappear.
-const activeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  // One keyed one-shot per scheduled job, keyed by job ID. Used to avoid duplicate scheduling and to clear timers when jobs disappear.
+  readonly jobs: TimerRegistry;
+
+  // The repeating poll and the deferred first poll.
+  readonly polls: TimerRegistry;
+}
+
+/* The running scheduler, or null when it is stopped. Both registries are built on the scheduler's clock at start and disposed at stop, and this one binding is the
+ * single statement of whether the scheduler is running, so the two registries can never disagree about it.
+ */
+let scheduler: Nullable<SchedulerRegistries> = null;
 
 // Public API.
 
@@ -115,20 +127,28 @@ const activeTimers = new Map<string, ReturnType<typeof setTimeout>>();
  */
 export function startPretunePolling(deps: PretuneDeps = defaultPretuneDeps): void {
 
-  if(pollInterval) {
+  if(scheduler) {
 
     return;
   }
 
-  // Run the first poll after a short delay to allow the persisted DVR host to load.
-  setTimeout(() => {
+  const registries = { jobs: new TimerRegistry({ clock: deps.clock }), polls: new TimerRegistry({ clock: deps.clock }) };
 
-    void pollForUpcomingJobs(deps);
+  scheduler = registries;
+
+  startPretuneSafetyTimers(deps.clock);
+
+  /* Run the first poll after a short delay to allow the persisted DVR host to load. Each poll is handed the registry it must arm on, by identity, so a poll still
+   * running across a stop arms on the disposed registry it started with rather than on whatever the module binding holds when its awaits resume.
+   */
+  registries.polls.schedule(() => {
+
+    void pollForUpcomingJobs(deps, registries.jobs);
   }, 5000);
 
-  pollInterval = setInterval(() => {
+  registries.polls.setInterval("poll", () => {
 
-    void pollForUpcomingJobs(deps);
+    void pollForUpcomingJobs(deps, registries.jobs);
   }, POLL_INTERVAL_MS);
 }
 
@@ -137,19 +157,10 @@ export function startPretunePolling(deps: PretuneDeps = defaultPretuneDeps): voi
  */
 export function stopPretunePolling(): void {
 
-  if(pollInterval) {
-
-    clearInterval(pollInterval);
-    pollInterval = null;
-  }
-
-  // Clear all pending pretune timers.
-  for(const timer of activeTimers.values()) {
-
-    clearTimeout(timer);
-  }
-
-  activeTimers.clear();
+  // Disposing both registries drains every pending poll and per-job timer and makes any later arm on them inert.
+  scheduler?.jobs.dispose();
+  scheduler?.polls.dispose();
+  scheduler = null;
 
   // Clear all safety timers via their owning registry.
   clearAllPretuneSafetyTimers();
@@ -158,9 +169,12 @@ export function stopPretunePolling(): void {
 // Internal Functions.
 
 /**
- * Polls the Channels DVR API for upcoming scheduled recordings and schedules pretune timers for eligible jobs.
+ * Polls the Channels DVR API for upcoming scheduled recordings and arms pretune timers for eligible jobs.
+ * @param deps - The injected external-I/O surface and clock.
+ * @param jobRegistry - The per-job registry this poll arms on, handed in by the timer that fired it. Named for the registry rather than for the jobs because the
+ *                      DVR job list is already a body-level binding here.
  */
-async function pollForUpcomingJobs(deps: PretuneDeps): Promise<void> {
+async function pollForUpcomingJobs(deps: PretuneDeps, jobRegistry: TimerRegistry): Promise<void> {
 
   const host = deps.getDvrHost();
 
@@ -169,21 +183,21 @@ async function pollForUpcomingJobs(deps: PretuneDeps): Promise<void> {
     return;
   }
 
-  const jobs = await deps.fetchFromDvr(host, "/api/v1/jobs");
+  const jobs = await deps.fetchFromDvr(host, "/api/v1/jobs", deps.clock);
 
   if(jobs.length === 0) {
 
     return;
   }
 
-  const now = Date.now();
+  const now = deps.clock.now();
   const horizon = now + SCHEDULING_HORIZON_MS;
 
   // Track which job IDs we see this poll cycle so we can clear timers for removed jobs.
   const seenJobIds = new Set<string>();
 
   // Get the device mappings once for resolving guide numbers. The cache ensures this is fast on repeated calls.
-  const mappings = await deps.getDeviceMappings(host);
+  const mappings = await deps.getDeviceMappings(host, now);
 
   if(mappings.size === 0) {
 
@@ -224,7 +238,7 @@ async function pollForUpcomingJobs(deps: PretuneDeps): Promise<void> {
     seenJobIds.add(job.id);
 
     // Skip if a timer is already scheduled for this job.
-    if(activeTimers.has(job.id)) {
+    if(jobRegistry.has(job.id)) {
 
       continue;
     }
@@ -235,23 +249,20 @@ async function pollForUpcomingJobs(deps: PretuneDeps): Promise<void> {
 
     LOG.debug("streaming:pretune", "Scheduling pretune for '%s' (%s) in %ds.", job.name, channelId, Math.round(effectiveDelay / 1000));
 
-    const timer = setTimeout(() => {
-
-      activeTimers.delete(job.id);
+    // The registry removes a keyed one-shot's entry before running its callback, so the fired job's key is already gone by the time the pretune begins.
+    jobRegistry.setTimeout(job.id, () => {
 
       void pretuneChannel(channelId, job.name, startMs, deps);
     }, effectiveDelay);
-
-    activeTimers.set(job.id, timer);
   }
 
-  // Clear timers for jobs that disappeared from the API (cancelled, rescheduled, or moved outside the horizon).
-  for(const [ jobId, timer ] of activeTimers) {
+  // Clear timers for jobs that disappeared from the API (cancelled, rescheduled, or moved outside the horizon). The registry answers its own key iterator, so
+  // clearing the key the walk is standing on is well-defined.
+  for(const jobId of jobRegistry.keys()) {
 
     if(!seenJobIds.has(jobId)) {
 
-      clearTimeout(timer);
-      activeTimers.delete(jobId);
+      jobRegistry.clear(jobId);
 
       LOG.debug("streaming:pretune", "Cleared timer for removed job %s.", jobId);
     }
@@ -329,15 +340,14 @@ async function pretuneChannel(channelId: string, jobName: string, startTimeMs: n
 
       if(streamId !== null) {
 
-        const leadSeconds = Math.round((startTimeMs - Date.now()) / 1000);
+        const leadSeconds = Math.round((startTimeMs - deps.clock.now()) / 1000);
 
         LOG.info("Pretuned %s for %s (starts in %ds).", displayName, jobName, leadSeconds);
 
         // Set a safety timeout to tear down the stream if no real client connects within 90 seconds of the scheduled start.
-        const safetyDelay = Math.max(0, (startTimeMs + SAFETY_TIMEOUT_MS) - Date.now());
-        const safetyTimer = setTimeout(() => {
+        const safetyDelay = Math.max(0, (startTimeMs + SAFETY_TIMEOUT_MS) - deps.clock.now());
 
-          forgetPretuneSafetyTimer(streamId);
+        setPretuneSafetyTimer(streamId, () => {
 
           const stream = getStream(streamId);
 
@@ -350,8 +360,6 @@ async function pretuneChannel(channelId: string, jobName: string, startTimeMs: n
           }
         }, safetyDelay);
 
-        setPretuneSafetyTimer(streamId, safetyTimer);
-
         return;
       }
     } catch(error) {
@@ -360,7 +368,7 @@ async function pretuneChannel(channelId: string, jobName: string, startTimeMs: n
     }
 
     // Stop retrying if we're past the scheduled start time.
-    if(Date.now() >= startTimeMs) {
+    if(deps.clock.now() >= startTimeMs) {
 
       LOG.debug("streaming:pretune", "Past start time for %s. Stopping pretune attempts.", channelId);
 
@@ -371,7 +379,7 @@ async function pretuneChannel(channelId: string, jobName: string, startTimeMs: n
     if(attempts < MAX_RETRIES) {
 
       // eslint-disable-next-line no-await-in-loop
-      await deps.clock.sleep(RETRY_DELAY_MS);
+      await deps.clock.delay(RETRY_DELAY_MS);
     }
   }
 

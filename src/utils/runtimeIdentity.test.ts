@@ -14,9 +14,13 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { withTempDir } from "../testing.helpers.ts";
 
+// The instant every context this file builds reports, so a claim record's startedAt is a fixed value rather than a reading of the host clock.
+const CLAIM_INSTANT_MS = 1700000000000;
+
 /* A deterministic RuntimeIdentityContext factory. Tests parameterize the boot session ID, a live-PID predicate, and an optional process-identity predicate; the
  * rest of the state machine is pure. The identity predicate defaults to "every live PID is genuinely a PrismCast process" so the common held-live path stays
  * concise; the same-boot PID-reuse cases pass an explicit predicate that returns false (confirmed unrelated process) or null (identity indeterminate) for a PID.
+ * The instant is fixed, so a claim's startedAt is a value the rows assert rather than whatever the host clock read when they ran.
  */
 function makeCtx(opts: { bootId: string; identifyPid?: (pid: number) => Nullable<boolean>; livePids: ReadonlySet<number> }): RuntimeIdentityContext {
 
@@ -24,7 +28,8 @@ function makeCtx(opts: { bootId: string; identifyPid?: (pid: number) => Nullable
 
     getBootSessionId: () => opts.bootId,
     isPidOurProcess: (pid: number): Nullable<boolean> => (opts.identifyPid === undefined) ? true : opts.identifyPid(pid),
-    isProcessRunning: (pid: number): boolean => opts.livePids.has(pid)
+    isProcessRunning: (pid: number): boolean => opts.livePids.has(pid),
+    now: (): number => CLAIM_INSTANT_MS
   };
 }
 
@@ -177,6 +182,7 @@ describe("claim", () => {
       assert.equal(result.ok, true);
       assert.equal(result.record.bootId, "session-1");
       assert.equal(result.record.pid, process.pid);
+      assert.equal(result.record.startedAt, new Date(CLAIM_INSTANT_MS).toISOString(), "the record stamps the context's instant");
       assert.equal(result.record.version, "1.10.3");
 
       // The file now reports held-live on re-inspect with the same context (our own PID is in the live set).
@@ -205,6 +211,7 @@ describe("claim", () => {
       assert.equal(after.kind, "held-live");
       assert.equal(after.record.bootId, "current-boot");
       assert.equal(after.record.pid, process.pid);
+      assert.equal(after.record.startedAt, new Date(CLAIM_INSTANT_MS).toISOString(), "the overwriting record stamps the context's instant");
       assert.equal(after.record.version, "1.10.3");
     });
   });

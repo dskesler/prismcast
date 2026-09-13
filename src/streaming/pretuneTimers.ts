@@ -8,62 +8,58 @@
  * terminateStream) and hls.ts (for initializeStream/validateChannel), so a direct lifecycle->pretune edge would close a hls -> lifecycle -> pretune -> hls import
  * cycle. Keeping the timer state here is the single source of truth for the registry and keeps the dependency edges acyclic.
  */
+import type { Clock } from "homebridge-plugin-utils";
+import { TimerRegistry } from "homebridge-plugin-utils";
 
-// Safety timers keyed by stream ID. Used to tear down unclaimed pretuned streams after the scheduled start time. Owned here so both the producer (pretune.ts, which
-// schedules them) and the consumer (lifecycle.ts, which clears them on normal termination) reference one registry without a cyclic import.
-const safetyTimers = new Map<number, ReturnType<typeof setTimeout>>();
+/* The safety timers, keyed by stream ID, on the library's lifetime-bound timer registry. Used to tear down unclaimed pretuned streams after the scheduled start
+ * time. Owned here so both the producer (pretune.ts, which schedules them) and the consumer (lifecycle.ts, which clears them on normal termination) reference one
+ * registry without a cyclic import.
+ *
+ * The binding starts on the system clock at module load and the scheduler replaces it with one on its own clock at every start, draining it at every stop. It is
+ * never absent and never throws: an arm that lands on a drained registry is accepted and fires on that registry's clock, which is what a plain map of handles did.
+ */
+let safetyTimers = new TimerRegistry();
 
 /**
- * Records the pending safety timer for a pretuned stream, replacing any existing entry for that stream ID. Called by pretune.ts when it schedules the reaper.
- * @param streamId - The numeric stream ID the timer guards.
- * @param timer - The timer handle to track.
+ * Retires the current safety-timer registry and builds a replacement on the scheduler's clock. Called by startPretunePolling() so every reaper a pretune attempt
+ * arms runs on the same clock the scheduler's own timers do. The prior registry is disposed BEFORE the replacement is built, so a reaper armed against the earlier
+ * generation can never fire once the restart has landed.
+ * @param clock - The clock the replacement registry arms its timers on.
  */
-export function setPretuneSafetyTimer(streamId: number, timer: ReturnType<typeof setTimeout>): void {
+export function startPretuneSafetyTimers(clock: Clock): void {
 
-  // Cancel any prior reaper for this stream before tracking the new one, so the registry holds at most one live timer per stream and an overwritten handle can never
-  // survive to fire against the same stream later. In practice a stream is pretuned once, so this is a no-op; it keeps the registry holding at most one live timer
-  // per stream even if a stream is ever re-registered.
-  clearPretuneSafetyTimer(streamId);
-
-  safetyTimers.set(streamId, timer);
+  safetyTimers.dispose();
+  safetyTimers = new TimerRegistry({ clock });
 }
 
 /**
- * Forgets a safety timer entry without cancelling it. Called from inside the timer's own callback after it has fired, where clearing the (already-elapsed) timer
- * would be redundant; we only need to drop the bookkeeping entry.
- * @param streamId - The numeric stream ID whose entry to drop.
+ * Records the pending safety timer for a pretuned stream, replacing any reaper the registry already holds under that stream ID. Called by pretune.ts when it
+ * schedules the reaper. The registry removes a keyed one-shot's entry before running its callback, so the reaper reads its own key as already gone.
+ * @param streamId - The numeric stream ID the timer guards.
+ * @param callback - The reaper to run when the safety window elapses.
+ * @param delayMs - How long to wait before reaping, in milliseconds.
  */
-export function forgetPretuneSafetyTimer(streamId: number): void {
+export function setPretuneSafetyTimer(streamId: number, callback: () => void, delayMs: number): void {
 
-  safetyTimers.delete(streamId);
+  safetyTimers.setTimeout(String(streamId), callback, delayMs);
 }
 
 /**
  * Cancels and forgets the pending safety timer for a pretuned stream. Called by terminateStream() when a pretuned stream is claimed and torn down through the normal
- * lifecycle, so the safety timeout - which exists only to reap streams that were never claimed - does not linger in the Map until it fires harmlessly against an
- * already-gone stream. Safe to call for any stream ID; streams without a pending safety timer are a no-op.
+ * lifecycle, so the safety timeout - which exists only to reap streams that were never claimed - does not linger in the registry until it fires harmlessly against
+ * an already-gone stream. Safe to call for any stream ID; streams without a pending safety timer are a no-op.
  * @param streamId - The numeric stream ID whose safety timer to clear.
  */
 export function clearPretuneSafetyTimer(streamId: number): void {
 
-  const timer = safetyTimers.get(streamId);
-
-  if(timer) {
-
-    clearTimeout(timer);
-    safetyTimers.delete(streamId);
-  }
+  safetyTimers.clear(String(streamId));
 }
 
 /**
- * Cancels and forgets every pending safety timer. Called by stopPretunePolling() on server shutdown so no reaper survives the polling loop.
+ * Cancels every pending safety timer while leaving the registry armed for the arms that follow. Called by stopPretunePolling() on server shutdown so no reaper
+ * survives the polling loop. The retirement of the registry itself belongs to the next start, through startPretuneSafetyTimers().
  */
 export function clearAllPretuneSafetyTimers(): void {
 
-  for(const timer of safetyTimers.values()) {
-
-    clearTimeout(timer);
-  }
-
-  safetyTimers.clear();
+  safetyTimers.clearAll();
 }

@@ -4,10 +4,11 @@
  */
 import type { ChannelSelectionProfile, ChannelSelectorResult, ChannelStrategyEntry, DiscoveredChannel, Nullable, ProviderModule,
   ResolvedSiteProfile } from "../types/index.ts";
-import { EvaluateAbortError, LOG, delay, evaluateWithAbort, extractDomain, formatError, isPageDeathError } from "../utils/index.ts";
+import { EvaluateAbortError, LOG, delay, evaluateWithAbort, extractDomain, formatError, isPageDeathError, pollUntil } from "../utils/index.ts";
 import { evictPersistedWatchUrl, getPersistedLineup, getPersistedWatchUrl } from "../config/providerLineups.ts";
 import { getDomainConfig, registerProviderModuleProfile } from "../config/sites.ts";
 import { CONFIG } from "../config/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Page } from "puppeteer-core";
 import { coxProvider } from "./tuning/cox.ts";
 import { directvProvider } from "./tuning/directv.ts";
@@ -18,6 +19,7 @@ import { isChannelSelectionProfile } from "../types/index.ts";
 import { resolveMatchSelector } from "./tuning/shared.ts";
 import { slingProvider } from "./tuning/sling.ts";
 import { spectrumProvider } from "./tuning/spectrum.ts";
+import { systemClock } from "homebridge-plugin-utils";
 import { thumbnailRowStrategy } from "./tuning/thumbnailRow.ts";
 import { tileClickStrategy } from "./tuning/tileClick.ts";
 import { xfinityProvider } from "./tuning/xfinity.ts";
@@ -319,6 +321,12 @@ export { logAvailableChannels, normalizeChannelName, resolveMatchSelector, scrol
 export interface SelectChannelOptions {
 
   /**
+   * The clock the pre-selection scroll poll's cadence and ceiling read. Defaults to the system clock, so a caller that holds no clock passes nothing. The tune
+   * orchestrator threads its own clock here, while the provider strategies behind the shared strategy types keep running on the poll policy's default.
+   */
+  readonly clock?: Clock;
+
+  /**
    * Callback invoked when the resolution layer converts a category selector to a concrete per-user channel identifier. The framework calls this with the resolved
    * call sign so the caller can persist the value to the user's channel store. After persistence, subsequent tunes start with the concrete selector and skip the
    * resolution path entirely.
@@ -330,7 +338,7 @@ export interface SelectChannelOptions {
    * Null/undefined means "do not persist." The resolution still happens and the resolved selector is used for this tune; it just isn't saved. Useful for ad-hoc
    * tunes (no associated channel record) and for testing.
    */
-  persistResolution?: (resolvedSelector: string) => Promise<void>;
+  readonly persistResolution?: (resolvedSelector: string) => Promise<void>;
 }
 
 /**
@@ -349,12 +357,13 @@ export interface SelectChannelOptions {
  * - Strategy dispatch based on profile.channelSelection.strategy.
  * @param page - The Puppeteer page object.
  * @param profile - The resolved site profile containing channelSelection config and channelSelector slug.
- * @param options - Optional callbacks for the resolution layer. Currently the only field is persistResolution.
+ * @param options - The clock the scroll poll runs on and the resolution layer's persistence callback. See SelectChannelOptions.
  * @returns Result object with success status and optional failure reason.
  */
 export async function selectChannel(page: Page, profile: ResolvedSiteProfile, options: SelectChannelOptions = {}): Promise<ChannelSelectorResult> {
 
   const { channelSelection } = profile;
+  const { clock = systemClock } = options;
 
   // No channel selection needed if strategy is "none" or no channelSelector is specified.
   if((channelSelection.strategy === "none") || !isChannelSelectionProfile(profile)) {
@@ -453,26 +462,27 @@ export async function selectChannel(page: Page, profile: ResolvedSiteProfile, op
     // Targeted scroll: find a specific element matching scrollSelector whose text content equals scrollTarget, then scroll it into view. This is used when only a
     // particular section needs to be visible rather than the entire page. Progressively scrolls in viewport-sized increments, checking after each step whether the
     // target element has appeared - necessary because sites with IntersectionObserver-based lazy loading only add sections to the DOM as they enter the viewport.
-    let found = false;
+    // The branch's two configured strings are bound here because the poll's read is a closure, where the compiler no longer holds the branch's narrowing.
+    const scrollSelector = channelSelection.scrollSelector;
+    const scrollTarget = channelSelection.scrollTarget;
 
     // Wait for at least one element matching the selector to appear so the SPA has started rendering content.
     try {
 
-      await page.waitForSelector(channelSelection.scrollSelector, { timeout: CONFIG.streaming.videoTimeout });
+      await page.waitForSelector(scrollSelector, { timeout: CONFIG.streaming.videoTimeout });
     } catch {
 
-      LOG.debug("tuning:tileClick", "No \"%s\" elements appeared within %sms. Page may not have rendered.",
-        channelSelection.scrollSelector, CONFIG.streaming.videoTimeout);
+      LOG.debug("tuning:tileClick", "No \"%s\" elements appeared within %sms. Page may not have rendered.", scrollSelector, CONFIG.streaming.videoTimeout);
     }
 
-    // Set the scroll deadline after the readiness gate so the progressive scroll loop gets its own full time budget rather than sharing it with the waitForSelector.
-    const scrollDeadline = Date.now() + CONFIG.streaming.videoTimeout;
+    /* The progressive scroll is the poll policy's shape - read a state on a cadence under a ceiling, stop early on a condition - so it is stated as one poll. The
+     * poll starts after the readiness gate so it gets its own full time budget rather than sharing it with the waitForSelector, and its cadence is the 300 ms the
+     * scroll paced itself by. The viewport step lives inside the read, after a miss: a read that finds the target scrolls it into view and does nothing else,
+     * while a read that misses scrolls one viewport so the next read sees whatever that step lazy-loaded.
+     */
+    const scroll = await pollUntil({ cadenceMs: 300, ceilingMs: CONFIG.streaming.videoTimeout, clock, read: async (): Promise<boolean> => {
 
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- found is mutated inside the loop body.
-    while(!found && (Date.now() < scrollDeadline)) {
-
-      // eslint-disable-next-line no-await-in-loop
-      found = await evaluateWithAbort(page, (selector: string, target: string): boolean => {
+      const located = await evaluateWithAbort(page, (selector: string, target: string): boolean => {
 
         for(const el of Array.from(document.querySelectorAll(selector))) {
 
@@ -485,25 +495,19 @@ export async function selectChannel(page: Page, profile: ResolvedSiteProfile, op
         }
 
         return false;
-      }, [ channelSelection.scrollSelector, channelSelection.scrollTarget ]);
+      }, [ scrollSelector, scrollTarget ]);
 
-      if(found) {
+      if(!located) {
 
-        break;
+        await page.evaluate(() => { window.scrollBy(0, window.innerHeight); });
       }
 
-      // Scroll down by one viewport height to trigger the next batch of lazy-loaded sections.
-      // eslint-disable-next-line no-await-in-loop
-      await page.evaluate(() => { window.scrollBy(0, window.innerHeight); });
+      return located;
+    }, until: (found: boolean): boolean => found });
 
-      // eslint-disable-next-line no-await-in-loop
-      await delay(300);
-    }
+    if(scroll.value) {
 
-    if(found) {
-
-      LOG.debug("tuning:tileClick", "Scroll target \"%s\" via \"%s\": found and scrolled into view.",
-        channelSelection.scrollTarget, channelSelection.scrollSelector);
+      LOG.debug("tuning:tileClick", "Scroll target \"%s\" via \"%s\": found and scrolled into view.", scrollTarget, scrollSelector);
 
       // Brief settle delay for lazy content near the target to finish rendering.
       await delay(500);
@@ -513,10 +517,10 @@ export async function selectChannel(page: Page, profile: ResolvedSiteProfile, op
       const headings = await evaluateWithAbort(page, (selector: string): string[] => {
 
         return Array.from(document.querySelectorAll(selector)).map((el) => el.textContent.trim());
-      }, [channelSelection.scrollSelector]);
+      }, [scrollSelector]);
 
       LOG.debug("tuning:tileClick", "Scroll target \"%s\" via \"%s\": not found after %sms. Found headings: %s.",
-        channelSelection.scrollTarget, channelSelection.scrollSelector, CONFIG.streaming.videoTimeout, JSON.stringify(headings));
+        scrollTarget, scrollSelector, CONFIG.streaming.videoTimeout, JSON.stringify(headings));
     }
   }
 

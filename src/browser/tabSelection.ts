@@ -29,12 +29,13 @@
  * for, and a marked tab no pass is waiting for belongs to nobody, which is the whole of what installStrayOpenTabReaper closes.
  */
 import type { Browser, Page, Target } from "puppeteer-core";
-import { LOG, evaluateWithAbort, formatError, realClock, timeoutSignal, waitWithTimeout } from "../utils/index.ts";
+import { LOG, evaluateWithAbort, formatError, timeoutSignal, waitWithTimeout } from "../utils/index.ts";
 import { CONFIG } from "../config/index.ts";
-import type { Clock } from "../utils/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import { TargetType } from "puppeteer-core";
 import { getExtensionPage } from "puppeteer-stream";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* The extension's options page can reach the chrome.* APIs, and this Node program cannot. Declaring the two namespaces at module scope rather than in the
  * project's global declarations keeps them spellable in exactly the one file whose evaluate callbacks execute inside that page, which is the same reason
@@ -120,12 +121,15 @@ export interface SharedWindowTabDeps {
 }
 
 /**
- * Per-call context for an open: how long the whole turn may take, and the collaborators it runs through.
+ * Per-call context for an open: how long the whole turn may take, the clock that ceiling runs on, and the collaborators it runs through.
  */
 export interface OpenSharedWindowTabContext {
 
   // The ceiling on the whole turn. Defaults to this module's own, which sits under the deadline a capture start runs under.
   readonly ceilingMs?: number;
+
+  // The time port the ceiling runs on. Defaults to the system clock; tests inject a virtual clock.
+  readonly clock?: Clock;
 
   // The topology collaborators and the library lookup.
   readonly deps: SharedWindowTabDeps;
@@ -154,7 +158,7 @@ export interface WithTabSelectedContext {
   // The ceiling on this hold. Defaults to the deadline a capture start already runs under, so the default hold cannot outlive the caller waiting on it.
   readonly ceilingMs?: number;
 
-  // The time port the ceiling runs on. Defaults to realClock; tests inject a fake.
+  // The time port the ceiling runs on. Defaults to the system clock; tests inject a virtual clock.
   readonly clock?: Clock;
 
   // The library collaborators. Defaults to the real ones.
@@ -376,7 +380,7 @@ async function returnSelection(extension: Page, selectedId: number, previousId: 
  * finished reading its result, which is what lets a body that outlives its ceiling keep running without holding the selection or the queue.
  * @param page - The page whose tab the body needs selected.
  * @param body - The work to run while the tab is selected. It receives the selected tab.
- * @param context - The ceiling, clock, and collaborators. Defaults to the capture start's own deadline on the real clock with the production collaborators.
+ * @param context - The ceiling, clock, and collaborators. Defaults to the capture start's own deadline on the system clock with the production collaborators.
  * @returns Whatever the body resolves with, even when the hold's ceiling lapsed first.
  * @throws The body's own rejection, or a selection failure of this module's own.
  */
@@ -407,7 +411,7 @@ export async function withTabSelected<T>(page: Page, body: (tab: SelectedTab) =>
 async function hold<T>(page: Page, body: (tab: SelectedTab) => Promise<T>, context: WithTabSelectedContext,
   released: PromiseWithResolvers<void>): Promise<T> {
 
-  const { ceilingMs = CONFIG.streaming.navigationTimeout, clock = realClock, deps = defaultTabSelectionDeps } = context;
+  const { ceilingMs = CONFIG.streaming.navigationTimeout, clock = systemClock, deps = defaultTabSelectionDeps } = context;
 
   try {
 
@@ -501,7 +505,7 @@ async function hold<T>(page: Page, body: (tab: SelectedTab) => Promise<T>, conte
 
       try {
 
-        return await clock.waitWithTimeout(running, ceilingMs, lapse);
+        return await waitWithTimeout(running, ceilingMs, { clock, reason: lapse });
       } catch(error) {
 
         if(error !== lapse) {
@@ -553,7 +557,7 @@ async function hold<T>(page: Page, body: (tab: SelectedTab) => Promise<T>, conte
  * that is another stream's capture page its composition wobbles for about a second until the re-affirm ladder lands - the same self-healing wobble a capture
  * start already causes once, now possible a second time at page creation.
  * @param browser - The browser to open the tab in.
- * @param context - The turn's ceiling and the collaborators it runs through.
+ * @param context - The turn's ceiling, the clock it runs on, and the collaborators it runs through.
  * @returns The opened page, or a page created the plain way when the anchor could not be had.
  */
 export async function openSharedWindowTab(browser: Browser, context: OpenSharedWindowTabContext): Promise<Page> {
@@ -573,13 +577,13 @@ export async function openSharedWindowTab(browser: Browser, context: OpenSharedW
 /**
  * Opens the tab under the selection, gives the selection back, and settles - degrading to a plain background page whenever the anchor cannot be had.
  * @param browser - The browser to open the tab in.
- * @param context - The turn's ceiling and collaborators.
+ * @param context - The turn's ceiling, clock, and collaborators.
  * @param released - The signal the executor chains the next turn on, settled once this turn has genuinely finished.
  * @returns The page, opened as a tab of the shared window or created plainly.
  */
 async function openTurn(browser: Browser, context: OpenSharedWindowTabContext, released: PromiseWithResolvers<void>): Promise<Page> {
 
-  const { ceilingMs = OPEN_TURN_CEILING_MS, deps } = context;
+  const { ceilingMs = OPEN_TURN_CEILING_MS, clock = systemClock, deps } = context;
   const { confirmPlacement, getExtensionPage: lookup = getExtensionPage, resolveCarrier } = deps;
 
   /* The fragment the opened tab wears, and the whole of what tells it from any other tab. Chrome reports a fragment on the target verbatim, so the target that
@@ -595,9 +599,9 @@ async function openTurn(browser: Browser, context: OpenSharedWindowTabContext, r
    * the alternating-holders race this executor exists to make unrepresentable.
    */
   const lapse = new Error("The capture extension's window did not take a new tab within " + String(ceilingMs) + " ms.");
-  const deadline = realClock.now() + ceilingMs;
-  const ceiling = timeoutSignal(ceilingMs, lapse);
-  const bounded = async <T>(work: Promise<T>): Promise<T> => waitWithTimeout(work, Math.max(1, deadline - realClock.now()), lapse);
+  const deadline = clock.now() + ceilingMs;
+  const ceiling = timeoutSignal(ceilingMs, { clock, reason: lapse });
+  const bounded = async <T>(work: Promise<T>): Promise<T> => waitWithTimeout(work, Math.max(1, deadline - clock.now()), { clock, reason: lapse });
 
   // The tab this turn opened, for as long as there is one that might still need closing.
   let opened: Nullable<Page> = null;

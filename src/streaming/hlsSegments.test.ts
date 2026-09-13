@@ -12,6 +12,7 @@ import { clearNativeInitState, findNamedInitSegment, getAudioPlaylist, getAudioS
 import { getStream, registerStream, unregisterStream } from "./registry.ts";
 import { CONFIG } from "../config/index.ts";
 import type { StreamRegistryEntry } from "./registry.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { makeRegistryEntry } from "./registry.helpers.ts";
 
@@ -463,18 +464,22 @@ describe("updatePlaylist / getPlaylist", () => {
   test("clears the preroll timer when the first real playlist arrives", () => {
 
     // Locks the cancellation contract - preroll timers must be cancelled by updatePlaylist so they don't fire after live content starts flowing.
+    const clock = new TestClock();
     const stream = registryEntry(streamId);
 
     let timerFired = false;
 
-    stream.hls.prerollTimer = setTimeout(() => { timerFired = true; }, 100);
+    stream.hls.prerollTimer = clock.schedule(() => { timerFired = true; }, 100);
 
     updatePlaylist(streamId, "#EXTM3U");
 
     assert.equal(stream.hls.prerollTimer, null, "timer handle cleared");
 
-    // The clearTimeout call should also prevent the timer from firing if we waited 200ms; we do not wait here to avoid real-time delays.
-    assert.equal(timerFired, false, "timer not yet fired regardless");
+    // Advancing past the original delay proves the disposal took: a handle that was merely nulled would still fire here.
+    clock.advance(200);
+
+    assert.equal(timerFired, false, "the disarmed timer never fired");
+    assert.equal(clock.pending, 0, "the disarm left nothing on the timeline");
   });
 
   test("update is a no-op for an unknown stream", () => {

@@ -2,7 +2,7 @@
  *
  * proxy.ts: Native HLS proxy - manifest polling, segment fetching, and playlist generation.
  */
-import { LOG, chromeFetch, realClock, startTimer } from "../utils/index.ts";
+import { LOG, chromeFetch, startTimer, timeoutSignal } from "../utils/index.ts";
 import type { MediaContainer, Nullable } from "../types/index.ts";
 import { buildPrerollEntries, computePrerollWindow } from "../streaming/preroll.ts";
 import { decryptSegment, deriveIvFromSequence, fetchDecryptionKey, parseExplicitIv } from "./decrypt.ts";
@@ -10,13 +10,14 @@ import { findNamedInitSegment, pruneNamedInitSegments, storeAudioSegment, storeN
   updateVideoPlaylist } from "../streaming/hlsSegments.ts";
 import { CONFIG } from "../config/index.ts";
 import type { CaptureCodec } from "../streaming/codec.ts";
-import type { Clock } from "../utils/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { InitSegmentTrack } from "../streaming/registry.ts";
 import type { PipelineShape } from "./probe.ts";
 import type { PlaylistSegmentEntry } from "../streaming/playlistBuilder.ts";
 import { buildPlaylist } from "../streaming/playlistBuilder.ts";
 import { getStream } from "../streaming/registry.ts";
 import { resolveUrl } from "./probe.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* This module implements the native HLS proxy that replaces Chrome screen capture for viable streams. It polls the service's variant manifest at regular intervals,
  * detects new segments by tracking #EXT-X-MEDIA-SEQUENCE, fetches each segment (optionally decrypting AES-128), stores them in the existing HLS segment system, and
@@ -119,9 +120,9 @@ export interface NativeProxyOptions {
   // The channel name for logging.
   channelName: string;
 
-  // Optional clock for the polling cadence sleep. Defaults to realClock; tests inject a fake clock so the manifest poll loop's backoff resolves on demand
-  // rather than via real timers. This mirrors the same default-arg port pattern used by retry.ts, timing.ts, and hlsSegments.ts - the production code path
-  // is unchanged when callers omit it.
+  // Optional clock for the polling cadence sleep. Defaults to the system clock; tests inject a virtual clock so the manifest poll loop's backoff resolves when
+  // the test advances past it rather than after real time. This mirrors the same default-arg port pattern used by retry.ts, timing.ts, and hlsSegments.ts - the
+  // production code path is unchanged when callers omit it.
   clock?: Clock;
 
   // Container format of the upstream segments, as classified by the probe. It is fixed for the proxy's lifetime: an "fmp4" relay fetches and re-references the
@@ -209,9 +210,9 @@ export interface NativeProxy {
   // Stores the refresh attempt now in flight, or null to release the slot when it settles.
   setPendingRefresh: (refresh: Nullable<Promise<boolean>>) => void;
 
-  // Sets the token refresh timer handle so it can be cancelled on stop. Called by the coordinator after scheduling a refresh. The proxy holds at most one live
-  // refresh timer: arming a successor retires its predecessor.
-  setTokenRefreshTimer: (timer: ReturnType<typeof setTimeout>) => void;
+  // Sets the token refresh handle so it can be cancelled on stop. Called by the coordinator after scheduling a refresh. The proxy holds at most one live
+  // refresh handle: arming a successor retires its predecessor.
+  setTokenRefreshTimer: (timer: Disposable) => void;
 
   // Stops the proxy and cancels the pending token refresh timer.
   stop: () => void;
@@ -371,7 +372,7 @@ interface ProxyLifecycleState {
   refreshFailureCount: number;
 
   stopped: boolean;
-  tokenRefreshTimer: ReturnType<typeof setTimeout> | null;
+  tokenRefreshTimer: Nullable<Disposable>;
 }
 
 /**
@@ -456,6 +457,11 @@ interface ProxyStatsState {
 interface ProxyContext {
 
   channelName: string;
+
+  // The clock the relay's segment-store calls take their instant from, so a store the relay drives stamps on the proxy's own time source rather than the store's
+  // default reading.
+  readonly clock: Clock;
+
   lifecycle: ProxyLifecycleState;
   onError: (error: string) => void;
   stats: ProxyStatsState;
@@ -1025,7 +1031,7 @@ async function resolveTrackInit(options: { ctx: ProxyContext; fetchSegment: Segm
     tracking.initCounter++;
   }
 
-  storeNamedInitSegment(ctx.streamId, track, servedName, data);
+  storeNamedInitSegment(ctx.streamId, track, servedName, data, ctx.clock.now());
   tracking.lastUpstreamMapUri = mapUri;
 
   LOG.debug("native:proxy", "Initialization segment %s for %s (%s track, %s bytes, %s).", (existingName === undefined) ? "stored as " + servedName :
@@ -1339,31 +1345,43 @@ async function pollAudioStream(ctx: ProxyContext, audio: AudioTrackingState, pip
 
   try {
 
-    const response = await chromeFetch(audio.variantUrl, { signal: AbortSignal.timeout(SEGMENT_FETCH_TIMEOUT) });
+    const bound = timeoutSignal(SEGMENT_FETCH_TIMEOUT, { clock: ctx.clock });
 
-    if(!response.ok) {
+    let body: string;
 
-      audio.consecutiveManifestFailures++;
-      ctx.stats.totalFetchErrors++;
+    try {
 
-      // Classify the failure via the shared threshold helper so the audio path escalates identically to the video path: 4xx uses the base threshold, 5xx and
-      // network conditions get double the attempts.
-      const effectiveThreshold = manifestFailureThreshold(response.status);
+      const response = await chromeFetch(audio.variantUrl, { signal: bound.signal });
 
-      LOG.debug("native:proxy", "Audio manifest poll failed for %s: HTTP %s (%s/%s).",
-        ctx.channelName, response.status, audio.consecutiveManifestFailures, effectiveThreshold);
+      if(!response.ok) {
 
-      if(audio.consecutiveManifestFailures >= effectiveThreshold) {
+        audio.consecutiveManifestFailures++;
+        ctx.stats.totalFetchErrors++;
 
-        escalateProxyFailure({ ctx, message: "audio manifest poll failed " + String(audio.consecutiveManifestFailures) + " times" });
+        // Classify the failure via the shared threshold helper so the audio path escalates identically to the video path: 4xx uses the base threshold, 5xx and
+        // network conditions get double the attempts.
+        const effectiveThreshold = manifestFailureThreshold(response.status);
+
+        LOG.debug("native:proxy", "Audio manifest poll failed for %s: HTTP %s (%s/%s).",
+          ctx.channelName, response.status, audio.consecutiveManifestFailures, effectiveThreshold);
+
+        if(audio.consecutiveManifestFailures >= effectiveThreshold) {
+
+          escalateProxyFailure({ ctx, message: "audio manifest poll failed " + String(audio.consecutiveManifestFailures) + " times" });
+        }
+
+        return false;
       }
 
-      return false;
+      audio.consecutiveManifestFailures = 0;
+
+      body = await response.text();
+    } finally {
+
+      // The bound covers this poll's own network wait and nothing past it: a bound is armed for exactly the wait it bounds and disposed the moment that wait
+      // settles, so the audio processing below runs with no timer of this poll's left pending on the proxy's clock.
+      bound.cancel();
     }
-
-    audio.consecutiveManifestFailures = 0;
-
-    const body = await response.text();
 
     return await processAudioStream(ctx, audio, body, audio.variantUrl, pipeline);
   } catch(error) {
@@ -1581,7 +1599,7 @@ function buildCompositePlaylist(options: CompositePlaylistOptions): string {
  */
 export function createNativeProxy(options: NativeProxyOptions): NativeProxy {
 
-  const { channelName, clock = realClock, container, encryption, keyUrl, onError, streamId } = options;
+  const { channelName, clock = systemClock, container, encryption, keyUrl, onError, streamId } = options;
   const hasAudio = options.audioVariantUrl !== null;
 
   // Preroll segment index offset. When preroll is ready (prerollSegmentCount > 0), real segments start numbering after the preroll range (e.g., segmentN.ts where
@@ -1667,7 +1685,7 @@ export function createNativeProxy(options: NativeProxyOptions): NativeProxy {
   };
 
   // Shared context for extracted module-level functions. Bundles immutable references with shared mutable state objects.
-  const ctx: ProxyContext = { channelName, lifecycle, onError, stats, streamId };
+  const ctx: ProxyContext = { channelName, clock, lifecycle, onError, stats, streamId };
 
   /* The two tracks' pipeline bindings. Construction happens here, at the proxy's composition root, so the pipeline that serves both loops carries no branch on
    * which track it is running: everything that differs between them - where segments are stored, how many are stored, how they are named, which initialization
@@ -1678,7 +1696,7 @@ export function createNativeProxy(options: NativeProxyOptions): NativeProxy {
     afterCommit: ({ byteLength, storedBefore }): void => {
 
       video.lastSegmentSize = byteLength;
-      video.lastSegmentTime = Date.now();
+      video.lastSegmentTime = ctx.clock.now();
 
       // Log the first segment fetch latency for timing diagnostics.
       if(stats.totalSegmentsFetched === 1) {
@@ -1763,42 +1781,54 @@ export function createNativeProxy(options: NativeProxyOptions): NativeProxy {
       return;
     }
 
-    const pollElapsed = startTimer();
+    const pollElapsed = startTimer(clock);
 
     try {
 
-      const response = await chromeFetch(video.variantUrl, { signal: AbortSignal.timeout(SEGMENT_FETCH_TIMEOUT) });
+      const bound = timeoutSignal(SEGMENT_FETCH_TIMEOUT, { clock });
 
-      if(!response.ok) {
+      let body: string;
 
-        video.consecutiveManifestFailures++;
-        stats.totalFetchErrors++;
+      try {
 
-        // Classify the error via the shared threshold helper. Client errors (4xx) use the base threshold; server errors (5xx) and network conditions get double the
-        // attempts. This is the same logic the audio poll path uses, so video and audio escalate identically.
-        const isClientError = (response.status >= 400) && (response.status < 500);
-        const effectiveThreshold = manifestFailureThreshold(response.status);
+        const response = await chromeFetch(video.variantUrl, { signal: bound.signal });
 
-        LOG.debug("native:proxy", "Manifest poll failed for %s: HTTP %s (%s, %s/%s).",
-          channelName, response.status, isClientError ? "client" : "server", video.consecutiveManifestFailures, effectiveThreshold);
+        if(!response.ok) {
 
-        if(video.consecutiveManifestFailures >= effectiveThreshold) {
+          video.consecutiveManifestFailures++;
+          stats.totalFetchErrors++;
 
-          escalateProxyFailure({ ctx, message: "manifest poll failed " + String(video.consecutiveManifestFailures) + " times (HTTP " +
-            String(response.status) + ")" });
+          // Classify the error via the shared threshold helper. Client errors (4xx) use the base threshold; server errors (5xx) and network conditions get double
+          // the attempts. This is the same logic the audio poll path uses, so video and audio escalate identically.
+          const isClientError = (response.status >= 400) && (response.status < 500);
+          const effectiveThreshold = manifestFailureThreshold(response.status);
+
+          LOG.debug("native:proxy", "Manifest poll failed for %s: HTTP %s (%s, %s/%s).",
+            channelName, response.status, isClientError ? "client" : "server", video.consecutiveManifestFailures, effectiveThreshold);
+
+          if(video.consecutiveManifestFailures >= effectiveThreshold) {
+
+            escalateProxyFailure({ ctx, message: "manifest poll failed " + String(video.consecutiveManifestFailures) + " times (HTTP " +
+              String(response.status) + ")" });
+
+            return;
+          }
+
+          schedulePoll(nextBackoffDelay());
 
           return;
         }
 
-        schedulePoll(nextBackoffDelay());
+        video.consecutiveManifestFailures = 0;
+        lifecycle.manifestBackoffMs = MANIFEST_BACKOFF_BASE;
 
-        return;
+        body = await response.text();
+      } finally {
+
+        // The bound covers this poll's own network wait and nothing past it: a bound is armed for exactly the wait it bounds and disposed the moment that wait
+        // settles, so the segment work below runs with no timer of this poll's left pending on the proxy's clock.
+        bound.cancel();
       }
-
-      video.consecutiveManifestFailures = 0;
-      lifecycle.manifestBackoffMs = MANIFEST_BACKOFF_BASE;
-
-      const body = await response.text();
 
       LOG.debug("native:proxy", "Manifest poll for %s completed in %sms.", channelName, pollElapsed());
       LOG.debug("native:manifest", "Variant manifest for %s:\n%s", channelName, body);
@@ -1981,19 +2011,30 @@ export function createNativeProxy(options: NativeProxyOptions): NativeProxy {
   async function fetchAndDecryptSegment(url: string, sequence: number, ivHex: Nullable<string>, segKeyUrl: Nullable<string>,
     abortSignal?: AbortSignal): Promise<Nullable<Buffer>> {
 
-    // The caller's cancellation and this fetch's own timeout are composed, so the segment ends on whichever arrives first and a caller with nothing to cancel
-    // gets the timeout alone.
-    const timeout = AbortSignal.timeout(SEGMENT_FETCH_TIMEOUT);
-    const response = await chromeFetch(url, { signal: abortSignal ? AbortSignal.any([ abortSignal, timeout ]) : timeout });
+    // The caller's cancellation and this fetch's own bound are composed, so the segment ends on whichever arrives first and a caller with nothing to cancel gets
+    // the bound alone.
+    const bound = timeoutSignal(SEGMENT_FETCH_TIMEOUT, { clock });
 
-    if(!response.ok) {
+    let data: Buffer;
 
-      LOG.debug("native:proxy", "Segment fetch failed for %s: HTTP %s.", channelName, response.status);
+    try {
 
-      return null;
+      const response = await chromeFetch(url, { signal: abortSignal ? AbortSignal.any([ abortSignal, bound.signal ]) : bound.signal });
+
+      if(!response.ok) {
+
+        LOG.debug("native:proxy", "Segment fetch failed for %s: HTTP %s.", channelName, response.status);
+
+        return null;
+      }
+
+      data = Buffer.from(await response.arrayBuffer());
+    } finally {
+
+      // The bound covers the segment's own fetch and body read. The key lookup below carries its own bound, and the decryption is pure work, so neither belongs
+      // inside this one.
+      bound.cancel();
     }
-
-    let data: Buffer = Buffer.from(await response.arrayBuffer());
 
     // Decrypt if this segment has a key URL. The manifest's #EXT-X-KEY tag is authoritative - DAI streams can switch between clear and AES-128 mid-stream (e.g., ad
     // pods encrypted while main content is clear), so the initial probe classification cannot be relied upon. Segments before the first #EXT-X-KEY tag have
@@ -2007,7 +2048,7 @@ export function createNativeProxy(options: NativeProxyOptions): NativeProxy {
 
         // The key fetch receives the raw cancellation signal rather than the composed one above, so it gets its own full timeout budget instead of inheriting
         // whatever this segment's fetch has already spent.
-        key = await fetchDecryptionKey(segKeyUrl, abortSignal) ?? undefined;
+        key = await fetchDecryptionKey(segKeyUrl, { clock, signal: abortSignal }) ?? undefined;
 
         if(!key) {
 
@@ -2098,7 +2139,7 @@ export function createNativeProxy(options: NativeProxyOptions): NativeProxy {
 
     if(!hasAudio) {
 
-      if((prerollSegmentCount > 0) && stream.hls.prerollStartTime && stream.hls.prerollBaseUrl) {
+      if((prerollSegmentCount > 0) && (stream.hls.prerollStartTime !== null) && stream.hls.prerollBaseUrl) {
 
         // Composite playlist with fMP4 preroll entries + MPEG-TS real entries. The prerollStartTime check ensures we only include preroll entries when the deferred
         // timer has fired and the client is actually watching preroll. Without this check, fast native streams (where real content arrives before the preroll delay)
@@ -2113,12 +2154,12 @@ export function createNativeProxy(options: NativeProxyOptions): NativeProxy {
           segmentIndex: video.segmentIndex,
           targetDuration,
           videoMetadata: video.metadata
-        }));
+        }), clock.now());
       } else {
 
         // No preroll active - standard variant playlist. The segment index may still be offset (starting at prerollSegmentCount) to reserve the index space, but no
         // preroll entries are included.
-        updatePlaylist(streamId, buildVariantPlaylist(segmentEntries, video.metadata, "segment", targetDuration));
+        updatePlaylist(streamId, buildVariantPlaylist(segmentEntries, video.metadata, "segment", targetDuration), clock.now());
       }
     } else {
 
@@ -2154,7 +2195,7 @@ export function createNativeProxy(options: NativeProxyOptions): NativeProxy {
         "#EXT-X-STREAM-INF:BANDWIDTH=" + String(bandwidth) + ",AUDIO=\"audio\"\n" +
         "video.m3u8\n";
 
-      updatePlaylist(streamId, masterPlaylist);
+      updatePlaylist(streamId, masterPlaylist, clock.now());
     }
 
     // Release initialization segments the freshly-generated window no longer references. This runs after generation so the retain set reflects exactly the
@@ -2188,11 +2229,11 @@ export function createNativeProxy(options: NativeProxyOptions): NativeProxy {
   }
 
   /**
-   * Schedules the next manifest poll after a delay. The sleep is awaited through the injected Clock port (defaulting to realClock) so tests can virtualize the
-   * polling cadence without depending on real timers. Cancellation semantics: stop() flips lifecycle.stopped, and the post-sleep guard catches that flip before
-   * issuing the next poll. The in-flight sleep itself is not cancelled - in production a stopped proxy lingers for at most the currently scheduled poll delay,
-   * which can be as long as MANIFEST_BACKOFF_CAP once jittered, before the awaiter wakes and exits cleanly. This is the same shape as retryOperation in
-   * utils/retry.ts which already adopted the Clock port for the same reason.
+   * Schedules the next manifest poll after a delay. The sleep is awaited through the injected Clock port (defaulting to the system clock) so tests drive the
+   * polling cadence on a virtual timeline rather than against real timers. Cancellation semantics: stop() flips lifecycle.stopped, and the post-sleep guard
+   * catches that flip before issuing the next poll. The in-flight sleep itself is not cancelled - in production a stopped proxy lingers for at most the currently
+   * scheduled poll delay, which can be as long as MANIFEST_BACKOFF_CAP once jittered, before the awaiter wakes and exits cleanly. This is the same shape
+   * retryOperation in utils/retry.ts takes, for the same reason.
    *
    * @param delayMs - Delay in milliseconds before the next poll.
    */
@@ -2205,7 +2246,7 @@ export function createNativeProxy(options: NativeProxyOptions): NativeProxy {
 
     void (async (): Promise<void> => {
 
-      await clock.sleep(delayMs);
+      await clock.delay(delayMs);
 
       if(lifecycle.stopped) {
 
@@ -2226,16 +2267,13 @@ export function createNativeProxy(options: NativeProxyOptions): NativeProxy {
     // straggler write can land after the stream's state has been cleared.
     lifecycle.abortController.abort();
 
-    // The polling cadence sleep is owned by schedulePoll's awaiter and is not cancelled here - the awaiter checks lifecycle.stopped after clock.sleep resolves
+    // The polling cadence sleep is owned by schedulePoll's awaiter and is not cancelled here - the awaiter checks lifecycle.stopped after clock.delay resolves
     // and exits before issuing the next poll. See schedulePoll's docblock for the cancellation contract.
 
     // Cancel the pending token refresh timer to prevent fire-after-termination. Without this, the timer fires on a stopped proxy and attempts to navigate a
     // potentially closed or reused page.
-    if(lifecycle.tokenRefreshTimer) {
-
-      clearTimeout(lifecycle.tokenRefreshTimer);
-      lifecycle.tokenRefreshTimer = null;
-    }
+    lifecycle.tokenRefreshTimer?.[Symbol.dispose]();
+    lifecycle.tokenRefreshTimer = null;
 
     LOG.debug("native:proxy", "Stopped native proxy for %s.", channelName);
   };
@@ -2288,13 +2326,9 @@ export function createNativeProxy(options: NativeProxyOptions): NativeProxy {
      * here, so a reschedule cannot leave an orphaned handle firing against a proxy that a newer schedule already speaks for, and the stop path retires whichever
      * handle is live when the stream ends.
      */
-    setTokenRefreshTimer: (timer: ReturnType<typeof setTimeout>): void => {
+    setTokenRefreshTimer: (timer: Disposable): void => {
 
-      if(lifecycle.tokenRefreshTimer) {
-
-        clearTimeout(lifecycle.tokenRefreshTimer);
-      }
-
+      lifecycle.tokenRefreshTimer?.[Symbol.dispose]();
       lifecycle.tokenRefreshTimer = timer;
     },
 

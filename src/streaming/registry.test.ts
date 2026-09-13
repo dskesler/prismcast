@@ -5,15 +5,16 @@
  * tests lock the registry's contract: register/unregister round-trips, ID monotonicity, getAllStreams snapshot independence, lookup with getStream, byte counter
  * arithmetic in getStreamMemoryUsage, the capture-activity predicate the browser window's visibility policy reads, and the shape of a freshly-minted HLSState.
  */
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
 import { applyNativeQualityRefresh, cancelPrerollTimer, createHLSState, getAllStreams, getLastSegmentHasVideo, getLastSegmentSize, getNextStreamId, getStream,
   getStreamCount, getStreamMemoryUsage, getTotalSegmentMemory, hasActiveCaptureStreams, makePendingCaptureIdentity, registerStream, unregisterStream,
   updateLastAccess } from "./registry.ts";
+import { beforeEach, describe, test } from "node:test";
 import { makeNativeIdentity, makeRegistryEntry } from "./registry.helpers.ts";
 import type { FMP4SegmenterResult } from "./fmp4Segmenter.ts";
 import type { Nullable } from "../types/index.ts";
 import type { Readable } from "node:stream";
 import type { StreamRegistryEntry } from "./registry.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { createCaptureSession } from "./captureSession.ts";
 
@@ -303,24 +304,18 @@ describe("updateLastAccess", () => {
   beforeEach(() => {
 
     clearRegistry();
-    mock.timers.enable({ apis: ["Date"], now: 1700000000000 });
   });
 
-  afterEach(() => {
-
-    mock.timers.reset();
-  });
-
-  test("sets lastPlaylistRequest to Date.now() for a known stream", () => {
+  test("sets lastPlaylistRequest to the supplied instant for a known stream", () => {
 
     const entry = makeRegistryEntry();
 
     entry.info.lastPlaylistRequest = 0;
 
     registerStream(entry);
-    updateLastAccess(entry.id);
+    updateLastAccess(entry.id, 1700000000000);
 
-    assert.equal(entry.info.lastPlaylistRequest, 1700000000000, "stamped to current Date.now()");
+    assert.equal(entry.info.lastPlaylistRequest, 1700000000000, "stamped to the instant the caller handed it");
   });
 
   test("is a no-op for an unknown stream", () => {
@@ -329,7 +324,7 @@ describe("updateLastAccess", () => {
     // terminates between client poll and registry lookup.
     assert.doesNotThrow(() => {
 
-      updateLastAccess(999);
+      updateLastAccess(999, 1700000000000);
     });
   });
 });
@@ -417,26 +412,28 @@ describe("createHLSState", () => {
 
 describe("cancelPrerollTimer", () => {
 
-  test("disarms an armed timer so its callback never runs and nulls the handle", async () => {
+  test("disarms an armed timer so its callback never runs and nulls the handle", () => {
 
-    // Arm a real short timer that flips a flag, cancel it, then wait well past the original delay. A helper that failed to clear the timer would let the callback run
-    // and flip the flag - this assertion fails against a broken no-op helper, which is what makes it distinguish a working helper from a broken one rather than
-    // merely asserting the handle is null.
+    // Arm a timer on a virtual clock that flips a flag, cancel it, then advance well past the original delay. A helper that failed to dispose the handle would let
+    // the callback run and flip the flag - this assertion fails against a broken no-op helper, which is what makes it tell a working helper from a broken one
+    // rather than merely asserting the handle is null.
+    const clock = new TestClock();
     const state = createHLSState();
 
     let fired = false;
 
-    state.prerollTimer = setTimeout(() => {
+    state.prerollTimer = clock.schedule(() => {
 
       fired = true;
     }, 20);
 
     cancelPrerollTimer(state);
 
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    clock.advance(60);
 
     assert.equal(fired, false, "the cancelled timer's callback never ran");
     assert.equal(state.prerollTimer, null, "the timer handle is nulled after cancellation");
+    assert.equal(clock.pending, 0, "the disarm left nothing on the timeline");
   });
 
   test("is a no-op when no timer is armed and leaves the handle null", () => {

@@ -10,6 +10,7 @@ import { CONFIG } from "../config/index.ts";
 import type { ClientType } from "../streaming/clients.ts";
 import type { HealthStatus } from "../types/index.ts";
 import { getClientSummary } from "../streaming/clients.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* The health endpoint provides detailed metrics about the application status including browser connection, memory usage, and active stream counts. This is useful
  * for monitoring and alerting systems. Returns HTTP 503 when unhealthy to allow load balancers and monitoring systems to detect problems via status code.
@@ -19,7 +20,7 @@ import { getClientSummary } from "../streaming/clients.ts";
  * HealthDeps is the state-reader boundary the /health handler folds into its payload: browser connection/pages/version, the stream registry counts and memory, and
  * the per-stream client summary. It is injected as a default parameter so a test can substitute in-memory readers through the same HealthDeps parameter - no
  * loader mock - while production uses the real defaultHealthDeps. isFFmpegAvailable, CONFIG, and the process memory/version are read directly because they are
- * not the substituted boundary. This mirrors the Clock port (utils/clock.ts): a typed interface plus a module-const default, consumed through a defaulted parameter.
+ * not the substituted boundary. This mirrors the library's Clock port: a typed interface plus a module-const default, consumed through a defaulted parameter.
  */
 export interface HealthDeps {
 
@@ -112,13 +113,16 @@ export function setupHealthEndpoint(app: Express, deps: HealthDeps = defaultHeal
     const segmentMemory = deps.getTotalSegmentMemory();
     const ffmpegAvailable = await isFFmpegAvailable();
 
+    // The instant this response is composed at, so every stream's client TTL is measured against one reading and the payload's timestamp names that same moment.
+    const now = systemClock.now();
+
     // Aggregate client data across all active streams for the system-wide summary.
     const allClientTypes = new Map<ClientType, number>();
     let totalClients = 0;
 
     for(const streamInfo of deps.getAllStreams()) {
 
-      const summary = deps.getClientSummary(streamInfo.id);
+      const summary = deps.getClientSummary(streamInfo.id, now);
 
       totalClients += summary.total;
 
@@ -163,7 +167,7 @@ export function setupHealthEndpoint(app: Express, deps: HealthDeps = defaultHeal
         active: deps.getStreamCount(),
         limit: CONFIG.streaming.maxConcurrentStreams
       },
-      timestamp: new Date().toISOString(),
+      timestamp: new Date(now).toISOString(),
       uptime: process.uptime(),
       version: getPackageVersion()
     };

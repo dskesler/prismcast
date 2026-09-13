@@ -12,6 +12,7 @@ import { getDataDir, getServiceFilePath } from "../config/paths.ts";
 import { getNodeExecutablePath, getPlatform, getPrismCastEntryPoint } from "../utils/platform.ts";
 import { print, printError } from "../utils/cliOutput.ts";
 import type { Platform } from "../utils/platform.ts";
+import { timeoutSignal } from "../utils/delay.ts";
 
 /**
  * Builds the default ServiceContext from real runtime I/O.
@@ -25,9 +26,12 @@ export function createDefaultServiceContext(): ServiceContext {
     detectStalePaths,
     fetchActiveStreams: async (port: number): Promise<StreamsResponse | null> => {
 
+      // This adapter holds no clock of its own, so the probe's bound takes the port's default, the system clock.
+      const bound = timeoutSignal(3000);
+
       try {
 
-        const response = await fetch("http://127.0.0.1:" + String(port) + "/streams", { signal: AbortSignal.timeout(3000) });
+        const response = await fetch("http://127.0.0.1:" + String(port) + "/streams", { signal: bound.signal });
 
         if(!response.ok) {
 
@@ -38,6 +42,9 @@ export function createDefaultServiceContext(): ServiceContext {
       } catch {
 
         return null;
+      } finally {
+
+        bound.cancel();
       }
     },
     getDataDir,

@@ -15,9 +15,9 @@ import { ACTIVE_TAB_GRANT_CEILING_MS, ACTIVE_TAB_GRANT_POLL_MS, CAPTURE_FRAME_SI
 import type { Browser, Page } from "puppeteer-core";
 import type { CaptureStreamOptions, ExtensionRecordingSettings, TabCaptureDeps } from "./tabCapture.ts";
 import type { SelectedTab, WithTabSelectedContext } from "./tabSelection.ts";
+import { TestClock, advanceThroughSchedule, drainClock, settle } from "homebridge-plugin-utils/testing";
 import type { WebSocket, WebSocketServer } from "ws";
 import { describe, test } from "node:test";
-import { makeAdvancingClock, makeFakeClock } from "../utils/clock.helpers.ts";
 import { CAPTURE_SOURCE_UNAVAILABLE_MESSAGE } from "../types/index.ts";
 import { EventEmitter } from "node:events";
 import type { LogEntry } from "../utils/logEmitter.ts";
@@ -348,7 +348,7 @@ describe("acquireCaptureStream", () => {
     const server = makeFakeServer(timeline);
     const extension = makeFakeExtension(timeline);
     const page = makeFakePage(timeline);
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
 
     await acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) });
 
@@ -379,7 +379,7 @@ describe("acquireCaptureStream", () => {
     const server = makeFakeServer(timeline);
     const extension = makeFakeExtension(timeline);
     const page = makeFakePage(timeline);
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
     const before = server.listeners();
     const stream = await acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) });
     const chunks: string[] = [];
@@ -425,7 +425,7 @@ describe("acquireCaptureStream", () => {
     const server = makeFakeServer(timeline);
     const extension = makeFakeExtension(timeline);
     const page = makeFakePage(timeline);
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
     const stream = await acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) });
     const first = stream.stop();
     const second = stream.stop();
@@ -449,7 +449,7 @@ describe("acquireCaptureStream", () => {
     const server = makeFakeServer(timeline);
     const extension = makeFakeExtension(timeline);
     const page = makeFakePage(timeline);
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
     const stream = await acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) });
 
     extension.disconnect();
@@ -481,7 +481,7 @@ describe("acquireCaptureStream", () => {
       }
     });
     const page = makeFakePage(timeline);
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
 
     let stream: Awaited<ReturnType<typeof acquireCaptureStream>> | null = null;
 
@@ -519,7 +519,7 @@ describe("acquireCaptureStream", () => {
       }
     });
     const page = makeFakePage(timeline);
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
 
     await assert.rejects(acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) }),
       (error: unknown) => (error instanceof Error) && error.message.includes(CAPTURE_SOURCE_UNAVAILABLE_MESSAGE),
@@ -543,7 +543,7 @@ describe("acquireCaptureStream", () => {
       }
     });
     const page = makeFakePage(timeline);
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
 
     let warnings: LogEntry[] = [];
 
@@ -578,16 +578,22 @@ describe("acquireCaptureStream", () => {
       }
     });
     const page = makeFakePage(timeline);
-    const { clock, sleeps } = makeFakeClock();
+    const clock = new TestClock();
 
-    await acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) });
+    const running = acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) });
+
+    await settle();
+    assert.equal(clock.pending, 1, "the first attempt found no grant, so its cadence is parked on the clock");
+
+    await advanceThroughSchedule(clock, [ ACTIVE_TAB_GRANT_POLL_MS, ACTIVE_TAB_GRANT_POLL_MS ]);
+    await running;
 
     const starts = extension.calls.filter((call) => call.kind === "start");
     const indexes = starts.map((call) => (call.arg as ExtensionRecordingSettings).index);
 
     assert.equal(starts.length, 3, "the start is re-attempted until the grant lands");
     assert.equal(new Set(indexes).size, 3, "every attempt publishes under its own index");
-    assert.deepEqual(sleeps, [ ACTIVE_TAB_GRANT_POLL_MS, ACTIVE_TAB_GRANT_POLL_MS ], "one cadence wait between each pair of attempts");
+    assert.deepEqual(clock.requested, [ ACTIVE_TAB_GRANT_POLL_MS, ACTIVE_TAB_GRANT_POLL_MS ], "one cadence wait between each pair of attempts");
     assert.equal(server.listeners(), before + 1, "only the successful attempt's handler survives");
   });
 
@@ -605,12 +611,20 @@ describe("acquireCaptureStream", () => {
       }
     });
     const page = makeFakePage(timeline);
-    const { clock } = makeAdvancingClock();
+    const clock = new TestClock();
+    const running = acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) });
 
-    await assert.rejects(acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) }),
-      (error: unknown) => (error instanceof Error) && error.message.includes("has not been invoked for the current page"),
+    // The expectation is attached before the clock is driven, so the rejection the drain releases is observed rather than left unhandled.
+    const rejection = assert.rejects(running, (error: unknown) => (error instanceof Error) && error.message.includes("has not been invoked for the current page"),
       "the last grant-pending answer is what the caller sees");
 
+    await settle();
+    assert.equal(clock.pending, 1, "the first attempt found no grant, so its cadence is parked on the clock");
+
+    await drainClock(clock);
+    await rejection;
+
+    assert.equal(clock.now(), ACTIVE_TAB_GRANT_CEILING_MS, "virtual time advanced by exactly the cadences the ceiling afforded");
     assert.equal(extension.calls.filter((call) => call.kind === "start").length, Math.floor(ACTIVE_TAB_GRANT_CEILING_MS / ACTIVE_TAB_GRANT_POLL_MS) + 1,
       "the ceiling affords one attempt plus one per cadence");
     assert.equal(server.listeners(), before, "no attempt left a handler behind");
@@ -624,8 +638,8 @@ describe("acquireCaptureStream", () => {
     const destroyServer = makeFakeServer(destroyTimeline);
     const destroyExtension = makeFakeExtension(destroyTimeline);
     const destroyPage = makeFakePage(destroyTimeline);
-    const destroyClock = makeFakeClock();
-    const destroyed = await acquireCaptureStream(destroyPage.page, OPTIONS, { clock: destroyClock.clock, deps: makeDeps(destroyExtension, destroyServer) });
+    const destroyClock = new TestClock();
+    const destroyed = await acquireCaptureStream(destroyPage.page, OPTIONS, { clock: destroyClock, deps: makeDeps(destroyExtension, destroyServer) });
 
     destroyed.destroy();
 
@@ -637,8 +651,8 @@ describe("acquireCaptureStream", () => {
     const closeServer = makeFakeServer(closeTimeline);
     const closeExtension = makeFakeExtension(closeTimeline);
     const closePage = makeFakePage(closeTimeline);
-    const closeClock = makeFakeClock();
-    const closed = await acquireCaptureStream(closePage.page, OPTIONS, { clock: closeClock.clock, deps: makeDeps(closeExtension, closeServer) });
+    const closeClock = new TestClock();
+    const closed = await acquireCaptureStream(closePage.page, OPTIONS, { clock: closeClock, deps: makeDeps(closeExtension, closeServer) });
 
     closePage.emitClose();
 
@@ -655,7 +669,7 @@ describe("acquireCaptureStream", () => {
     const server = makeFakeServer(timeline);
     const extension = makeFakeExtension(timeline, { ready: false });
     const page = makeFakePage(timeline);
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
 
     await assert.rejects(acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) }),
       (error: unknown) => (error instanceof Error) && (error.message === EXTENSION_NOT_READY_MESSAGE));
@@ -673,7 +687,7 @@ describe("acquireCaptureStream", () => {
     const server = makeFakeServer(timeline);
     const extension = makeFakeExtension(timeline);
     const page = makeFakePage(timeline);
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
 
     const deps = makeDeps(extension, server, async (): Promise<void> => { throw new Error(TAB_NOT_SELECTED_MESSAGE); });
 
@@ -704,9 +718,15 @@ describe("acquireCaptureStream", () => {
       }
     });
     const page = makeFakePage(timeline);
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
 
-    await acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) });
+    const running = acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) });
+
+    await settle();
+    assert.equal(clock.pending, 1, "the first attempt found no grant, so its cadence is parked on the clock");
+
+    await advanceThroughSchedule(clock, [ACTIVE_TAB_GRANT_POLL_MS]);
+    await running;
 
     assert.equal(timeline.filter((entry) => entry === "select").length, 1, "one selection covers the whole poll");
     assert.equal(timeline.filter((entry) => entry === "release").length, 1, "and it is handed back exactly once");
@@ -736,7 +756,7 @@ describe("acquireCaptureStream", () => {
       }
     });
     const page = makeFakePage(timeline);
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
 
     const warnings = await captureWarnings(async () => {
 

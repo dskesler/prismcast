@@ -20,6 +20,7 @@ import { applyVideoStyles, buildVideoSelectorType, checkVideoPresence, enforceVi
 import { getCaptureImpairment, syncWindowVisibility } from "../browser/index.ts";
 import { getEffectiveCaptureCodec, isCaptureHardwareAccelerated } from "./codec.ts";
 import { CONFIG } from "../config/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import { clearNativeInitState } from "./hlsSegments.ts";
 import { clearProbeCache } from "../native/probe.ts";
 import { emitStreamHealthChanged } from "./statusEmitter.ts";
@@ -30,6 +31,7 @@ import { getProviderBySlug } from "../browser/channelSelection.ts";
 import { getShowName } from "./showInfo.ts";
 import { reaffirmCaptureSurface } from "../browser/cdp.ts";
 import { refreshNativeManifest } from "../native/index.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* Live video streams can fail in many ways: the network can drop, the player can stall, the site can auto-pause, or ads can break playback. The health monitor
  * watches for these failures and attempts recovery. This is essential for unattended DVR recording where the user cannot manually intervene.
@@ -92,7 +94,7 @@ export interface MonitorStreamInfo {
   // Service filter tag from the domain config (e.g., "xfinity", "hulu"). Used to look up the ProviderModule for service-specific monitoring flags.
   serviceTag?: string;
 
-  startTime: Date;
+  startTime: number;
 }
 
 // Monitor state interfaces.
@@ -164,18 +166,20 @@ interface SegmentState {
  * defaultMonitorDeps built from the functions this module already imports. The impairment read belongs here for a reason of its own: a replacement starts a fresh
  * capture, so whether one can succeed is a fact about the browser, and injecting the read is what lets a test drive the ladder's availability decision without a
  * live Chrome. The codec reads belong here for the mirror-image reason: their real answers depend on the host's GPU, so only an injected pair lets a test prove
- * the fallback actually consults them rather than passing on values that happen to agree. This is the collaborator-injection form of the Clock port
- * (utils/clock.ts).
+ * the fallback actually consults them rather than passing on values that happen to agree. The set carries the library's Clock as one of its members: every grace
+ * window, every navigation and segment mark, every recovery instant, and the tick's own cadence read it, so production wires the system clock while a test wires a
+ * virtual clock and drives the monitor's whole timeline from one advance.
  */
 export interface MonitorDeps {
 
+  readonly clock: Clock;
   readonly getCaptureImpairment: typeof getCaptureImpairment;
   readonly getEffectiveCaptureCodec: typeof getEffectiveCaptureCodec;
   readonly isCaptureHardwareAccelerated: typeof isCaptureHardwareAccelerated;
   readonly syncWindowVisibility: typeof syncWindowVisibility;
 }
 
-const defaultMonitorDeps: MonitorDeps = { getCaptureImpairment, getEffectiveCaptureCodec, isCaptureHardwareAccelerated, syncWindowVisibility };
+const defaultMonitorDeps: MonitorDeps = { clock: systemClock, getCaptureImpairment, getEffectiveCaptureCodec, isCaptureHardwareAccelerated, syncWindowVisibility };
 
 /**
  * Monitors video playback health and attempts escalating recovery when issues are detected. This function runs on an interval, checking video state and triggering
@@ -353,14 +357,14 @@ export function monitorPlaybackHealth(
   const PROACTIVE_RELOAD_MARGIN_MS = 120000;
 
   // Timestamp of the most recent full page navigation. Used to calculate elapsed continuous playback for proactive reload when maxContinuousPlayback is configured.
-  // Initialized to Date.now() because the monitor starts immediately after stream setup establishes playback, meaning a page load just completed. Reset
+  // Initialized to the clock's reading because the monitor starts immediately after stream setup establishes playback, meaning a page load just completed. Reset
   // after any successful page navigation recovery or tab replacement, but NOT after source reloads (L2) which preserve the page's JavaScript context.
-  let lastPageNavigationTime = Date.now();
+  let lastPageNavigationTime = deps.clock.now();
 
   // Pre-compute the selector type string for video element selection. This is passed to evaluate() calls.
   const selectorType = buildVideoSelectorType(profile);
 
-  // Capture stream context for re-establishing on each interval tick. AsyncLocalStorage context is lost when entering setInterval callbacks. The show name
+  // Capture stream context for re-establishing on each interval tick. AsyncLocalStorage context is lost when entering the callback timer. The show name
   // resolver is lazy - it reads from the live show name cache at log time, so messages always reflect the current program even as shows change mid-stream.
   const streamContext = {
 
@@ -400,7 +404,7 @@ export function monitorPlaybackHealth(
 
     consecutiveTinySegments: 0,
     lastCheckedIndex: 0,
-    lastSegmentAdvanceTime: Date.now(),
+    lastSegmentAdvanceTime: deps.clock.now(),
     preRecoveryIndex: null,
     productionStalled: false,
     waitStartTime: null,
@@ -415,7 +419,7 @@ export function monitorPlaybackHealth(
     issueTime: null,
     issueType: null,
     lastCheckedSegmentIndex: 0,
-    lastSegmentAdvanceTime: Date.now(),
+    lastSegmentAdvanceTime: deps.clock.now(),
     recoveryAttempts: 0
   };
 
@@ -424,7 +428,7 @@ export function monitorPlaybackHealth(
   const resolutionState: ResolutionState = {
 
     consecutiveDegradedReadings: 0,
-    graceEnd: Date.now() + RESOLUTION_GRACE_PERIOD,
+    graceEnd: deps.clock.now() + RESOLUTION_GRACE_PERIOD,
     peak: null,
     recoveryAttempt: 0
   };
@@ -456,7 +460,7 @@ export function monitorPlaybackHealth(
     }
 
     const proxy = identity.nativeProxy;
-    const now = Date.now();
+    const now = deps.clock.now();
     const currentSegmentIndex = proxy.getSegmentIndex();
     const lastSegmentTime = proxy.getLastSegmentTime();
     const targetDuration = proxy.getTargetDuration();
@@ -609,10 +613,10 @@ export function monitorPlaybackHealth(
       return;
     }
 
-    const now = Date.now();
+    const now = deps.clock.now();
     const memoryBytes = getStreamMemoryUsage(entry).total;
     const channelKey = entry.info.storeKey;
-    const clientSummary = getClientSummary(streamInfo.numericStreamId);
+    const clientSummary = getClientSummary(streamInfo.numericStreamId, now);
 
     // Native streams have no recovery ladder, so we reuse escalationLevel purely as a UI severity encoding rather than as a recovery-level index: healthy maps to 0,
     // stalled to 1, and recovering to 2. The intended ordering is stalled < recovering because an actively-recovering stream warrants a stronger visual signal than one
@@ -628,7 +632,7 @@ export function monitorPlaybackHealth(
       clientCount: clientSummary.total,
       clients: clientSummary.clients,
       currentTime: 0,
-      duration: Math.round((now - streamInfo.startTime.getTime()) / 1000),
+      duration: Math.round((now - streamInfo.startTime) / 1000),
       escalationLevel: escalation,
       hardwareAccelerated: isHardwareAccelerated(entry),
       health,
@@ -647,7 +651,7 @@ export function monitorPlaybackHealth(
       serviceName: streamInfo.serviceName,
       showName: getShowName(streamInfo.numericStreamId),
       sourceResolution: null,
-      startTime: streamInfo.startTime.toISOString(),
+      startTime: new Date(streamInfo.startTime).toISOString(),
       streamingMode: identity.mode,
       url
     };
@@ -700,6 +704,7 @@ export function monitorPlaybackHealth(
       const success = await refreshNativeManifest({
 
         channelName: entry.info.storeKey,
+        clock: deps.clock,
         onFeedApplied: (metadata) => {
 
           // The registry write belongs to this layer, not to the native one: recovery already holds the entry, so a refresh that binds a different rung of the
@@ -717,7 +722,7 @@ export function monitorPlaybackHealth(
       if(success) {
 
         // Reset staleness tracking so the monitor gives the refreshed stream time to produce segments.
-        nativeHealthState.lastSegmentAdvanceTime = Date.now();
+        nativeHealthState.lastSegmentAdvanceTime = deps.clock.now();
       }
     } finally {
 
@@ -918,7 +923,7 @@ export function monitorPlaybackHealth(
       return;
     }
 
-    const now = Date.now();
+    const now = deps.clock.now();
 
     // Get current memory usage from the stream's HLS segment buffers.
     const entry = getStream(streamInfo.numericStreamId);
@@ -928,7 +933,7 @@ export function monitorPlaybackHealth(
     const channelKey = entry?.info.storeKey ?? "";
 
     // Get current client counts and type breakdown for this stream.
-    const clientSummary = getClientSummary(streamInfo.numericStreamId);
+    const clientSummary = getClientSummary(streamInfo.numericStreamId, now);
 
     // An entry that is gone projects as the capture defaults, which is the same shape the flat wire carries for a stream whose setup has not filled it in yet.
     const identity = entry?.identity;
@@ -949,7 +954,7 @@ export function monitorPlaybackHealth(
       clientCount: clientSummary.total,
       clients: clientSummary.clients,
       currentTime: lastVideoState?.time ?? 0,
-      duration: Math.round((now - streamInfo.startTime.getTime()) / 1000),
+      duration: Math.round((now - streamInfo.startTime) / 1000),
       escalationLevel: recoveryState.escalationLevel,
       hardwareAccelerated: entry ? isHardwareAccelerated(entry) : false,
       health: computeHealthStatus(),
@@ -968,7 +973,7 @@ export function monitorPlaybackHealth(
       serviceName: streamInfo.serviceName,
       showName: getShowName(streamInfo.numericStreamId),
       sourceResolution,
-      startTime: streamInfo.startTime.toISOString(),
+      startTime: new Date(streamInfo.startTime).toISOString(),
       streamingMode: identity?.mode ?? "capture",
       url
     };
@@ -999,7 +1004,7 @@ export function monitorPlaybackHealth(
     segmentState.consecutiveTinySegments = 0;
     segmentState.wasInTinyState = false;
     segmentState.lastCheckedIndex = getStreamSegmenter(getStream(streamInfo.numericStreamId))?.getSegmentIndex() ?? 0;
-    segmentState.lastSegmentAdvanceTime = Date.now();
+    segmentState.lastSegmentAdvanceTime = deps.clock.now();
   }
 
   /**
@@ -1023,7 +1028,7 @@ export function monitorPlaybackHealth(
   function resetResolutionState(): void {
 
     resolutionState.consecutiveDegradedReadings = 0;
-    resolutionState.graceEnd = Date.now() + RESOLUTION_GRACE_PERIOD;
+    resolutionState.graceEnd = deps.clock.now() + RESOLUTION_GRACE_PERIOD;
     resolutionState.recoveryAttempt = 0;
   }
 
@@ -1034,7 +1039,7 @@ export function monitorPlaybackHealth(
    */
   function isPageReloadAllowed(): boolean {
 
-    const reloadWindow = Date.now() - CONFIG.playback.pageReloadWindow;
+    const reloadWindow = deps.clock.now() - CONFIG.playback.pageReloadWindow;
 
     pageReloadTimestamps = pageReloadTimestamps.filter((ts) => ts > reloadWindow);
 
@@ -1043,7 +1048,7 @@ export function monitorPlaybackHealth(
       return false;
     }
 
-    pageReloadTimestamps.push(Date.now());
+    pageReloadTimestamps.push(deps.clock.now());
 
     return true;
   }
@@ -1064,7 +1069,7 @@ export function monitorPlaybackHealth(
    */
   function setRecoveryGracePeriod(level: number): void {
 
-    recoveryState.graceUntil = Date.now() + (recoveryGracePeriods[level] ?? 0);
+    recoveryState.graceUntil = deps.clock.now() + (recoveryGracePeriods[level] ?? 0);
   }
 
   /**
@@ -1076,7 +1081,7 @@ export function monitorPlaybackHealth(
    */
   function isWithinRecoveryGrace(): boolean {
 
-    return Date.now() < recoveryState.graceUntil;
+    return deps.clock.now() < recoveryState.graceUntil;
   }
 
   /**
@@ -1088,7 +1093,7 @@ export function monitorPlaybackHealth(
   function stopMonitoring(): void {
 
     intervalCleared = true;
-    clearInterval(interval);
+    interval[Symbol.dispose]();
   }
 
   /**
@@ -1138,7 +1143,7 @@ export function monitorPlaybackHealth(
       return { outcome: "stopped" };
     }
 
-    const cbResult = checkCircuitBreaker(circuitBreaker, Date.now());
+    const cbResult = checkCircuitBreaker(circuitBreaker, deps.clock.now());
 
     if(cbResult.shouldTrip) {
 
@@ -1163,14 +1168,15 @@ export function monitorPlaybackHealth(
     currentPage = result.page;
     currentContext = result.context;
 
-    const duration = formatRecoveryDuration(metrics.currentRecoveryStartTime ?? Date.now());
+    const settledAt = deps.clock.now();
+    const duration = formatRecoveryDuration(metrics.currentRecoveryStartTime ?? settledAt, settledAt);
 
     LOG.info("Recovered in %s via %s.", duration, RECOVERY_METHODS.tabReplacement);
 
-    recordRecoverySuccess(metrics, RECOVERY_METHODS.tabReplacement);
+    recordRecoverySuccess(metrics, RECOVERY_METHODS.tabReplacement, settledAt);
 
     // Full state reset for fresh tab.
-    lastPageNavigationTime = Date.now();
+    lastPageNavigationTime = deps.clock.now();
     resetRecoveryCounters();
     resetEscalationState();
     resetSegmentMonitoringState();
@@ -1273,13 +1279,13 @@ export function monitorPlaybackHealth(
 
     recoveryState.inProgress = true;
     recoveryState.totalAttempts++;
-    recoveryState.lastRecoveryTime = Date.now();
+    recoveryState.lastRecoveryTime = deps.clock.now();
     lastIssueType = issueType;
-    lastIssueTime = Date.now();
+    lastIssueTime = deps.clock.now();
 
-    const tabRecoveryElapsed = startTimer();
+    const tabRecoveryElapsed = startTimer(deps.clock);
 
-    recordRecoveryAttempt(metrics, RECOVERY_METHODS.tabReplacement);
+    recordRecoveryAttempt(metrics, RECOVERY_METHODS.tabReplacement, deps.clock.now());
 
     try {
 
@@ -1363,7 +1369,7 @@ export function monitorPlaybackHealth(
    */
   async function performPageNavigationRecovery(): Promise<PageNavigationRecoveryResult> {
 
-    const navRecoveryElapsed = startTimer();
+    const navRecoveryElapsed = startTimer(deps.clock);
 
     // Track page count before navigation to detect unexpected new tabs (popups, ads).
     const browser = currentPage.browser();
@@ -1373,7 +1379,7 @@ export function monitorPlaybackHealth(
 
       // Use tuneToChannel to reinitialize playback. It is the tune this recovery path owns, and it runs the phases stream setup ran - navigation, channel
       // selection, video detection, click-to-play, playback - so a recovered stream comes up the way a fresh one did.
-      const { context: newContext } = await tuneToChannel(currentPage, url, profile);
+      const { context: newContext } = await tuneToChannel(currentPage, url, profile, deps.clock);
 
       // Check for unexpected new tabs created during tuning.
       const pageCountAfter = (await browser.pages()).length;
@@ -1482,7 +1488,7 @@ export function monitorPlaybackHealth(
 
       try {
 
-        const newContext = await findVideoContext(currentPage, profile);
+        const newContext = await findVideoContext(currentPage, profile, deps.clock);
         const validationState = await validateVideoElement(newContext, selectorType);
 
         if(validationState.found) {
@@ -1543,7 +1549,7 @@ export function monitorPlaybackHealth(
     recoveryState.totalAttempts++;
     recoveryState.inProgress = true;
 
-    recordRecoveryAttempt(metrics, RECOVERY_METHODS.pageNavigation);
+    recordRecoveryAttempt(metrics, RECOVERY_METHODS.pageNavigation, deps.clock.now());
 
     // Check page reload limit before attempting recovery.
     if(!isPageReloadAllowed()) {
@@ -1577,13 +1583,14 @@ export function monitorPlaybackHealth(
 
       currentContext = recoveryResult.newContext;
 
-      const duration = formatRecoveryDuration(metrics.currentRecoveryStartTime ?? now);
+      const settledAt = deps.clock.now();
+      const duration = formatRecoveryDuration(metrics.currentRecoveryStartTime ?? settledAt, settledAt);
 
       LOG.info("Recovered in %s via %s.", duration, RECOVERY_METHODS.pageNavigation);
 
-      recordRecoverySuccess(metrics, RECOVERY_METHODS.pageNavigation);
+      recordRecoverySuccess(metrics, RECOVERY_METHODS.pageNavigation, settledAt);
 
-      lastPageNavigationTime = Date.now();
+      lastPageNavigationTime = deps.clock.now();
       resetRecoveryCounters();
       resetEscalationState();
       resetSegmentMonitoringState();
@@ -1850,7 +1857,7 @@ export function monitorPlaybackHealth(
       if(recoveryResult.success && recoveryResult.newContext) {
 
         currentContext = recoveryResult.newContext;
-        lastPageNavigationTime = Date.now();
+        lastPageNavigationTime = deps.clock.now();
 
         // Reset the general-recovery state a successful reload made stale, composed for this site. Deliberately NOT resetResolutionState() (which the proactive-reload
         // sibling calls): that zeroes the recoveryAttempt ratchet set to 1 just above, collapsing the two-step resolution ladder into an endless step-1 loop. And
@@ -1978,7 +1985,7 @@ export function monitorPlaybackHealth(
     if(recoveryResult.success && recoveryResult.newContext) {
 
       currentContext = recoveryResult.newContext;
-      lastPageNavigationTime = Date.now();
+      lastPageNavigationTime = deps.clock.now();
 
       LOG.info("Proactive reload completed successfully.");
 
@@ -2096,7 +2103,7 @@ export function monitorPlaybackHealth(
       LOG.warn("Playback %s - recovering via %s.", issueDesc, recoveryMethod);
     }
 
-    recordRecoveryAttempt(metrics, recoveryMethod);
+    recordRecoveryAttempt(metrics, recoveryMethod, deps.clock.now());
 
     // For L2/L3 recovery, record the current segment index so we can verify segments are flowing after recovery completes.
     if(recoveryState.escalationLevel >= 2) {
@@ -2114,7 +2121,8 @@ export function monitorPlaybackHealth(
       // Levels 1-2: In-page recovery via ensurePlayback().
       if(recoveryState.escalationLevel <= 2) {
 
-        await ensurePlayback(currentPage, currentContext, profile, { recoveryLevel: recoveryState.escalationLevel, skipNativeFullscreen: true });
+        await ensurePlayback(currentPage, currentContext, profile,
+          { clock: deps.clock, recoveryLevel: recoveryState.escalationLevel, skipNativeFullscreen: true });
 
         // The stream can terminate while ensurePlayback runs. A resumption after the monitor stopped applies none of the settlement below - the source-reload
         // mark, the discontinuity, the grace window, the resolution reset. Returning true is what makes the caller exit the tick immediately.
@@ -2175,13 +2183,14 @@ export function monitorPlaybackHealth(
 
               currentContext = recoveryResult.newContext;
 
-              const duration = formatRecoveryDuration(metrics.currentRecoveryStartTime ?? now);
+              const settledAt = deps.clock.now();
+              const duration = formatRecoveryDuration(metrics.currentRecoveryStartTime ?? settledAt, settledAt);
 
               LOG.info("Recovered in %s via %s.", duration, RECOVERY_METHODS.pageNavigation);
 
-              recordRecoverySuccess(metrics, RECOVERY_METHODS.pageNavigation);
+              recordRecoverySuccess(metrics, RECOVERY_METHODS.pageNavigation, settledAt);
 
-              lastPageNavigationTime = Date.now();
+              lastPageNavigationTime = deps.clock.now();
               resetRecoveryCounters();
               resetEscalationState();
               resetSegmentMonitoringState();
@@ -2243,7 +2252,7 @@ export function monitorPlaybackHealth(
    *    a replacement is about to retire, and the swap closes it, so a tick landing between the close and applyTabReplacementSuccess's re-point would read the
    *    closed page and clear the interval mid-recovery, stopping status updates permanently.
    */
-  const interval = setInterval((): void => {
+  const interval = deps.clock.schedule((): void => {
 
     // Stop monitoring if cleanup was requested.
     if(intervalCleared) {
@@ -2316,8 +2325,8 @@ export function monitorPlaybackHealth(
 
     if(nativeEntry?.identity.mode === "native") {
 
-      // Re-establish stream context for this interval tick before running the native health check. AsyncLocalStorage context is lost when entering setInterval
-      // callbacks, so without this wrapper the native path's non-debug warnings would emit without the stream-ID prefix. This mirrors the capture-mode branch below.
+      // Re-establish stream context for this interval tick before running the native health check. AsyncLocalStorage context is lost when entering the callback
+      // timer, so without this wrapper the native path's non-debug warnings would emit without the stream-ID prefix. This mirrors the capture-mode branch below.
       dispatchSerializedTick(() => runWithStreamContext(streamContext, async () => {
 
         checkNativeStreamHealth(nativeEntry);
@@ -2326,7 +2335,7 @@ export function monitorPlaybackHealth(
       return;
     }
 
-    // Re-establish stream context for this interval tick. AsyncLocalStorage context is lost when entering setInterval callbacks.
+    // Re-establish stream context for this interval tick. AsyncLocalStorage context is lost when entering the callback timer.
     dispatchSerializedTick(() => runWithStreamContext(streamContext, async () => {
 
       try {
@@ -2342,7 +2351,7 @@ export function monitorPlaybackHealth(
         }
 
         // Capture current timestamp for all timing calculations in this check cycle.
-        const now = Date.now();
+        const now = deps.clock.now();
 
         // Gather current video state for analysis. The getVideoState helper encapsulates video element selection and returns all properties needed for health analysis.
         // We catch frame detachment errors specifically to handle context invalidation differently from normal "video not found" cases.
@@ -2353,7 +2362,8 @@ export function monitorPlaybackHealth(
 
           // A read issued while a timeout streak is open is a confirmation probe, so it carries the short bound. With no streak open the read takes the evaluate
           // wrapper's default, which is the bound that detects a hung tab in the first place.
-          stateInfo = await getVideoState(currentContext, selectorType, (consecutiveTimeouts > 0) ? UNRESPONSIVE_PROBE_TIMEOUT : undefined);
+          stateInfo = await getVideoState(currentContext, selectorType,
+            { clock: deps.clock, timeoutMs: (consecutiveTimeouts > 0) ? UNRESPONSIVE_PROBE_TIMEOUT : undefined });
         } catch(stateError) {
 
           // Classify through the shared page-death predicate: the world the read ran in is gone, so the video may simply live in a context we no longer hold.
@@ -2378,7 +2388,7 @@ export function monitorPlaybackHealth(
 
           try {
 
-            const newContext = await findVideoContext(currentPage, profile);
+            const newContext = await findVideoContext(currentPage, profile, deps.clock);
             const validationState = await validateVideoElement(newContext, selectorType);
 
             if(validationState.found) {
@@ -2557,11 +2567,12 @@ export function monitorPlaybackHealth(
           // If a recovery was pending confirmation (L1/L2), log success now that we have healthy playback.
           if((metrics.currentRecoveryStartTime !== null) && (metrics.currentRecoveryMethod !== null)) {
 
-            const duration = formatRecoveryDuration(metrics.currentRecoveryStartTime);
+            const settledAt = deps.clock.now();
+            const duration = formatRecoveryDuration(metrics.currentRecoveryStartTime, settledAt);
 
             LOG.info("Recovered in %s via %s.", duration, metrics.currentRecoveryMethod);
 
-            recordRecoverySuccess(metrics, metrics.currentRecoveryMethod);
+            recordRecoverySuccess(metrics, metrics.currentRecoveryMethod, settledAt);
           }
 
           const healthyDuration = now - recoveryState.lastRecoveryTime;
@@ -2623,7 +2634,7 @@ export function monitorPlaybackHealth(
 
           // Update issue state so SSE clients can show the degraded state.
           lastIssueType = "tab timing out";
-          lastIssueTime = Date.now();
+          lastIssueTime = deps.clock.now();
 
           /* After 3 consecutive timeouts the tab has stopped answering and only a replacement can save the stream. When one cannot be started, the stream is
            * unrecoverable: the ladder has nothing left to try, and leaving it in the registry would hold open the very relaunch that would cure a marked browser.
@@ -2681,7 +2692,7 @@ export function monitorPlaybackHealth(
       // Log errors that escape the inner try/catch. In normal operation we should not reach here - if we do, there's a bug to investigate.
       LOG.warn("Monitor tick error escaped inner try/catch: %s.", formatError(outerError));
     }));
-  }, CONFIG.playback.monitorInterval);
+  }, CONFIG.playback.monitorInterval, { repeat: true });
 
   /* The monitor's teardown: mark the interval cleared (so any in-flight async tick short-circuits) and clear it. Self-contained - it owns only the interval. Defined
    * as a const so it is exposed as both dispose() and [Symbol.dispose].

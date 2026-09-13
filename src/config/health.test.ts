@@ -5,29 +5,38 @@
  * transitions (verified / needsLogin / unknown) and the status-aware TTL exemption; persistence is exercised indirectly via the file store framework's own
  * tests in persistence.test.ts, and the v1-to-v2 schema migration is exercised at the integration tier (test/e2e/persistence/health-state-persistence.test.ts).
  */
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
+import { afterEach, beforeEach, describe, test } from "node:test";
 import { clearDomainAuthRequirement, flushHealthStateNow, getChannelHealth, getDomainAuthState, getHealthSnapshot, loadHealthState, markChannelFailure,
   markChannelSuccess, markDomainAuth, markDomainAuthRequired, subscribeToHealth } from "./health.ts";
 import { firstOf, withTempDir } from "../testing.helpers.ts";
 import { getHealthFilePath, initializeDataDir } from "./paths.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { useHealthStoreOnClock } from "./health.helpers.ts";
 
-// The reference instant every mocked clock in this file counts from, so a row's expected timestamps read as offsets rather than absolute epochs.
+// The reference instant every clock in this file counts from, so a row's expected timestamps read as offsets rather than absolute epochs.
 const BASE_TIME_MS = 1700000000000;
+
+// The module's write debounce, restated here because it is private to health.ts. The rows that drive a flush advance by exactly this window.
+const FLUSH_DELAY_MS = 2000;
 
 describe("markChannelSuccess", () => {
 
-  beforeEach(() => {
+  let clock: TestClock;
+  let dispose: () => Promise<void>;
 
-    // We mock Date for deterministic timestamps and setTimeout to suppress the 2-second debounced flushHealthState() write timer. Without setTimeout mocking,
-    // the timer would survive the test, attempt a write to (potentially missing) data-dir, and keep the test process alive.
-    mock.timers.enable({ apis: [ "Date", "setTimeout" ], now: BASE_TIME_MS });
+  beforeEach(async () => {
+
+    // The load is the store's establishment, so a fresh clock handed to it puts every stamp, every expiry test, and the flush debounce on this row's own virtual
+    // timeline: the timestamps below read as offsets from BASE_TIME_MS, and the debounce arms nothing that can survive the row.
+    clock = new TestClock(BASE_TIME_MS);
+    dispose = await useHealthStoreOnClock(clock);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
-    mock.timers.reset();
+    await dispose();
   });
 
   test("records success status and timestamp for the channel + domain pair", () => {
@@ -124,16 +133,20 @@ describe("markChannelSuccess", () => {
 
 describe("markChannelFailure", () => {
 
-  beforeEach(() => {
+  let clock: TestClock;
+  let dispose: () => Promise<void>;
 
-    // We mock Date for deterministic timestamps and setTimeout to suppress the 2-second debounced flushHealthState() write timer. Without setTimeout mocking,
-    // the timer would survive the test, attempt a write to (potentially missing) data-dir, and keep the test process alive.
-    mock.timers.enable({ apis: [ "Date", "setTimeout" ], now: BASE_TIME_MS });
+  beforeEach(async () => {
+
+    // The load is the store's establishment, so a fresh clock handed to it puts every stamp, every expiry test, and the flush debounce on this row's own virtual
+    // timeline: the timestamps below read as offsets from BASE_TIME_MS, and the debounce arms nothing that can survive the row.
+    clock = new TestClock(BASE_TIME_MS);
+    dispose = await useHealthStoreOnClock(clock);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
-    mock.timers.reset();
+    await dispose();
   });
 
   test("records failed status without affecting domain auth", () => {
@@ -178,16 +191,20 @@ describe("markChannelFailure", () => {
 
 describe("markDomainAuth", () => {
 
-  beforeEach(() => {
+  let clock: TestClock;
+  let dispose: () => Promise<void>;
 
-    // We mock Date for deterministic timestamps and setTimeout to suppress the 2-second debounced flushHealthState() write timer. Without setTimeout mocking,
-    // the timer would survive the test, attempt a write to (potentially missing) data-dir, and keep the test process alive.
-    mock.timers.enable({ apis: [ "Date", "setTimeout" ], now: BASE_TIME_MS });
+  beforeEach(async () => {
+
+    // The load is the store's establishment, so a fresh clock handed to it puts every stamp, every expiry test, and the flush debounce on this row's own virtual
+    // timeline: the timestamps below read as offsets from BASE_TIME_MS, and the debounce arms nothing that can survive the row.
+    clock = new TestClock(BASE_TIME_MS);
+    dispose = await useHealthStoreOnClock(clock);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
-    mock.timers.reset();
+    await dispose();
   });
 
   test("marks the domain as authenticated without recording any channel state", () => {
@@ -222,16 +239,20 @@ describe("markDomainAuth", () => {
 
 describe("getChannelHealth", () => {
 
-  beforeEach(() => {
+  let clock: TestClock;
+  let dispose: () => Promise<void>;
 
-    // We mock Date for deterministic timestamps and setTimeout to suppress the 2-second debounced flushHealthState() write timer. Without setTimeout mocking,
-    // the timer would survive the test, attempt a write to (potentially missing) data-dir, and keep the test process alive.
-    mock.timers.enable({ apis: [ "Date", "setTimeout" ], now: BASE_TIME_MS });
+  beforeEach(async () => {
+
+    // The load is the store's establishment, so a fresh clock handed to it puts every stamp, every expiry test, and the flush debounce on this row's own virtual
+    // timeline: the timestamps below read as offsets from BASE_TIME_MS, and the debounce arms nothing that can survive the row.
+    clock = new TestClock(BASE_TIME_MS);
+    dispose = await useHealthStoreOnClock(clock);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
-    mock.timers.reset();
+    await dispose();
   });
 
   test("returns null when no entry exists for the key", () => {
@@ -252,7 +273,7 @@ describe("getChannelHealth", () => {
     markChannelSuccess("ttl-test", "ttl.com");
 
     // Advance time by 8 days; entry should now be considered expired.
-    mock.timers.tick(8 * 24 * 60 * 60 * 1000);
+    clock.advance(8 * 24 * 60 * 60 * 1000);
 
     assert.equal(getChannelHealth("ttl-test", "ttl.com"), null);
   });
@@ -260,16 +281,20 @@ describe("getChannelHealth", () => {
 
 describe("getDomainAuthState", () => {
 
-  beforeEach(() => {
+  let clock: TestClock;
+  let dispose: () => Promise<void>;
 
-    // We mock Date for deterministic timestamps and setTimeout to suppress the 2-second debounced flushHealthState() write timer. Without setTimeout mocking,
-    // the timer would survive the test, attempt a write to (potentially missing) data-dir, and keep the test process alive.
-    mock.timers.enable({ apis: [ "Date", "setTimeout" ], now: BASE_TIME_MS });
+  beforeEach(async () => {
+
+    // The load is the store's establishment, so a fresh clock handed to it puts every stamp, every expiry test, and the flush debounce on this row's own virtual
+    // timeline: the timestamps below read as offsets from BASE_TIME_MS, and the debounce arms nothing that can survive the row.
+    clock = new TestClock(BASE_TIME_MS);
+    dispose = await useHealthStoreOnClock(clock);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
-    mock.timers.reset();
+    await dispose();
   });
 
   test("returns null when the domain has no recorded auth", () => {
@@ -281,7 +306,7 @@ describe("getDomainAuthState", () => {
 
     markDomainAuth("ttl-domain-test");
 
-    mock.timers.tick(8 * 24 * 60 * 60 * 1000);
+    clock.advance(8 * 24 * 60 * 60 * 1000);
 
     assert.equal(getDomainAuthState("ttl-domain-test"), null);
   });
@@ -294,7 +319,7 @@ describe("getDomainAuthState", () => {
      */
     markDomainAuthRequired("ttl-exempt-domain-test");
 
-    mock.timers.tick(8 * 24 * 60 * 60 * 1000);
+    clock.advance(8 * 24 * 60 * 60 * 1000);
 
     assert.deepEqual(getDomainAuthState("ttl-exempt-domain-test"), { status: "needsLogin", timestamp: BASE_TIME_MS },
       "needsLogin entry survives past the TTL with its original timestamp");
@@ -303,16 +328,20 @@ describe("getDomainAuthState", () => {
 
 describe("markDomainAuthRequired", () => {
 
-  beforeEach(() => {
+  let clock: TestClock;
+  let dispose: () => Promise<void>;
 
-    // We mock Date for deterministic timestamps and setTimeout to suppress the 2-second debounced flushHealthState() write timer. Without setTimeout mocking,
-    // the timer would survive the test, attempt a write to (potentially missing) data-dir, and keep the test process alive.
-    mock.timers.enable({ apis: [ "Date", "setTimeout" ], now: BASE_TIME_MS });
+  beforeEach(async () => {
+
+    // The load is the store's establishment, so a fresh clock handed to it puts every stamp, every expiry test, and the flush debounce on this row's own virtual
+    // timeline: the timestamps below read as offsets from BASE_TIME_MS, and the debounce arms nothing that can survive the row.
+    clock = new TestClock(BASE_TIME_MS);
+    dispose = await useHealthStoreOnClock(clock);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
-    mock.timers.reset();
+    await dispose();
   });
 
   test("records a needs-sign-in entry without touching channel health", () => {
@@ -358,16 +387,20 @@ describe("markDomainAuthRequired", () => {
 
 describe("clearDomainAuthRequirement", () => {
 
-  beforeEach(() => {
+  let clock: TestClock;
+  let dispose: () => Promise<void>;
 
-    // We mock Date for deterministic timestamps and setTimeout to suppress the 2-second debounced flushHealthState() write timer. Without setTimeout mocking,
-    // the timer would survive the test, attempt a write to (potentially missing) data-dir, and keep the test process alive.
-    mock.timers.enable({ apis: [ "Date", "setTimeout" ], now: BASE_TIME_MS });
+  beforeEach(async () => {
+
+    // The load is the store's establishment, so a fresh clock handed to it puts every stamp, every expiry test, and the flush debounce on this row's own virtual
+    // timeline: the timestamps below read as offsets from BASE_TIME_MS, and the debounce arms nothing that can survive the row.
+    clock = new TestClock(BASE_TIME_MS);
+    dispose = await useHealthStoreOnClock(clock);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
-    mock.timers.reset();
+    await dispose();
   });
 
   test("removes a needs-sign-in entry, returning the domain to unknown, and emits a change event", () => {
@@ -452,16 +485,20 @@ describe("clearDomainAuthRequirement", () => {
 
 describe("getHealthSnapshot", () => {
 
-  beforeEach(() => {
+  let clock: TestClock;
+  let dispose: () => Promise<void>;
 
-    // We mock Date for deterministic timestamps and setTimeout to suppress the 2-second debounced flushHealthState() write timer. Without setTimeout mocking,
-    // the timer would survive the test, attempt a write to (potentially missing) data-dir, and keep the test process alive.
-    mock.timers.enable({ apis: [ "Date", "setTimeout" ], now: BASE_TIME_MS });
+  beforeEach(async () => {
+
+    // The load is the store's establishment, so a fresh clock handed to it puts every stamp, every expiry test, and the flush debounce on this row's own virtual
+    // timeline: the timestamps below read as offsets from BASE_TIME_MS, and the debounce arms nothing that can survive the row.
+    clock = new TestClock(BASE_TIME_MS);
+    dispose = await useHealthStoreOnClock(clock);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
-    mock.timers.reset();
+    await dispose();
   });
 
   test("returns the current channels and domains maps", () => {
@@ -487,7 +524,7 @@ describe("getHealthSnapshot", () => {
 
     markDomainAuthRequired(domain);
 
-    mock.timers.tick(8 * 24 * 60 * 60 * 1000);
+    clock.advance(8 * 24 * 60 * 60 * 1000);
 
     assert.deepEqual(getHealthSnapshot().domains[domain], { status: "needsLogin", timestamp: BASE_TIME_MS }, "aged needsLogin entry survives the snapshot prune");
   });
@@ -496,7 +533,7 @@ describe("getHealthSnapshot", () => {
 
     markChannelSuccess("stale-channel", "stale.com");
 
-    mock.timers.tick(8 * 24 * 60 * 60 * 1000);
+    clock.advance(8 * 24 * 60 * 60 * 1000);
 
     const snapshot = getHealthSnapshot();
 
@@ -506,75 +543,75 @@ describe("getHealthSnapshot", () => {
 
 describe("subscribeToHealth", () => {
 
-  beforeEach(() => {
+  let clock: TestClock;
+  let dispose: () => Promise<void>;
 
-    // We mock Date for deterministic timestamps and setTimeout to suppress the 2-second debounced flushHealthState() write timer. Without setTimeout mocking,
-    // the timer would survive the test, attempt a write to (potentially missing) data-dir, and keep the test process alive.
-    mock.timers.enable({ apis: [ "Date", "setTimeout" ], now: BASE_TIME_MS });
+  beforeEach(async () => {
+
+    // The load is the store's establishment, so a fresh clock handed to it puts every stamp, every expiry test, and the flush debounce on this row's own virtual
+    // timeline: the timestamps below read as offsets from BASE_TIME_MS, and the debounce arms nothing that can survive the row.
+    clock = new TestClock(BASE_TIME_MS);
+    dispose = await useHealthStoreOnClock(clock);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
-    mock.timers.reset();
+    await dispose();
   });
 
-  test("returns an unsubscribe function that detaches the listener", async () => {
+  test("returns an unsubscribe function that detaches the listener", () => {
 
-    // We use withTempDir to isolate any flush attempts that fire from prior tests.
-    await withTempDir((dir) => {
+    let calls = 0;
+    const unsubscribe = subscribeToHealth(() => {
 
-      initializeDataDir(dir);
-
-      let calls = 0;
-      const unsubscribe = subscribeToHealth(() => {
-
-        calls++;
-      });
-
-      markChannelSuccess("sub-test-1", "x.com");
-      assert.equal(calls, 1, "subscribed callback fired");
-
-      unsubscribe();
-
-      markChannelSuccess("sub-test-2", "x.com");
-      assert.equal(calls, 1, "after unsubscribe, callback no longer fires");
-
-      return Promise.resolve();
+      calls++;
     });
+
+    markChannelSuccess("sub-test-1", "x.com");
+    assert.equal(calls, 1, "subscribed callback fired");
+
+    unsubscribe();
+
+    markChannelSuccess("sub-test-2", "x.com");
+    assert.equal(calls, 1, "after unsubscribe, callback no longer fires");
   });
 });
 
 describe("expired-entry pruning (memory hygiene)", () => {
 
+  let clock: TestClock;
+
   beforeEach(() => {
 
-    // We mock Date for deterministic timestamps and setTimeout to suppress the 2-second debounced flushHealthState() write timer. Without setTimeout mocking,
-    // the timer would survive the test, attempt a write to (potentially missing) data-dir, and keep the test process alive.
-    mock.timers.enable({ apis: [ "Date", "setTimeout" ], now: BASE_TIME_MS });
+    // Each row below establishes the store itself, in its own data directory, so the shared setup is only the clock those establishments are handed.
+    clock = new TestClock(BASE_TIME_MS);
   });
 
-  afterEach(() => {
-
-    mock.timers.reset();
-  });
-
-  test("getHealthSnapshot excludes expired channel and domain entries from its result", () => {
+  test("getHealthSnapshot excludes expired channel and domain entries from its result", async () => {
 
     // The snapshot is a read-side chokepoint that both filters its own result and prunes the live maps. The directly observable, isolated behavior is the result
     // exclusion: an entry aged past the 7-day TTL must not appear in the returned snapshot. The pruning of the live maps it performs as a side effect is proven on disk
     // by the dedicated flush tests below, which read the persisted file rather than the snapshot result.
-    const channelKey = "prune-snap-channel-" + String(Math.random());
-    const domainKey = "prune-snap-domain-" + String(Math.random());
+    const dispose = await useHealthStoreOnClock(clock);
 
-    markChannelSuccess(channelKey, domainKey);
+    try {
 
-    // Age both entries one day past the 7-day TTL so the next snapshot reads them as expired and prunes them.
-    mock.timers.tick((7 * 24 * 60 * 60 * 1000) + (24 * 60 * 60 * 1000));
+      const channelKey = "prune-snap-channel-" + String(Math.random());
+      const domainKey = "prune-snap-domain-" + String(Math.random());
 
-    const expiredSnapshot = getHealthSnapshot();
+      markChannelSuccess(channelKey, domainKey);
 
-    assert.equal(expiredSnapshot.channels[channelKey], undefined, "expired channel excluded from snapshot");
-    assert.equal(expiredSnapshot.domains[domainKey], undefined, "expired domain excluded from snapshot");
+      // Age both entries one day past the 7-day TTL so the next snapshot reads them as expired and prunes them.
+      clock.advance((7 * 24 * 60 * 60 * 1000) + (24 * 60 * 60 * 1000));
+
+      const expiredSnapshot = getHealthSnapshot();
+
+      assert.equal(expiredSnapshot.channels[channelKey], undefined, "expired channel excluded from snapshot");
+      assert.equal(expiredSnapshot.domains[domainKey], undefined, "expired domain excluded from snapshot");
+    } finally {
+
+      await dispose();
+    }
   });
 
   test("an expired single-key read returns null, and the expired entry is never persisted", async () => {
@@ -589,14 +626,14 @@ describe("expired-entry pruning (memory hygiene)", () => {
       initializeDataDir(dir);
 
       // Reload clears the module-level maps from any residue left by prior tests so this assertion observes only the keys we mark below.
-      await loadHealthState();
+      await loadHealthState(clock);
 
       const channelKey = "prune-single-channel-" + String(Math.random());
       const freshChannel = "prune-single-fresh-" + String(Math.random());
 
       markChannelSuccess(channelKey, "prune-single.com", false);
 
-      mock.timers.tick(8 * 24 * 60 * 60 * 1000);
+      clock.advance(8 * 24 * 60 * 60 * 1000);
 
       // An expired single-key read returns null (and drops the touched key from the live map).
       assert.equal(getChannelHealth(channelKey, "prune-single.com"), null, "expired single-key read returns null");
@@ -619,14 +656,14 @@ describe("expired-entry pruning (memory hygiene)", () => {
 
       initializeDataDir(dir);
 
-      await loadHealthState();
+      await loadHealthState(clock);
 
       const domainKey = "prune-single-domain-" + String(Math.random());
       const freshDomain = "prune-single-fresh-domain-" + String(Math.random());
 
       markDomainAuth(domainKey);
 
-      mock.timers.tick(8 * 24 * 60 * 60 * 1000);
+      clock.advance(8 * 24 * 60 * 60 * 1000);
 
       // An expired single-key domain read returns null (and drops the touched key from the live map).
       assert.equal(getDomainAuthState(domainKey), null, "expired single-key domain read returns null");
@@ -652,7 +689,7 @@ describe("expired-entry pruning (memory hygiene)", () => {
 
       initializeDataDir(dir);
 
-      await loadHealthState();
+      await loadHealthState(clock);
 
       const flaggedDomain = "flush-exempt-needs-login-" + String(Math.random());
       const verifiedDomain = "flush-exempt-verified-" + String(Math.random());
@@ -660,7 +697,7 @@ describe("expired-entry pruning (memory hygiene)", () => {
       markDomainAuthRequired(flaggedDomain);
       markDomainAuth(verifiedDomain);
 
-      mock.timers.tick(8 * 24 * 60 * 60 * 1000);
+      clock.advance(8 * 24 * 60 * 60 * 1000);
 
       await flushHealthStateNow();
 
@@ -681,7 +718,7 @@ describe("expired-entry pruning (memory hygiene)", () => {
       initializeDataDir(dir);
 
       // Reload clears the module-level maps from any residue left by prior tests so this assertion sees only the keys we mark below.
-      await loadHealthState();
+      await loadHealthState(clock);
 
       const expiredChannel = "flush-expired-channel-" + String(Math.random());
       const freshChannel = "flush-fresh-channel-" + String(Math.random());
@@ -691,7 +728,7 @@ describe("expired-entry pruning (memory hygiene)", () => {
       // Mark the soon-to-expire entries first, then advance the clock past the TTL, then mark the fresh entries so only the latter remain inside the window at flush.
       markChannelSuccess(expiredChannel, expiredDomain);
 
-      mock.timers.tick(8 * 24 * 60 * 60 * 1000);
+      clock.advance(8 * 24 * 60 * 60 * 1000);
 
       markChannelSuccess(freshChannel, freshDomain);
 
@@ -704,5 +741,78 @@ describe("expired-entry pruning (memory hygiene)", () => {
       assert.ok(written.channels[freshChannel], "fresh channel persisted");
       assert.ok(written.domains[freshDomain], "fresh domain persisted");
     });
+  });
+});
+
+describe("the flush debounce", () => {
+
+  let clock: TestClock;
+  let dispose: () => Promise<void>;
+
+  beforeEach(async () => {
+
+    clock = new TestClock(BASE_TIME_MS);
+    dispose = await useHealthStoreOnClock(clock);
+  });
+
+  afterEach(async () => {
+
+    await dispose();
+  });
+
+  test("coalesces marks made inside the window into one armed write", async () => {
+
+    /* The debounce is the registry's replace-on-register rule under a single key: the second mark retires the arm the first one made rather than adding a second.
+     * A per-call key would leave two arms here and write twice, which is the regression this row reads.
+     */
+    markChannelSuccess("debounce-first", "debounce.com", false);
+    markChannelSuccess("debounce-second", "debounce.com", false);
+
+    assert.equal(clock.pending, 1, "two marks inside the window leave exactly one armed flush");
+
+    clock.advance(FLUSH_DELAY_MS);
+
+    assert.equal(clock.pending, 0, "the armed flush fired rather than lingering");
+
+    // The fired debounce enqueued its write on the store's serialization queue, so an immediate flush lands behind it and resolves once it has committed.
+    await flushHealthStateNow();
+
+    const written = JSON.parse(await readFile(getHealthFilePath(), "utf8")) as { channels: Record<string, unknown> };
+
+    assert.ok(written.channels["debounce-first"], "the first mark is carried by the single write");
+    assert.ok(written.channels["debounce-second"], "the second mark is carried by the same write");
+  });
+
+  test("a load retires the flush the previous establishment armed", async () => {
+
+    /* A load is the store's one establishment, so it disposes the registry that held any armed debounce before it takes the caller's clock. Without that disposal
+     * the earlier arm survives the load and fires afterwards, rewriting the state the load just read.
+     */
+    const successor = new TestClock(BASE_TIME_MS);
+
+    markChannelSuccess("pre-load-mark", "pre-load.com", false);
+
+    assert.equal(clock.pending, 1, "the mark armed a flush on the establishment's clock");
+
+    await loadHealthState(successor);
+
+    assert.equal(clock.pending, 0, "the load retired the arm the previous registry held");
+    assert.equal(successor.pending, 0, "the load arms nothing of its own");
+  });
+
+  test("an immediate flush retires the armed debounce and writes the mark it carried", async () => {
+
+    // flushHealthStateNow clears the pending arm before it writes, so a shutdown flush leaves no timer behind and the write carries the mark that armed it.
+    markChannelSuccess("flush-now", "flush-now.com", false);
+
+    assert.equal(clock.pending, 1, "the mark armed the debounce");
+
+    await flushHealthStateNow();
+
+    assert.equal(clock.pending, 0, "the immediate flush retired the armed debounce");
+
+    const written = JSON.parse(await readFile(getHealthFilePath(), "utf8")) as { channels: Record<string, unknown> };
+
+    assert.ok(written.channels["flush-now"], "the immediate flush carried the mark");
   });
 });

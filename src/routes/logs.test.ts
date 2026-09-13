@@ -8,11 +8,13 @@
  */
 import type { AddressInfo, Server } from "node:net";
 import type { Express, Request, Response } from "express";
-import { after, before, describe, mock, test } from "node:test";
+import { after, before, describe, test } from "node:test";
 import { emitLogEntry, setConsoleLogging, subscribeToLogs } from "../utils/index.ts";
 import { makeExpressStub, makeReqRes } from "./express.helpers.ts";
 import { mkdtemp, rm } from "node:fs/promises";
+import type { Clock } from "homebridge-plugin-utils";
 import type { RouteCapture } from "./express.helpers.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { closePuppeteerStreamWss } from "../testing.helpers.ts";
 import express from "express";
@@ -20,6 +22,9 @@ import { initializeDataDir } from "../config/paths.ts";
 import os from "node:os";
 import path from "node:path";
 import { setupLogsEndpoint } from "./logs.ts";
+
+// The heartbeat cadence the installer arms, as sse.test.ts declares it, so the rows below advance exactly one interval at a time.
+const HEARTBEAT_INTERVAL_MS = 30000;
 
 interface LogsResponse {
 
@@ -353,11 +358,11 @@ describe("setupLogsEndpoint - GET /logs/stream (SSE handshake)", () => {
 // pairs. This asserts the wire-byte forwarding contract (null-eventType produces only a `data:` line, no `event:` prefix), the level-filter short-circuit branch
 // (entries of the wrong level never reach res.write), and the close-cleanup guarantee (post-close emits do not reach the wire AND the heartbeat stops). Each
 // test extracts the route fresh because setupLogsEndpoint is the only public surface that wires the handler into our stub.
-function findLogsStreamHandler(): RouteCapture {
+function findLogsStreamHandler(clock?: Clock): RouteCapture {
 
   const stub = makeExpressStub();
 
-  setupLogsEndpoint(stub.app as Express);
+  setupLogsEndpoint(stub.app as Express, clock);
 
   const route = stub.routes.find((r) => (r.method === "get") && (r.path === "/logs/stream"));
 
@@ -388,8 +393,8 @@ describe("setupLogsEndpoint - GET /logs/stream (direct-handler wire bytes)", () 
 
     invokeLogsStreamHandler(route, req, res);
 
-    // Reset the spy AFTER install so we only observe writes triggered by the log emit, not the heartbeat install path (the heartbeat does not fire here because
-    // we have not enabled mock.timers; it lives on the real interval clock and never ticks during the test).
+    // Reset the spy AFTER install so we only observe writes triggered by the log emit, not the heartbeat install path (this row hands the factory no clock, so
+    // the heartbeat arms on the system clock and nothing here ever advances it).
     write.mock.resetCalls();
 
     emitLogEntry({ level: "info", message: "hello", timestamp: "2026/05/06 16:00:00.000" });
@@ -489,32 +494,26 @@ describe("setupLogsEndpoint - GET /logs/stream (direct-handler wire bytes)", () 
 
   test("req.on('close') handler clears the heartbeat - subsequent ticks do not produce writes", () => {
 
-    // Asserts the req.on("close") cleanup path: the close handler must run sse.close(), which clears the heartbeat interval. Without this, a regression that dropped
-    // sse.close() would leak the heartbeat past disconnect. We use mock.timers to drive the interval deterministically: confirm one tick fires before close, then
-    // call the close handler and confirm subsequent ticks produce no writes.
-    mock.timers.enable({ apis: ["setInterval"] });
+    // Asserts the req.on("close") cleanup path: the close handler must run sse.close(), which disposes the heartbeat. Without this, a regression that dropped
+    // sse.close() would leak the heartbeat past disconnect. The heartbeat is driven on the clock the factory is handed, so one advance while the connection is
+    // open produces a frame, and an advance after close produces none.
+    const clock = new TestClock();
+    const route = findLogsStreamHandler(clock);
+    const { req, res, triggerReqEvent, write } = makeReqRes();
 
-    try {
+    invokeLogsStreamHandler(route, req, res);
 
-      const route = findLogsStreamHandler();
-      const { req, res, triggerReqEvent, write } = makeReqRes();
+    // The heartbeat fires every 30s; confirm it ticks before close.
+    clock.advance(HEARTBEAT_INTERVAL_MS);
+    assert.equal(write.mock.callCount(), 1, "heartbeat fires while connection is open");
+    assert.deepEqual(write.mock.calls[0]?.arguments, ["event: heartbeat\ndata: \n\n"]);
 
-      invokeLogsStreamHandler(route, req, res);
+    // Invoke the close handler.
+    triggerReqEvent("close");
 
-      // The heartbeat fires every 30s; confirm it ticks before close.
-      mock.timers.tick(30000);
-      assert.equal(write.mock.callCount(), 1, "heartbeat fires while connection is open");
-      assert.deepEqual(write.mock.calls[0]?.arguments, ["event: heartbeat\ndata: \n\n"]);
-
-      // Invoke the close handler.
-      triggerReqEvent("close");
-
-      // Advance another full interval - no further writes.
-      mock.timers.tick(30000);
-      assert.equal(write.mock.callCount(), 1, "no heartbeat after close()");
-    } finally {
-
-      mock.timers.reset();
-    }
+    // Advance another full interval - no further writes.
+    clock.advance(HEARTBEAT_INTERVAL_MS);
+    assert.equal(write.mock.callCount(), 1, "no heartbeat after close()");
+    assert.equal(clock.pending, 0, "the close disposed the heartbeat");
   });
 });

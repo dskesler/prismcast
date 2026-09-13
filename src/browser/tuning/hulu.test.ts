@@ -15,10 +15,11 @@
  */
 import type { ChannelSelectionProfile, Nullable } from "../../types/index.ts";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
+import { findCurrentEabFromPrograms, huluProvider } from "./hulu.ts";
 import { initDebugFilter, subscribeToLogs } from "../../utils/index.ts";
+import type { HuluListingProgram } from "./hulu.ts";
 import type { Page } from "puppeteer-core";
 import assert from "node:assert/strict";
-import { huluProvider } from "./hulu.ts";
 import { makeProfile } from "../../config/profiles.helpers.ts";
 
 // One guide row as readRenderedChannels reads it out of the DOM: the lowercased data-testid name it matches on, the original-cased display name, and the
@@ -339,5 +340,35 @@ describe("cold tune fast path", () => {
     assert.equal(guide.releases(), 0, "a resolved playlist is never released back to the click flow");
     assert.deepEqual(guide.locates, [], "no on-now cell is looked up once the tune is resolved");
     assert.deepEqual(guide.clicks, [], "nothing is clicked once the tune is resolved");
+  });
+});
+
+describe("findCurrentEabFromPrograms", () => {
+
+  /* Two back-to-back airings, so the row set covers the inside of a window, the boundary where one hands off to the next, and the gap past both. The windows are
+   * built as ISO strings because that is what the listing API returns and what the lookup parses, and the instants are handed in rather than read from the wall
+   * clock, so the comparison is exact instead of dependent on when the row runs.
+   */
+  const programs: HuluListingProgram[] = [
+
+    { airingEnd: new Date(2000).toISOString(), airingStart: new Date(1000).toISOString(), eab: "first" },
+    { airingEnd: new Date(3000).toISOString(), airingStart: new Date(2000).toISOString(), eab: "second" }
+  ];
+
+  test("answers the program whose window brackets the instant", () => {
+
+    assert.equal(findCurrentEabFromPrograms(programs, 1500), "first", "an instant inside the first window answers the first program");
+  });
+
+  test("treats a window's start as inclusive and its end as exclusive", () => {
+
+    // The handoff instant belongs to the airing that starts there, not to the one that ends there, so a boundary read never reports the program just finished.
+    assert.equal(findCurrentEabFromPrograms(programs, 2000), "second", "the boundary instant answers the program whose window starts on it");
+  });
+
+  test("answers null when nothing is airing", () => {
+
+    assert.equal(findCurrentEabFromPrograms(programs, 3000), null, "an instant past both windows answers null");
+    assert.equal(findCurrentEabFromPrograms([], 1500), null, "an empty schedule answers null");
   });
 });

@@ -2,8 +2,9 @@
  *
  * status.handlers.ts: Pure handler logic for the PrismCast status display script.
  *
- * The architecture is ports-and-adapters with the same shape used across upgrade/, service/, utils/ffmpeg.ts, and utils/clock.ts. Every formatter, renderer, DOM
- * mutator, SSE event handler, and lifecycle helper that the status display needs is defined here as a free-standing TypeScript function over a HandlerContext.
+ * The architecture is ports-and-adapters with the same shape used across upgrade/, service/, utils/ffmpeg.ts, and the library's Clock port. Every formatter,
+ * renderer, DOM mutator, SSE event handler, and lifecycle helper that the status display needs is defined here as a free-standing TypeScript function over a
+ * HandlerContext.
  *
  *   - HandlerContext (this file) - the runtime-input port; the document, the mutable client state, and the window.*-resolved externals
  *   - ClientState (this file) - the mutable record of streamData / systemData / expandedStreams / staleness counters / rAF gates

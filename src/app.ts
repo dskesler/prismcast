@@ -35,6 +35,7 @@ import { loadProviderLineups } from "./config/providerLineups.ts";
 import morgan from "morgan";
 import { runConsistencyProbeAtStartup } from "./config/consistencyProbe.ts";
 import { setupRoutes } from "./routes/index.ts";
+import { systemClock } from "homebridge-plugin-utils";
 import { terminateStream } from "./streaming/lifecycle.ts";
 import { validateProfiles } from "./config/profiles.ts";
 
@@ -64,8 +65,8 @@ const SERVER_CLOSE_BOUND_MS = 5000;
 
 let backgroundServices: Nullable<AsyncDisposableStack> = null;
 
-// Interval for idle stream cleanup.
-let idleCleanupInterval: Nullable<ReturnType<typeof setInterval>> = null;
+// The repeating callback timer the idle stream cleanup runs on, armed through the port and disposed through its handle.
+let idleCleanupInterval: Nullable<Disposable> = null;
 
 /**
  * Starts the idle cleanup interval. Runs every 10 seconds to check for idle streams and terminate them.
@@ -77,11 +78,11 @@ function startIdleCleanup(): void {
     return;
   }
 
-  // Check for idle streams every 10 seconds.
-  idleCleanupInterval = setInterval(() => {
+  // Check for idle streams every 10 seconds, on the port's repeating callback timer.
+  idleCleanupInterval = systemClock.schedule((): void => {
 
     cleanupIdleStreams();
-  }, 10000);
+  }, 10000, { repeat: true });
 }
 
 /**
@@ -91,7 +92,7 @@ function stopIdleCleanup(): void {
 
   if(idleCleanupInterval) {
 
-    clearInterval(idleCleanupInterval);
+    idleCleanupInterval[Symbol.dispose]();
     idleCleanupInterval = null;
   }
 }
@@ -154,7 +155,7 @@ function setupGracefulShutdown(): void {
       }
     }
 
-    saveResumeState(resumeEntries);
+    saveResumeState(resumeEntries, systemClock.now());
 
     for(const stream of streams) {
 
@@ -737,7 +738,7 @@ export async function startServer(parsedArgs: ParsedArgs): Promise<void> {
   await runConsistencyProbeAtStartup();
 
   // Load HLS resume state from the previous shutdown. This seeds sequence numbers so streams resume forward instead of resetting to 0.
-  loadResumeState();
+  loadResumeState(systemClock.now());
 
   killStaleChrome();
 

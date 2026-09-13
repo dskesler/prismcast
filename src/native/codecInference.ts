@@ -2,9 +2,11 @@
  *
  * codecInference.ts: Inference of the video codec carried by an HLS media playlist by parsing the first segment.
  */
-import { LOG, chromeFetch } from "../utils/index.ts";
+import { LOG, chromeFetch, timeoutSignal } from "../utils/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import { resolveUrl } from "./probe.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* Media-only HLS playlists do not declare codec information - that lives in the master playlist's #EXT-X-STREAM-INF CODECS attribute, which the master-playlist
  * resolver consumes today. For media-only feeds (no master playlist exists), the codec must be inferred from the segments themselves so the MediaFeed surfaces
@@ -58,10 +60,13 @@ const TS_STREAM_TYPE_TO_CODEC: Readonly<Record<number, string>> = {
 export interface InferMediaCodecOptions {
 
   // The base URL of the playlist, used to resolve relative segment URLs. This is the URL the playlist itself was fetched from, not a master URL above it.
-  baseUrl: string;
+  readonly baseUrl: string;
+
+  // The clock the segment-prefix fetch's bound arms on. Defaults to the system clock, so a caller that holds no clock of its own omits it.
+  readonly clock?: Clock;
 
   // The raw text of an HLS media playlist (#EXTINF segments declared directly).
-  playlistBody: string;
+  readonly playlistBody: string;
 }
 
 /**
@@ -442,16 +447,19 @@ async function readStreamPrefix(response: Response, limit: number): Promise<Buff
  * fetch error so the inference can fail gracefully back to a null codec label.
  *
  * @param url - The absolute segment URL.
+ * @param clock - The clock this fetch's bound arms on.
  * @returns The fetched prefix, or null on failure.
  */
-async function fetchSegmentPrefix(url: string): Promise<Nullable<Buffer>> {
+async function fetchSegmentPrefix(url: string, clock: Clock): Promise<Nullable<Buffer>> {
+
+  const bound = timeoutSignal(SEGMENT_PROBE_TIMEOUT_MS, { clock });
 
   try {
 
     const response = await chromeFetch(url, {
 
       headers: { Range: "bytes=0-" + String(MAX_SEGMENT_PROBE_BYTES - 1) },
-      signal: AbortSignal.timeout(SEGMENT_PROBE_TIMEOUT_MS)
+      signal: bound.signal
     });
 
     // Accept both 206 Partial Content (Range honored) and 200 OK (Range ignored or unsupported); both deliver bytes the parser can use.
@@ -473,6 +481,9 @@ async function fetchSegmentPrefix(url: string): Promise<Nullable<Buffer>> {
     LOG.debug("native:codec", "Segment prefix fetch error: %s.", String(error));
 
     return null;
+  } finally {
+
+    bound.cancel();
   }
 }
 
@@ -481,12 +492,12 @@ async function fetchSegmentPrefix(url: string): Promise<Nullable<Buffer>> {
  * playlist has no segments, the segment cannot be fetched, or the segment format is unrecognized. Currently supports MPEG-TS segments via PAT/PMT walk; fMP4
  * segment inference (via #EXT-X-MAP and parseMoovCodecConfig) is a future extension.
  *
- * @param options - The playlist body and base URL.
+ * @param options - The playlist body, its base URL, and the clock the segment-prefix fetch's bound arms on.
  * @returns The inferred codec metadata.
  */
 export async function inferMediaCodec(options: InferMediaCodecOptions): Promise<InferredCodec> {
 
-  const { baseUrl, playlistBody } = options;
+  const { baseUrl, clock = systemClock, playlistBody } = options;
 
   const segUrl = findFirstSegmentUrl(playlistBody, baseUrl);
 
@@ -506,7 +517,7 @@ export async function inferMediaCodec(options: InferMediaCodecOptions): Promise<
     return { codec: null };
   }
 
-  const buffer = await fetchSegmentPrefix(segUrl);
+  const buffer = await fetchSegmentPrefix(segUrl, clock);
 
   if(!buffer) {
 

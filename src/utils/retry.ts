@@ -1,21 +1,35 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * retry.ts: Retry logic with exponential backoff for PrismCast. Time-dependent operations route through a Clock (see clock.ts) so tests can deterministically
- * control sleeps and per-attempt bounds without depending on real-time delays - the function's nested waitWithTimeout/finally/await delay chain is exactly the
- * shape Node's synchronous mock.timers.tick cannot drain.
+ * retry.ts: PrismCast's retry policy over the library's retry loop. homebridge-plugin-utils owns the attempt loop, the attempt budget, and the between-attempt
+ * wait, together with the exponential ladder that wait is measured by; this file owns what one attempt is - the abort gate, the per-attempt bound, the
+ * session-closed pass-through, the early-success check, the ladder's ceiling and jitter, and the logging - and the closed-form estimate of a run's worst-case
+ * duration. The loop and the wait policies both run on the library's Clock, so a test drives an entire retry - every per-attempt bound and every backoff - from
+ * one TestClock and asserts the schedule rather than waiting it out.
  */
+import { exponentialBackoff, retry, systemClock } from "homebridge-plugin-utils";
 import { formatError, isSessionClosedError } from "./errors.ts";
-import type { Clock } from "./clock.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import { LOG } from "./logger.ts";
-import { realClock } from "./clock.ts";
+import { waitWithTimeout } from "./delay.ts";
 
 // Default maximum jitter added to each backoff sleep in milliseconds. Prevents synchronized retries across concurrent operations. Read by both retryOperation's
-// destructuring default and maxRetryDuration, so the worst-case estimate cannot drift from the loop that produces the sleeps.
+// destructuring default and maxRetryDuration, so the worst-case estimate cannot drift from the policy that produces the sleeps.
 const DEFAULT_BACKOFF_JITTER = 1000;
 
 // Default cap on each backoff sleep in milliseconds. Bounds the exponential growth so a long retry chain never sleeps unboundedly. Read by both retryOperation's
-// destructuring default and maxRetryDuration, so the worst-case estimate cannot drift from the loop that produces the sleeps.
+// destructuring default and maxRetryDuration, so the worst-case estimate cannot drift from the policy that produces the sleeps.
 const DEFAULT_MAX_BACKOFF_DELAY = 3000;
+
+// Thrown by the attempt gate when shouldAbort reports the abort condition before an attempt starts. It is its own class so the retry veto can tell it from an
+// attempt's own failure: the gate's throw is never warned about and never retried, exactly as a closed session is not.
+class RetryAbortedError extends Error {
+
+  public constructor() {
+
+    super("Operation aborted: abort condition met before retry.");
+    this.name = "RetryAbortedError";
+  }
+}
 
 /**
  * Options for retryOperation. Groups all parameters into a single object to avoid positional parameter sprawl and make the function extensible.
@@ -25,9 +39,8 @@ export interface RetryOptions<T> {
   // Maximum jitter added to the backoff delay in milliseconds. Prevents synchronized retries across concurrent operations. Default: 1000ms.
   backoffJitter?: number;
 
-  // The clock used for sleeps between attempts and for the per-attempt timeout bound. Defaults to realClock which delegates to delay()/waitWithTimeout() from
-  // delay.ts. Tests inject a fake clock so backoff sleeps resolve instantly and bounded waits have deterministic outcomes - the production code path is
-  // unchanged.
+  // The clock the backoff sleeps and the per-attempt bound run on. Defaults to the system clock; a test injects the library's virtual clock so the backoff
+  // schedule and the bounds run on virtual time and every wait the policy makes is asserted rather than waited out.
   clock?: Clock;
 
   // Human-readable description for logging purposes.
@@ -57,23 +70,31 @@ export interface RetryOptions<T> {
 /**
  * Implements a generic retry mechanism with exponential backoff and jitter. This function attempts an operation multiple times, waiting progressively longer between
  * attempts to avoid overwhelming failing services. The exponential backoff with jitter prevents thundering herd problems where many clients retry simultaneously.
+ * The library's retry loop owns the attempt budget and the backoff wait; this policy owns the backoff ladder the loop waits on (seeded at one second, doubling,
+ * capped, and jittered) and what one attempt is: the abort gate, the per-attempt bound, the session-closed pass-through, the early-success check, and the logging.
  * @param options - Retry configuration including the operation, attempt limits, timeouts, and optional backoff tuning.
  * @returns The result of the operation if successful, or undefined when earlySuccessCheck reports the operation already succeeded after a timeout-shaped error.
  * @throws The last error encountered if all attempts fail.
  */
 export async function retryOperation<T>(options: RetryOptions<T>): Promise<T | undefined> {
 
-  const { backoffJitter = DEFAULT_BACKOFF_JITTER, clock = realClock, description, earlySuccessCheck, maxAttempts, maxBackoffDelay = DEFAULT_MAX_BACKOFF_DELAY,
+  const { backoffJitter = DEFAULT_BACKOFF_JITTER, clock = systemClock, description, earlySuccessCheck, maxAttempts, maxBackoffDelay = DEFAULT_MAX_BACKOFF_DELAY,
     operation, shouldAbort, timeoutMs } = options;
 
-  let lastError: unknown = null;
+  // The ladder is the library's exponential backoff at the configured ceiling; the jitter added to each wait is PrismCast's, so concurrent retries never synchronize.
+  const ladder = exponentialBackoff({ ceilingMs: maxBackoffDelay });
 
-  for(let attempt = 1; attempt <= maxAttempts; attempt++) {
+  // The attempt number the log lines report, advanced as each attempt starts; the loop that runs the attempts is the library's.
+  let attempt = 0;
 
-    // Check if we should abort before starting this attempt. This catches cases where the page was closed during the backoff delay between retries.
+  return retry(async (): Promise<T | undefined> => {
+
+    attempt++;
+
+    // The abort gate runs before every attempt, so a page closed during the backoff is caught before another attempt is issued against it.
     if(shouldAbort?.()) {
 
-      throw new Error("Operation aborted: abort condition met before retry.");
+      throw new RetryAbortedError();
     }
 
     if(attempt > 1) {
@@ -83,11 +104,8 @@ export async function retryOperation<T>(options: RetryOptions<T>): Promise<T | u
 
     try {
 
-      // eslint-disable-next-line no-await-in-loop
-      return await clock.waitWithTimeout(operation(), timeoutMs);
+      return await waitWithTimeout(operation(), timeoutMs, { clock });
     } catch(error) {
-
-      lastError = error;
 
       // If the page or session was closed, retrying is pointless. Abort immediately without warning since we're not going to retry.
       if(isSessionClosedError(error)) {
@@ -103,12 +121,9 @@ export async function retryOperation<T>(options: RetryOptions<T>): Promise<T | u
 
         try {
 
-          // eslint-disable-next-line no-await-in-loop
-          const successResult = await earlySuccessCheck();
+          if(await earlySuccessCheck()) {
 
-          if(successResult) {
-
-            return;
+            return undefined;
           }
         } catch(_checkError) {
 
@@ -116,25 +131,21 @@ export async function retryOperation<T>(options: RetryOptions<T>): Promise<T | u
         }
       }
 
-      // If we reach here, we're going to retry (or fail after max attempts). Now log the warning since there's an actual issue to report.
+      // Every failed attempt is an actual issue to report, the last one included, so the warning is logged here rather than by the retry veto, which the loop
+      // consults only while attempts remain.
       LOG.warn("Attempt %s failed for %s: %s.", attempt, description, formatError(error));
 
-      // Between retry attempts, wait with exponential backoff plus random jitter.
-      if(attempt < maxAttempts) {
-
-        // The progression seeds at one second (1000ms) and doubles each attempt - 1s, 2s, 4s, ... - capped at maxBackoffDelay so growth never exceeds the ceiling.
-        const baseDelay = Math.min(1000 * (2 ** (attempt - 1)), maxBackoffDelay);
-        const jitter = Math.random() * backoffJitter;
-
-        // eslint-disable-next-line no-await-in-loop
-        await clock.sleep(baseDelay + jitter);
-      }
+      throw error;
     }
-  }
+  }, {
 
-  // When maxAttempts < 1 the loop body never runs and lastError is still its initial null; throwing it here is the intentional, predictable failure mode for an
-  // out-of-contract maxAttempts.
-  throw lastError;
+    attempts: maxAttempts,
+    backoff: (next: number): number => ladder(next) + (Math.random() * backoffJitter),
+    clock,
+
+    // A closed session and a met abort condition are the failures the loop never retries; every other failure retries until the attempt budget runs out.
+    shouldRetry: (error: unknown): boolean => !isSessionClosedError(error) && !(error instanceof RetryAbortedError)
+  });
 }
 
 /**
@@ -158,8 +169,8 @@ export interface RetryDurationTiming {
 
 /**
  * Computes the worst-case wall-clock duration of a retryOperation run: every attempt consuming its full per-attempt timeout, plus one backoff sleep per retry
- * after the first, each taken at its ceiling (the backoff cap plus the full jitter). The estimate reads the same default constants the loop reads, so it cannot
- * drift from the loop's arithmetic. The loop seeds each backoff at one second and doubles, capped at maxBackoffDelay, so every gap is at or below
+ * after the first, each taken at its ceiling (the backoff cap plus the full jitter). The estimate reads the same default constants the policy reads, so it cannot
+ * drift from the policy's arithmetic. The policy seeds each backoff at one second and doubles, capped at maxBackoffDelay, so every gap is at or below
  * maxBackoffDelay + backoffJitter; taking that ceiling for each gap makes the result an upper bound - a leak bound for a caller sizing a window that must outlive
  * the retries, never an under-count. The closed form holds only for configurations whose operation carries no unbounded callback: earlySuccessCheck runs awaited
  * on the timeout path and can add time beyond the per-attempt timeout, so a caller relying on the bound must pass a configuration without one.

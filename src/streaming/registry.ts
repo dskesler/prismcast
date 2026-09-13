@@ -145,14 +145,14 @@ export interface HLSState {
   // window are preroll entries vs real entries.
   prerollSegmentCount: number;
 
-  // Wall-clock time when the preroll timer fired and the progressive preroll playlist began. Used to compute elapsed time on each playlist poll so the progressive
-  // window advances in real time, simulating a live stream. Null before the preroll timer fires.
-  prerollStartTime: Nullable<Date>;
+  // The epoch millisecond instant the preroll timer fired and the progressive preroll playlist began. Compared against the instant of each playlist poll so the
+  // progressive window advances in real time, simulating a live stream. Null before the preroll timer fires.
+  prerollStartTime: Nullable<number>;
 
   // Timer handle for deferred preroll seeding. The timer fires after PREROLL_DELAY_MS; if real content hasn't arrived yet, preroll is seeded and playlistReady is
   // signaled. Deliberately NOT cancelled in completeStreamSetup() - the timer must survive setup completion for native streams where the proxy's first poll cycle
   // takes 10-15+ seconds. Every path that invalidates preroll state disarms it through cancelPrerollTimer(), the single disarm point.
-  prerollTimer: Nullable<ReturnType<typeof setTimeout>>;
+  prerollTimer: Nullable<Disposable>;
 
   // Resume continuity.
 
@@ -285,8 +285,9 @@ export interface StreamRegistryEntry {
   // that have been registered but whose async setup has not yet completed.
   profile: Nullable<ResolvedSiteProfile>;
 
-  // Set when the stream entry is created; the basis for uptime and duration calculations reported by status and logging.
-  startTime: Date;
+  // The epoch millisecond instant the stream entry was created, and the basis for the uptime and duration the status and the logs report. The ISO form is produced
+  // where the value leaves the process.
+  startTime: number;
 
   // The playback health monitor handle, or null if monitoring hasn't started. Exposes the live recovery metrics (read in the termination prologue) and a
   // self-contained dispose that stops the monitor's polling interval.
@@ -437,14 +438,15 @@ export function applyNativeQualityRefresh(entry: StreamRegistryEntry, refreshed:
 /**
  * Updates the last playlist request timestamp for a stream. This should be called whenever a playlist or segment is requested to keep the idle timeout accurate.
  * @param id - The numeric stream ID.
+ * @param now - The instant of the request.
  */
-export function updateLastAccess(id: number): void {
+export function updateLastAccess(id: number, now: number): void {
 
   const entry = streamRegistry.get(id);
 
   if(entry) {
 
-    entry.info.lastPlaylistRequest = Date.now();
+    entry.info.lastPlaylistRequest = now;
   }
 }
 
@@ -505,7 +507,7 @@ export function cancelPrerollTimer(hls: HLSState): void {
 
   if(hls.prerollTimer) {
 
-    clearTimeout(hls.prerollTimer);
+    hls.prerollTimer[Symbol.dispose]();
     hls.prerollTimer = null;
   }
 }

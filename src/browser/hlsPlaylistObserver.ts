@@ -2,12 +2,14 @@
  *
  * hlsPlaylistObserver.ts: HLS-aware observer layered on top of the tab-wide network observer.
  */
-import { LOG, chromeFetch } from "../utils/index.ts";
+import { LOG, chromeFetch, timeoutSignal } from "../utils/index.ts";
 import { classifyHlsPlaylist, extractChildPlaylistUrls, isLiveMediaPlaylist } from "../native/probe.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import type { Page } from "puppeteer-core";
 import type { TabNetworkObserver } from "./tabNetworkObserver.ts";
 import { observeTabResponses } from "./tabNetworkObserver.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* This module is the HLS-aware layer on top of tabNetworkObserver. Its job is to deliver every recognized HLS playlist (URL + kind) observed anywhere in the tab
  * to a single callback. It encapsulates:
@@ -83,6 +85,10 @@ export interface ObservedHlsMediaPlaylist {
  */
 export interface HlsPlaylistObserverOptions {
 
+  // The clock the manifest body fetch's bound arms on. The interceptor passes the tune's clock, so a tune drives that bound on the same timeline as the rest of
+  // its work; a caller that holds no clock omits it and takes the system clock.
+  readonly clock?: Clock;
+
   // Debug log category for the observer's lifecycle messages. Pass-through to LOG.debug so consumers can route messages through their own scope; both
   // manifestInterceptor.ts consumers (the long-lived interception and the predicate-verification path) currently pass "native:intercept".
   readonly logCategory: string;
@@ -116,12 +122,12 @@ export interface HlsPlaylistObserver extends Disposable {
  * Returns null when the underlying tab network observer could not be installed (page closed, root CDP session creation failed).
  *
  * @param page - The puppeteer page to observe.
- * @param options - Observer options including the playlist callback and the debug log category.
+ * @param options - Observer options: the playlist callback, the debug log category, and the clock the body fetch's bound arms on.
  * @returns The observer handle, or null if installation failed.
  */
 export async function observeHlsPlaylists(page: Page, options: HlsPlaylistObserverOptions): Promise<Nullable<HlsPlaylistObserver>> {
 
-  const { logCategory, onPlaylist } = options;
+  const { clock = systemClock, logCategory, onPlaylist } = options;
 
   let disposed = false;
 
@@ -170,9 +176,11 @@ export async function observeHlsPlaylists(page: Page, options: HlsPlaylistObserv
 
     LOG.debug(logCategory, "Observed .m3u8 response (seq %s): %s.", sequence, url.slice(0, 120));
 
+    const bound = timeoutSignal(MANIFEST_BODY_FETCH_TIMEOUT, { clock });
+
     try {
 
-      const response = await chromeFetch(url, { signal: AbortSignal.timeout(MANIFEST_BODY_FETCH_TIMEOUT) });
+      const response = await chromeFetch(url, { signal: bound.signal });
 
       if(!response.ok) {
 
@@ -215,6 +223,9 @@ export async function observeHlsPlaylists(page: Page, options: HlsPlaylistObserv
     } catch(error) {
 
       LOG.debug(logCategory, "Could not fetch .m3u8 body: %s.", String(error));
+    } finally {
+
+      bound.cancel();
     }
   };
 

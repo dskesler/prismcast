@@ -54,6 +54,10 @@ interface MockState {
   streamCount: number;
   streamSummaries: Map<number, ClientSummary>;
   streams: { id: number }[];
+
+  // Every instant the client-summary double was handed, in call order, so a row can assert the handler read the clock once and shared that one reading.
+  summaryInstants: number[];
+
   totalSegmentMemory: number;
 }
 
@@ -130,6 +134,7 @@ function defaultMockState(): MockState {
     streamCount: 0,
     streamSummaries: new Map(),
     streams: [],
+    summaryInstants: [],
     totalSegmentMemory: 0
   };
 }
@@ -152,7 +157,12 @@ const deps: HealthDeps = {
   },
   getCaptureImpairment: (): Nullable<CaptureImpairment> => (mockState.captureImpaired ? { reason: "probe", since: 0 } : null),
   getChromeVersion: (): Nullable<string> => mockState.chromeVersion,
-  getClientSummary: (streamId: number): ClientSummary => mockState.streamSummaries.get(streamId) ?? { clients: [], total: 0 },
+  getClientSummary: (streamId: number, now: number): ClientSummary => {
+
+    mockState.summaryInstants.push(now);
+
+    return mockState.streamSummaries.get(streamId) ?? { clients: [], total: 0 };
+  },
   getStreamCount: (): number => mockState.streamCount,
   getTotalSegmentMemory: (): number => mockState.totalSegmentMemory,
   isBrowserConnected: (): boolean => mockState.browserConnected
@@ -495,6 +505,30 @@ describe("setupHealthEndpoint - GET /health (client aggregation loop)", () => {
     assert.deepEqual(body.clients.byType,
       [ { count: 5, type: "hls" }, { count: 1, type: "mpegts" } ],
       "byType folds 3 HLS + 2 HLS = 5 HLS, 1 MPEG-TS, sorted alphabetically");
+  });
+
+  test("reads one instant at the boundary and uses it for every client summary and for the payload timestamp", async () => {
+
+    /* The handler reads the clock once before the aggregation, so every stream's client TTL is measured against the same moment and the payload's timestamp names
+     * that same moment. A handler that read the clock per stream, or read it again for the timestamp, would let two streams disagree about which clients are live
+     * and would stamp a response with an instant no summary was measured at.
+     */
+    mockState.browserConnected = true;
+    mockState.streamCount = 2;
+    mockState.streams = [ { id: 101 }, { id: 202 } ];
+    mockState.streamSummaries = new Map<number, ClientSummary>([
+      [ 101, { clients: [{ count: 1, type: "hls" satisfies ClientType }], total: 1 } ],
+      [ 202, { clients: [{ count: 1, type: "mpegts" satisfies ClientType }], total: 1 } ]
+    ]);
+
+    const res = await fetch(urlFor("/health"));
+    const body = await res.json() as HealthBody;
+    const recorded = mockState.summaryInstants;
+
+    assert.equal(res.status, 200);
+    assert.equal(recorded.length, 2, "one summary read per stream");
+    assert.equal(recorded[0], recorded[1], "both summaries measured against one instant");
+    assert.equal(body.timestamp, new Date(recorded[0] ?? 0).toISOString(), "the payload timestamp names the instant the summaries were measured at");
   });
 
   test("an empty getAllStreams() yields an empty byType array and zero total clients", async () => {

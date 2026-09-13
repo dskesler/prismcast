@@ -5,7 +5,8 @@
  * tears down every resource associated with a stream. The terminateStream tests focus on the contract: safe repeated calls, registry removal, channel-mapping
  * cleanup, preroll-timer cancellation, abort-controller signaling, segmenter.stop() invocation, FFmpeg.kill() invocation, and "terminated" event emission.
  */
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
+import { LOG, registerAbortController } from "../utils/index.ts";
+import { afterEach, beforeEach, describe, test } from "node:test";
 import { deleteChannelStreamId, getChannelStreamId, isTerminationInitiated, setChannelStreamId, terminateStream } from "./lifecycle.ts";
 import { getNextStreamId, getStream, makePendingCaptureIdentity, registerStream } from "./registry.ts";
 import { makeNativeIdentity, makeRegistryEntry } from "./registry.helpers.ts";
@@ -16,14 +17,18 @@ import type { NativeProxy } from "../native/proxy.ts";
 import type { Nullable } from "../types/index.ts";
 import type { Readable } from "node:stream";
 import type { StreamRegistryEntry } from "./registry.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
+import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { closePuppeteerStreamWssOnIdle } from "../testing.helpers.ts";
 import { createCaptureSession } from "./captureSession.ts";
-import { registerAbortController } from "../utils/index.ts";
 import { setGracefulShutdown } from "../browser/index.ts";
 
 // Schedule background-server cleanup on a 0ms unref'd timer that fires when the suite resolves so the runner can exit cleanly.
 closePuppeteerStreamWssOnIdle();
+
+// The reference instant the rows that measure a stream's lifetime count from, so their expected durations read as offsets rather than absolute epochs.
+const BASE = 1700000000000;
 
 /* makeSegmenter returns a stub satisfying the FMP4SegmenterResult shape that lifecycle's terminateStream calls into. We track which methods were invoked so tests
  * can assert on the cleanup ordering.
@@ -163,13 +168,11 @@ describe("terminateStream", () => {
 
     // We disable graceful shutdown by default so the page-close branch executes if reached. Tests that need graceful shutdown enable it explicitly.
     setGracefulShutdown(false);
-    mock.timers.enable({ apis: ["Date"], now: 1700000000000 });
   });
 
   afterEach(() => {
 
     setGracefulShutdown(false);
-    mock.timers.reset();
   });
 
   test("removes the stream from the registry", () => {
@@ -231,19 +234,44 @@ describe("terminateStream", () => {
     assert.equal(calls.filter((c) => c === "stop").length, 1, "segmenter.stop called exactly once across two terminate calls");
   });
 
+  test("reports the stream's lifetime in the termination summary, measured against the clock it is handed", (t: TestContext) => {
+
+    // The summary's duration is the only place the entry's start instant is read, so the row drives it directly: an entry started 65 seconds before the clock's
+    // reading has to log "1m 5s". The bound logger is intercepted at withStreamId, which is where terminateStream obtains it.
+    const messages: string[] = [];
+    const entry = makeRegistryEntry({ startTime: BASE - 65000 });
+
+    t.mock.method(LOG, "withStreamId", () => ({
+
+      debug: (): void => undefined,
+      error: (): void => undefined,
+      info: (message: string): void => { messages.push(message); },
+      warn: (): void => undefined
+    }));
+
+    registerStream(entry);
+    terminateStream(entry.id, entry.channelName ?? "", "test", new TestClock(BASE));
+
+    assert.equal(messages[0], "Stream ended after 1m 5s (test).", "the summary measures the entry's start against the supplied clock");
+  });
+
   test("cancels a pending preroll timer so it cannot fire after termination", () => {
 
     let timerFired = false;
+    const clock = new TestClock();
     const entry = makeRegistryEntry();
 
-    entry.hls.prerollTimer = setTimeout(() => { timerFired = true; }, 10);
+    entry.hls.prerollTimer = clock.schedule(() => { timerFired = true; }, 10);
     registerStream(entry);
 
     terminateStream(entry.id, entry.channelName ?? "", "test");
 
     // The timer handle on the entry must be cleared.
     assert.equal(entry.hls.prerollTimer, null);
-    // The timer should not fire even if we waited 200ms; we do not wait here because clearTimeout is synchronous and reliable.
+
+    // Advancing well past the original delay proves the disposal took: a handle that was merely nulled would still fire here.
+    clock.advance(60);
+
     assert.equal(timerFired, false);
   });
 

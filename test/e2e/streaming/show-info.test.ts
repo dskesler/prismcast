@@ -27,6 +27,7 @@
  * globalThis.fetch to the real implementation, so no straggling call can resolve against a live network address once the stub is gone. Any registered
  * stream and status subscription are also torn down so no state leaks into the next test.
  */
+import { TestClock, settle } from "homebridge-plugin-utils/testing";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { closePuppeteerStreamWssOnIdle, firstOf, nthOf } from "../../../src/testing.helpers.ts";
 import { createIntegrationContext, initializePersistence, readPersistedJson, writePersistedJson } from "../../helpers/integration.helpers.ts";
@@ -110,6 +111,11 @@ interface DvrStubState {
   devices: FixtureDevice[];
   guideByDevice: Map<string, FixtureGuideEntry[]>;
   jobs: FixtureJob[];
+
+  // How many times the stub has served each URL path, so a row that drives the poll cadence can count the fetches a cadence produced rather than infer them
+  // from a downstream effect.
+  pathCalls: Map<string, number>;
+
   tmsByName: Map<string, FixtureTmsResult[]>;
 }
 
@@ -142,7 +148,7 @@ interface BuildFullDeviceOptions {
  */
 function createDvrStubState(): DvrStubState {
 
-  return { devices: [], guideByDevice: new Map(), jobs: [], tmsByName: new Map() };
+  return { devices: [], guideByDevice: new Map(), jobs: [], pathCalls: new Map(), tmsByName: new Map() };
 }
 
 /**
@@ -168,6 +174,8 @@ function installDvrFetchStub(state: DvrStubState): void {
     // co-located unit test's pattern, so eslint's no-base-to-string rule never fires on a code path fetchFromDvr never exercises.
     const urlStr = (typeof input === "string") ? input : (input instanceof URL ? input.toString() : input.url);
     const url = new URL(urlStr);
+
+    state.pathCalls.set(url.pathname, (state.pathCalls.get(url.pathname) ?? 0) + 1);
 
     if(url.pathname === "/devices") {
 
@@ -301,6 +309,144 @@ describe("showInfo: Channels DVR API integration (show names, DVR host persisten
 
     globalThis.fetch = originalFetch;
     unsubscribeStatus?.();
+  });
+
+  describe("the poller's timers run on the injected clock", () => {
+
+    /* These two rows drive the poller's cadence and debounce directly, which the rows below cannot: they observe fire-and-forget chains on real time by design,
+     * where these assert WHEN a timer comes due. Both hand startShowInfoPolling a virtual clock, so every cadence the poller owns runs on one timeline the row
+     * advances explicitly, and the stub's per-path call counter is what makes a fetch that a cadence produced countable.
+     */
+
+    // The instant each row's virtual clock is seeded at, matching the baseline the sibling streaming suites anchor on.
+    const BASE_TIME_MS = 1700000000000;
+
+    // The poller's debounce window for triggered updates, from showInfo.ts's own TRIGGER_DEBOUNCE_MS. Restated here because the constant is module-private.
+    const TRIGGER_DEBOUNCE_MS = 2000;
+
+    test("polls at the start and once per interval on the injected clock, and stops polling once the poller is stopped", async () => {
+
+      await using ctx = await createIntegrationContext();
+
+      await initializePersistence(ctx);
+
+      const clock = new TestClock(BASE_TIME_MS);
+      const state = createDvrStubState();
+
+      installDvrFetchStub(state);
+
+      const deviceId = "M3U-Prism-Test-Clock-1";
+      const { device, guideNumberOf } = buildFullDevice(deviceId);
+
+      state.devices = [device];
+
+      const targetKey = firstOf(Object.keys(getAllChannels()), "visible channel key");
+      const targetGuideNumber = guideNumberOf.get(targetKey);
+
+      assert.ok(targetGuideNumber, "buildFullDevice must assign a GuideNumber to every channel key it processes");
+
+      state.jobs = [{ Channel: targetGuideNumber, DeviceID: deviceId, Name: "Clocked Recording" }];
+
+      const entry = makeRegistryEntry({ info: { lastPlaylistRequest: 0, storeKey: targetKey } });
+
+      registerStream(entry);
+      activeStreamIds.push(entry.id);
+
+      setDvrHost("showinfo-test-clock1.example.invalid");
+      startShowInfoPolling(clock);
+
+      assert.equal(clock.pending, 2, "the start armed the show-name poll and the logo refresh on the injected clock");
+
+      // The start runs an immediate update, which is the first jobs fetch.
+      await waitFor(() => (state.pathCalls.get("/dvr/jobs") ?? 0) >= 1, 5000, "the immediate update at start reaches the jobs endpoint");
+
+      const afterStart = state.pathCalls.get("/dvr/jobs") ?? 0;
+
+      // Crossing one poll interval on the injected clock runs exactly one further update.
+      clock.advance(30000);
+      await settle();
+
+      await waitFor(() => (state.pathCalls.get("/dvr/jobs") ?? 0) > afterStart, 5000, "the poll interval fires a further update on the injected clock");
+
+      const afterOneInterval = state.pathCalls.get("/dvr/jobs") ?? 0;
+
+      stopShowInfoPolling();
+
+      assert.equal(clock.pending, 0, "the stop drained every timer the poller held");
+
+      clock.advance(30000);
+      await settle();
+      await delay(100);
+
+      assert.equal(state.pathCalls.get("/dvr/jobs") ?? 0, afterOneInterval, "a stopped poller runs no further update when its clock advances");
+    });
+
+    test("debounces triggered updates so the latest trigger wins, and arms nothing once the poller is stopped", async () => {
+
+      await using ctx = await createIntegrationContext();
+
+      await initializePersistence(ctx);
+
+      const clock = new TestClock(BASE_TIME_MS);
+      const state = createDvrStubState();
+
+      installDvrFetchStub(state);
+
+      const deviceId = "M3U-Prism-Test-Clock-2";
+      const { device, guideNumberOf } = buildFullDevice(deviceId);
+
+      state.devices = [device];
+
+      const targetKey = firstOf(Object.keys(getAllChannels()), "visible channel key");
+      const targetGuideNumber = guideNumberOf.get(targetKey);
+
+      assert.ok(targetGuideNumber, "buildFullDevice must assign a GuideNumber to every channel key it processes");
+
+      state.jobs = [{ Channel: targetGuideNumber, DeviceID: deviceId, Name: "Debounced Recording" }];
+
+      const entry = makeRegistryEntry({ info: { lastPlaylistRequest: 0, storeKey: targetKey } });
+
+      registerStream(entry);
+      activeStreamIds.push(entry.id);
+
+      setDvrHost("showinfo-test-clock2.example.invalid");
+      startShowInfoPolling(clock);
+
+      await waitFor(() => (state.pathCalls.get("/dvr/jobs") ?? 0) >= 1, 5000, "the immediate update at start reaches the jobs endpoint");
+
+      const afterStart = state.pathCalls.get("/dvr/jobs") ?? 0;
+
+      // Two triggers back to back register under one key, so the second replaces the first rather than stacking a second update behind it.
+      triggerShowNameUpdate();
+
+      assert.equal(clock.pending, 3, "the first trigger armed the debounce beside the two intervals");
+
+      triggerShowNameUpdate();
+
+      assert.equal(clock.pending, 3, "the second trigger replaced the first rather than arming a second debounce");
+
+      clock.advance(TRIGGER_DEBOUNCE_MS);
+      await settle();
+
+      await waitFor(() => (state.pathCalls.get("/dvr/jobs") ?? 0) > afterStart, 5000, "the debounce fires one update once its window elapses");
+
+      const afterDebounce = state.pathCalls.get("/dvr/jobs") ?? 0;
+
+      assert.equal(afterDebounce, afterStart + 1, "the two triggers collapsed into exactly one further update");
+      assert.equal(clock.pending, 2, "the fired debounce left only the two intervals armed");
+
+      // A trigger after the poller has stopped has no registry to arm on, so it is a no-op rather than a timer that fires against a stopped poller.
+      stopShowInfoPolling();
+      triggerShowNameUpdate();
+
+      assert.equal(clock.pending, 0, "a trigger raised after the stop arms nothing");
+
+      clock.advance(TRIGGER_DEBOUNCE_MS);
+      await settle();
+      await delay(100);
+
+      assert.equal(state.pathCalls.get("/dvr/jobs") ?? 0, afterDebounce, "the post-stop trigger never ran an update");
+    });
   });
 
   describe("show-name resolution: recording-vs-guide precedence and stale-name clearing", () => {

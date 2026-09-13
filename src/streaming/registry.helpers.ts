@@ -115,7 +115,7 @@ export function makeRegistryEntry(overrides: Partial<StreamRegistryEntry> = {}):
     preTuned: false,
     probeIdentity: null,
     profile: null,
-    startTime: new Date(),
+    startTime: Date.now(),
     streamIdStr,
     url,
     ...overrides

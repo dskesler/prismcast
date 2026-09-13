@@ -13,6 +13,7 @@ import { reloadConfiguration } from "../../config/index.ts";
 import { setupChannelRoutes } from "./channels/index.ts";
 import { setupProfileRoutes } from "./services.ts";
 import { setupSettingsRoutes } from "./settings.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /**
  * Result of scheduling a server restart.
@@ -88,7 +89,7 @@ export function scheduleServerRestart(reason: string): RestartResult {
   }
 
   // No active streams - restart immediately. Close the browser first to avoid orphan Chrome processes.
-  setTimeout(() => {
+  systemClock.schedule(() => {
 
     LOG.info("Exiting for service manager restart %s.", reason);
 

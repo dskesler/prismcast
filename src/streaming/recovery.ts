@@ -52,8 +52,8 @@ export interface RecoveryMetrics {
  */
 export interface MonitorHandle extends Disposable {
 
-  // Stops the health-monitor interval. Safe to call more than once: a second call is a harmless clearInterval on an already-cleared handle, and the monitor's
-  // internal guard short-circuits any in-flight async tick. Aliased to [Symbol.dispose].
+  // Stops the health-monitor interval. Safe to call more than once: a second call disposes a clock handle that is already disposed, which does nothing, and the
+  // monitor's internal guard short-circuits any in-flight async tick. Aliased to [Symbol.dispose].
   readonly dispose: () => void;
 
   // Returns the live recovery metrics accumulated over the monitor's lifetime. Safe to read at any time, including after disposal. Read in the termination prologue
@@ -160,13 +160,14 @@ function getTotalRecoverySuccesses(metrics: RecoveryMetrics): number {
 }
 
 /**
- * Formats recovery duration from start time to now.
+ * Formats recovery duration from start time to the supplied instant.
  * @param startTime - The timestamp when recovery started.
+ * @param now - The instant to measure against.
  * @returns Formatted duration string like "2.1s".
  */
-export function formatRecoveryDuration(startTime: number): string {
+export function formatRecoveryDuration(startTime: number, now: number): string {
 
-  const durationMs = Date.now() - startTime;
+  const durationMs = now - startTime;
 
   return (durationMs / 1000).toFixed(1) + "s";
 }
@@ -232,8 +233,9 @@ export function getRecoveryMethod(level: number): string {
  * attempt, not per callback invocation.
  * @param metrics - The metrics object to update.
  * @param method - The recovery method being attempted.
+ * @param now - The instant the attempt starts.
  */
-export function recordRecoveryAttempt(metrics: RecoveryMetrics, method: string): void {
+export function recordRecoveryAttempt(metrics: RecoveryMetrics, method: string, now: number): void {
 
   // Cast to the specific field type to handle potential unknown methods at runtime. The mapping ensures valid methods resolve to counter field names.
   const field = ATTEMPT_FIELDS[method as RecoveryMethodValue] as keyof RecoveryMetrics | undefined;
@@ -243,7 +245,7 @@ export function recordRecoveryAttempt(metrics: RecoveryMetrics, method: string):
     (metrics[field] as number)++;
   }
 
-  metrics.currentRecoveryStartTime = Date.now();
+  metrics.currentRecoveryStartTime = now;
   metrics.currentRecoveryMethod = method;
 }
 
@@ -252,8 +254,9 @@ export function recordRecoveryAttempt(metrics: RecoveryMetrics, method: string):
  * eliminating the need for if/else chains. This makes adding new recovery methods trivial - just add an entry to SUCCESS_FIELDS.
  * @param metrics - The metrics object to update.
  * @param method - The recovery method that succeeded.
+ * @param now - The instant the recovery succeeded.
  */
-export function recordRecoverySuccess(metrics: RecoveryMetrics, method: string): void {
+export function recordRecoverySuccess(metrics: RecoveryMetrics, method: string, now: number): void {
 
   // Cast to the specific field type to handle potential unknown methods at runtime. The mapping ensures valid methods resolve to counter field names.
   const field = SUCCESS_FIELDS[method as RecoveryMethodValue] as keyof RecoveryMetrics | undefined;
@@ -265,7 +268,7 @@ export function recordRecoverySuccess(metrics: RecoveryMetrics, method: string):
 
   if(metrics.currentRecoveryStartTime !== null) {
 
-    metrics.totalRecoveryTimeMs += Date.now() - metrics.currentRecoveryStartTime;
+    metrics.totalRecoveryTimeMs += now - metrics.currentRecoveryStartTime;
   }
 
   metrics.currentRecoveryStartTime = null;

@@ -3,10 +3,11 @@
  * preroll.ts: Preroll generation and compositor for immediate HLS response during stream startup.
  */
 import type { Express, Request, Response } from "express";
-import { LOG, formatResolution, resolvePrerollFFmpegPath } from "../utils/index.ts";
+import { LOG, formatResolution, resolvePrerollFFmpegPath, timeoutSignal } from "../utils/index.ts";
 import { createMP4BoxParser, offsetMoofTimestamps, parseMoovTrackInfo } from "./mp4Parser.ts";
 import { CONFIG } from "../config/index.ts";
 import type { CaptureCodec } from "./codec.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import type { PlaylistSegmentEntry } from "./playlistBuilder.ts";
 import { buildPlaylist } from "./playlistBuilder.ts";
@@ -275,25 +276,39 @@ async function generateVariant(ffmpegBin: string, codec: CaptureCodec, videoArgs
 // Internal Helpers.
 
 /**
+ * What a one-shot FFmpeg collection needs beyond the executable and its arguments: how long the child is allowed, and where that deadline's time comes from.
+ */
+export interface SpawnCollectOptions {
+
+  // The clock the deadline arms on. Defaults to the system clock, so the production caller omits it and a test drives the kill by advancing its own.
+  readonly clock?: Clock;
+
+  // Milliseconds the child is allowed before it is killed. Defaults to PREROLL_GENERATION_TIMEOUT_MS.
+  readonly timeoutMs?: number;
+}
+
+/**
  * Spawns FFmpeg with the given arguments and collects all stdout output into a single Buffer. Used for one-shot operations like preroll generation where the entire
  * output fits in memory. Exported so the deadline and collection semantics can be exercised directly against a Node child process; the production caller omits the
- * timeout and takes the default.
+ * options and takes the defaults.
  * @param ffmpegBin - Path to the FFmpeg executable.
  * @param args - FFmpeg command-line arguments.
- * @param timeoutMs - Milliseconds the child is allowed before it is killed. Defaults to PREROLL_GENERATION_TIMEOUT_MS.
+ * @param options - How long the child is allowed, and the clock that deadline arms on.
  * @returns Promise resolving to the complete stdout output as a Buffer. Rejects when the deadline passes, when the spawn itself fails, when the child exits with a
  *   nonzero code, or when an external signal terminates it.
  */
-export async function spawnAndCollect(ffmpegBin: string, args: string[], timeoutMs = PREROLL_GENERATION_TIMEOUT_MS): Promise<Buffer> {
+export async function spawnAndCollect(ffmpegBin: string, args: string[], options: SpawnCollectOptions = {}): Promise<Buffer> {
 
-  /* The deadline belongs to the platform: spawn's own signal option kills the child once the timeout fires, so there is no separate timer to keep correct and no
-   * path where the promise settles while the process lives on. SIGKILL rather than SIGTERM because a wedged encoder can ignore SIGTERM, the output is discarded on
-   * a timeout anyway, and the encode holds no temp files or child processes needing a graceful teardown.
+  const { clock, timeoutMs = PREROLL_GENERATION_TIMEOUT_MS } = options;
+
+  /* The deadline arms on the Clock port and reaches the child through spawn's own signal option, so there is no separate timer to keep correct and no path where
+   * the promise settles while the process lives on. SIGKILL rather than SIGTERM because a wedged encoder can ignore SIGTERM, the output is discarded on a timeout
+   * anyway, and the encode holds no temp files or child processes needing a graceful teardown.
    */
-  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const bound = timeoutSignal(timeoutMs, { clock });
   const timeoutMessage = "FFmpeg timed out after " + String(timeoutMs) + "ms and was killed.";
 
-  const ffmpeg = spawn(ffmpegBin, args, { killSignal: "SIGKILL", signal: timeoutSignal, stdio: [ "ignore", "pipe", "pipe" ] });
+  const ffmpeg = spawn(ffmpegBin, args, { killSignal: "SIGKILL", signal: bound.signal, stdio: [ "ignore", "pipe", "pipe" ] });
 
   ffmpeg.stderr.on("data", (data: Buffer) => {
 
@@ -314,7 +329,7 @@ export async function spawnAndCollect(ffmpegBin: string, args: string[], timeout
   // the signal and translate an aborted spawn into the same timeout failure rather than the platform's abort text or a bare signal name.
   ffmpeg.on("error", (error: Error) => {
 
-    signalExitFailure(timeoutSignal.aborted ? new Error(timeoutMessage) : error);
+    signalExitFailure(bound.signal.aborted ? new Error(timeoutMessage) : error);
   });
 
   ffmpeg.on("exit", (code, signal) => {
@@ -326,7 +341,7 @@ export async function spawnAndCollect(ffmpegBin: string, args: string[], timeout
       return;
     }
 
-    if(timeoutSignal.aborted) {
+    if(bound.signal.aborted) {
 
       signalExitFailure(new Error(timeoutMessage));
 
@@ -339,9 +354,15 @@ export async function spawnAndCollect(ffmpegBin: string, args: string[], timeout
     signalExitFailure(new Error(signal ? ("FFmpeg killed by signal " + signal + ".") : ("FFmpeg exited with code " + String(code) + ".")));
   });
 
-  const [output] = await Promise.all([ streamToBuffer(ffmpeg.stdout), exitPromise ]);
+  try {
 
-  return output;
+    const [output] = await Promise.all([ streamToBuffer(ffmpeg.stdout), exitPromise ]);
+
+    return output;
+  } finally {
+
+    bound.cancel();
+  }
 }
 
 /**
@@ -547,7 +568,7 @@ export function buildPrerollEntries(options: PrerollEntryOptions): PlaylistSegme
 
 /**
  * Computes how many segments should be revealed given elapsed wall-clock time and a codec's segment durations. This is the pure reveal math, isolated from the
- * prerollVariants cache and Date.now() so it can be exercised directly with plain arguments - no seeded variant, no timer mocking required. The initial window
+ * prerollVariants cache and from the clock so it can be exercised directly with plain arguments - no seeded variant, no timer mocking required. The initial window
  * (initialWindow segments) is revealed immediately so the client has enough content to begin playback per the HLS 3-from-end rule. Additional segments are revealed
  * one at a time as wall-clock time passes - each new segment appears when enough time has elapsed for the client to have consumed the prior content beyond the
  * initial window.
@@ -590,15 +611,31 @@ export function computeReveal(totalSegments: number, durations: readonly number[
 }
 
 /**
+ * The inputs the progressive reveal is computed from. Named members rather than positional arguments because two of them are adjacent epoch instants, which a
+ * positional call could transpose without the compiler noticing.
+ */
+export interface ProgressiveRevealOptions {
+
+  // The preroll codec variant.
+  readonly codec: CaptureCodec;
+
+  // The epoch millisecond instant of the poll the reveal is being computed for.
+  readonly now: number;
+
+  // The epoch millisecond instant the preroll began.
+  readonly prerollStartTime: number;
+}
+
+/**
  * Computes how many preroll segments should be visible based on elapsed wall-clock time since the preroll started. Thin adapter over computeReveal: looks up the
- * codec's cached variant, converts prerollStartTime into elapsed seconds, and delegates the reveal math.
+ * codec's cached variant, converts the two instants into elapsed seconds, and delegates the reveal math.
  *
- * @param codec - The preroll codec variant.
- * @param prerollStartTime - Wall-clock time when the preroll began.
+ * @param options - See ProgressiveRevealOptions.
  * @returns The number of preroll segments to reveal.
  */
-export function computeProgressiveReveal(codec: CaptureCodec, prerollStartTime: Date): number {
+export function computeProgressiveReveal(options: ProgressiveRevealOptions): number {
 
+  const { codec, now, prerollStartTime } = options;
   const variant = prerollVariants.get(codec);
 
   if(!variant) {
@@ -606,12 +643,26 @@ export function computeProgressiveReveal(codec: CaptureCodec, prerollStartTime: 
     return 0;
   }
 
-  const elapsedSec = (Date.now() - prerollStartTime.getTime()) / 1000;
+  const elapsedSec = (now - prerollStartTime) / 1000;
 
   return computeReveal(variant.mediaSegments.length, variant.durations, elapsedSec);
 }
 
 // Playlist Generation.
+
+/**
+ * The inputs a progressive preroll playlist is built from. Extends the reveal options so the playlist builder hands one object to the reveal math and the two
+ * epoch instants travel under their own names all the way down.
+ */
+export interface PrerollPlaylistOptions extends ProgressiveRevealOptions {
+
+  // The server's external URL (e.g., "http://192.168.1.100:5589").
+  readonly baseUrl: string;
+
+  // The MEDIA-SEQUENCE offset. Zero for fresh starts. For resume streams, this is the saved segment index so the preroll playlist continues from the prior
+  // session's sequence range rather than restarting at 0.
+  readonly startingSequence: number;
+}
 
 /**
  * Generates a progressive HLS playlist referencing the global preroll segments for the specified codec. The playlist simulates a live stream by revealing segments
@@ -626,21 +677,20 @@ export function computeProgressiveReveal(codec: CaptureCodec, prerollStartTime: 
  * misleading and would create a backward time jump at the preroll-to-live boundary (preroll PDT would overshoot real content PDT because the preroll covers 30
  * seconds of content but real content typically arrives in ~15 seconds). PDT is emitted only on real segments once the segmenter produces them.
  *
- * @param baseUrl - The server's external URL (e.g., "http://192.168.1.100:5589").
- * @param codec - The preroll codec variant.
- * @param startingSequence - The MEDIA-SEQUENCE offset. Zero for fresh starts. For resume streams, this is set to the saved segment index so the preroll
- *   playlist continues from the prior session's sequence range rather than restarting at 0.
- * @param prerollStartTime - Wall-clock time when the preroll began. Used to compute elapsed time and determine how many segments to reveal.
+ * @param options - See PrerollPlaylistOptions.
  * @returns The complete HLS playlist string, or an empty string if the preroll is not ready.
  */
-export function generatePrerollPlaylist(baseUrl: string, codec: CaptureCodec, startingSequence: number, prerollStartTime: Date): string {
+export function generatePrerollPlaylist(options: PrerollPlaylistOptions): string {
+
+  const { baseUrl, codec, startingSequence } = options;
 
   if(!isPrerollReady(codec)) {
 
     return "";
   }
 
-  const revealCount = computeProgressiveReveal(codec, prerollStartTime);
+  // The wider object satisfies the narrower reveal options, so the two instants reach the reveal math under their own names.
+  const revealCount = computeProgressiveReveal(options);
   const entries = buildPrerollEntries({ baseUrl, codec, extension: ".m4s", prerollSegmentCount: revealCount, startIndex: 0 });
 
   return buildPlaylist({

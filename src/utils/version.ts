@@ -2,10 +2,13 @@
  *
  * version.ts: Version checking and update notification utilities.
  */
+import { TimerRegistry, systemClock } from "homebridge-plugin-utils";
+import type { Clock } from "homebridge-plugin-utils";
 import { LOG } from "./logger.ts";
 import type { Nullable } from "../types/index.ts";
 import { formatError } from "./errors.ts";
 import packageJson from "../../package.json" with { type: "json" };
+import { timeoutSignal } from "./delay.ts";
 
 // Package name for npm registry lookups.
 const NPM_PACKAGE_NAME = "prismcast";
@@ -26,6 +29,9 @@ const CHANGELOG_URL = "https://raw.githubusercontent.com/hjdhjd/prismcast/main/C
 // How often to check for updates (2 hours in milliseconds).
 const UPDATE_CHECK_INTERVAL = 2 * 60 * 60 * 1000;
 
+// The registry key the periodic check is armed under.
+const UPDATE_TIMER_KEY = "check";
+
 // Minimum interval between consecutive checkForUpdates() calls. Multiple invocations within this window collapse into a single check, so a caller that
 // invokes startUpdateChecking() (or checkForUpdates() directly) more than once in quick succession does not fire duplicate network requests. Bypassed
 // when the caller passes force=true.
@@ -35,7 +41,11 @@ const UPDATE_CHECK_DEBOUNCE = 60 * 1000;
 let cachedLatestVersion: Nullable<string> = null;
 let cachedChangelog: Nullable<string> = null;
 let lastCheckTime = 0;
-let updateCheckInterval: Nullable<ReturnType<typeof setInterval>> = null;
+
+// The clock the debounce reads and the fetch bounds arm on, taken at the start and reset at the stop, so a check that begins under one run never mixes two
+// clocks. The registry below exists only while checking runs, so the binding is also the statement of whether it is running.
+let versionClock: Clock = systemClock;
+let updateTimers: Nullable<TimerRegistry> = null;
 
 /**
  * Normalizes a version string by stripping the leading 'v' prefix if present.
@@ -78,12 +88,10 @@ export function isVersionLessThan(a: string, b: string): boolean {
 }
 
 /**
- * Performs a timed fetch with explicit timer lifecycle management. The standard `AbortSignal.timeout(ms)` helper schedules a setTimeout whose handle libuv must
- * dispose during natural process exit; on Windows that disposal can race with pending TLS-socket cleanup and trigger the `UV_HANDLE_CLOSING` assertion in
- * libuv's `src\win\async.c`. By owning the AbortController and the timer explicitly and clearing the timer in `finally`
- * before we return, we guarantee the handle is disposed while the event loop is still healthy, sidestepping the race regardless of how soon after the fetch the
- * process exits. The behavior of the public callers is unchanged: a null return still means "treat the response as unavailable", whether the cause was a network
- * error, a non-2xx response, or a timeout.
+ * Performs a timed fetch bounded by the project's one reason-carrying interrupt source. timeoutSignal owns its timer's whole lifecycle - it arms the bound on
+ * the clock it is handed and disposes the handle when the caller cancels - and carries the libuv rationale for that ownership in its own comment. Cancelling in
+ * `finally` is what disposes the handle while the event loop is still healthy. The behavior of the public callers is unchanged: a null return still means
+ * "treat the response as unavailable", whether the cause was a network error, a non-2xx response, or a lapse of the bound.
  *
  * @param url - The URL to fetch.
  * @param timeoutMs - The hard timeout in milliseconds.
@@ -92,15 +100,11 @@ export function isVersionLessThan(a: string, b: string): boolean {
  */
 async function fetchWithTimeout(url: string, timeoutMs: number, failureLogTemplate: string): Promise<Nullable<Response>> {
 
-  const controller = new AbortController();
-  const timer = setTimeout((): void => {
-
-    controller.abort();
-  }, timeoutMs);
+  const bound = timeoutSignal(timeoutMs, { clock: versionClock });
 
   try {
 
-    const response = await fetch(url, { signal: controller.signal });
+    const response = await fetch(url, { signal: bound.signal });
 
     return response.ok ? response : null;
   } catch(error) {
@@ -110,7 +114,7 @@ async function fetchWithTimeout(url: string, timeoutMs: number, failureLogTempla
     return null;
   } finally {
 
-    clearTimeout(timer);
+    bound.cancel();
   }
 }
 
@@ -196,7 +200,7 @@ function extractVersionChangelog(changelog: string, version: string): Nullable<s
  */
 export async function checkForUpdates(currentVersion: string, force = false): Promise<void> {
 
-  const now = Date.now();
+  const now = versionClock.now();
 
   // Skip when a check fired within the debounce window so duplicate startup paths collapse to one network request, unless force=true bypasses the guard.
   if(!force && ((now - lastCheckTime) < UPDATE_CHECK_DEBOUNCE)) {
@@ -321,29 +325,42 @@ export async function getChangelogItems(version: string): Promise<Nullable<strin
 }
 
 /**
- * Starts periodic update checking.
+ * Starts periodic update checking. A start takes the clock the debounce reads and the periodic check and every fetch bound arm on.
  * @param currentVersion - The currently running version.
+ * @param clock - The clock the checker runs on; defaults to the system clock.
  */
-export function startUpdateChecking(currentVersion: string): void {
+export function startUpdateChecking(currentVersion: string, clock: Clock = systemClock): void {
 
   const current = normalizeVersion(currentVersion);
+
+  /* A checker that is already running keeps the clock and the interval it started with, and still fires the immediate check every call makes, which
+   * UPDATE_CHECK_DEBOUNCE collapses when the calls arrive close together.
+   */
+  if(updateTimers) {
+
+    void checkForUpdates(current);
+
+    return;
+  }
+
+  versionClock = clock;
+  updateTimers = new TimerRegistry({ clock });
 
   // Do an initial check.
   void checkForUpdates(current);
 
-  // Set up periodic checking. The ??= guard makes repeated calls to startUpdateChecking() safe: only the first call establishes the interval, while the
-  // unconditional initial check above fires on every call, with UPDATE_CHECK_DEBOUNCE collapsing calls that arrive close together into a single request.
-  updateCheckInterval ??= setInterval(() => void checkForUpdates(current), UPDATE_CHECK_INTERVAL);
+  updateTimers.setInterval(UPDATE_TIMER_KEY, () => {
+
+    void checkForUpdates(current);
+  }, UPDATE_CHECK_INTERVAL);
 }
 
 /**
- * Stops periodic update checking.
+ * Stops periodic update checking. Disposing the registry drains the periodic check, and the clock returns to the system's so a later start decides it afresh.
  */
 export function stopUpdateChecking(): void {
 
-  if(updateCheckInterval) {
-
-    clearInterval(updateCheckInterval);
-    updateCheckInterval = null;
-  }
+  updateTimers?.dispose();
+  updateTimers = null;
+  versionClock = systemClock;
 }

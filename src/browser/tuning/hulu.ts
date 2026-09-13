@@ -10,6 +10,7 @@ import type { GridProbeResult } from "./gridSearch.ts";
 import type { Page } from "puppeteer-core";
 import { createProviderChannelCache } from "./cache.ts";
 import { searchVirtualizedGrid } from "./gridSearch.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 // Unified channel cache entry combining discovery metadata, tuning data, and guide grid scroll positions. Populated from two sources: (1) details and listing API
 // responses intercepted during page load (provides uuid, programs, displayName), and (2) guide grid DOM reads during binary search or discovery linear scan
@@ -70,7 +71,7 @@ interface HuluDetailsResponse {
 
 // Partial type for a single program in Hulu's guide listing API response. Each program has an EAB ID and an airing window used to determine which program is
 // currently live on a given channel.
-interface HuluListingProgram {
+export interface HuluListingProgram {
 
   airingEnd: string;
   airingStart: string;
@@ -187,11 +188,10 @@ function populateHuluChannelCache(items: HuluDetailsItem[]): void {
  * Finds the currently-airing EAB from a program schedule array. Searches the programs for one whose airing window brackets the current time. Returns null if the
  * array is empty or no program is currently airing (stale data or program boundary gap).
  * @param programs - Array of programs with EAB IDs and airing times.
+ * @param now - The instant the airing windows are compared against.
  * @returns The currently-airing EAB string, or null if no match.
  */
-function findCurrentEabFromPrograms(programs: HuluListingProgram[]): Nullable<string> {
-
-  const now = Date.now();
+export function findCurrentEabFromPrograms(programs: HuluListingProgram[], now: number): Nullable<string> {
 
   for(const program of programs) {
 
@@ -748,7 +748,7 @@ async function tryFastPathTune(page: Page, entry: Nullable<HuluChannelEntry>, ch
   // is the primary mechanism for local affiliates (where the interceptor can't self-resolve by name) and a secondary mechanism for exact-match channels.
   if(entry?.uuid && entry.programs) {
 
-    const currentEab = findCurrentEabFromPrograms(entry.programs);
+    const currentEab = findCurrentEabFromPrograms(entry.programs, systemClock.now());
 
     if(currentEab) {
 
@@ -1380,7 +1380,7 @@ async function resolveHuluDirectUrl(channelSelector: string, page: Page): Promis
   // Look up the currently-airing EAB for the target channel (if UUID and programs are known). On warm cache (both UUID and EAB available), the interceptor has
   // both at install time and swaps immediately. On cold cache (no UUID), we return null below so the guide grid runs - the Channels tab click triggers full API
   // expansion.
-  const cachedEab = (cachedEntry?.programs) ? findCurrentEabFromPrograms(cachedEntry.programs) : null;
+  const cachedEab = (cachedEntry?.programs) ? findCurrentEabFromPrograms(cachedEntry.programs, systemClock.now()) : null;
   const isWarmCache = Boolean(cachedUuid && cachedEab);
 
   if(isWarmCache) {
@@ -1420,7 +1420,7 @@ async function resolveHuluDirectUrl(channelSelector: string, page: Page): Promis
 
     if(entry.programs) {
 
-      const currentEab = findCurrentEabFromPrograms(entry.programs);
+      const currentEab = findCurrentEabFromPrograms(entry.programs, systemClock.now());
 
       if(currentEab) {
 

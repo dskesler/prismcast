@@ -16,6 +16,7 @@ import { registerStream, unregisterStream } from "./registry.ts";
 import { CONFIG } from "../config/index.ts";
 import { LOG } from "../utils/index.ts";
 import { PassThrough } from "node:stream";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { closePuppeteerStreamWssOnIdle } from "../testing.helpers.ts";
 import { makeRegistryEntry } from "./registry.helpers.ts";
@@ -551,7 +552,6 @@ describe("createFMP4Segmenter", () => {
   afterEach(() => {
 
     unregisterStream(streamId);
-    mock.timers.reset();
   });
 
   test("stores the init segment on moov and bumps the version from a fresh start (no previousInitSegment)", (t) => {
@@ -615,11 +615,10 @@ describe("createFMP4Segmenter", () => {
 
   test("cuts the second segment only once elapsed time reaches CONFIG.hls.segmentDuration, never before", () => {
 
-    mock.timers.enable({ apis: ["Date"], now: 1700000000000 });
-
+    const clock = new TestClock(1700000000000);
     const onError = mock.fn();
     const onStop = mock.fn();
-    const segmenter = createFMP4Segmenter({ onError, onStop, streamId });
+    const segmenter = createFMP4Segmenter({ clock, onError, onStop, streamId });
     const readable = new PassThrough();
 
     segmenter.pipe(readable);
@@ -634,16 +633,16 @@ describe("createFMP4Segmenter", () => {
 
     assert.equal(segmenter.getSegmentIndex(), 1, "segment0 emitted via the fast path");
 
-    // Accumulate the second fragment without advancing the mocked clock. The moof that arrives here only evaluates the cut decision for the fragment already
+    // Accumulate the second fragment without advancing the injected clock. The moof that arrives here only evaluates the cut decision for the fragment already
     // sitting in the buffer - it does not itself get cut against.
     readable.write(makeMdat("m1"));
     readable.write(makeTestMoof());
 
     assert.equal(segmenter.getSegmentIndex(), 1, "zero elapsed time is below the segment-duration target, so no cut happens yet");
 
-    // Advance the mocked clock to exactly the segment-duration boundary and feed the next fragment. This is the boundary case (elapsed === target) that a
+    // Advance the injected clock to exactly the segment-duration boundary and feed the next fragment. This is the boundary case (elapsed === target) that a
     // flipped comparison (> instead of >=) would get wrong in either direction.
-    mock.timers.tick(CONFIG.hls.segmentDuration * 1000);
+    clock.advance(CONFIG.hls.segmentDuration * 1000);
 
     readable.write(makeMdat("m2"));
     readable.write(makeTestMoof());

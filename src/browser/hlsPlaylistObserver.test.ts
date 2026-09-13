@@ -7,11 +7,15 @@
  * makeFakeCdpPage) is shared via src/testing/cdp.helpers.ts with the other observers in the stack; globalThis.fetch is mocked locally to feed synthetic
  * manifest bodies into classifyHlsPlaylist.
  */
-import { FakeCdpSession, FakeConnection, closePuppeteerStreamWssOnIdle, makeFakeCdpPage, noop } from "../testing.helpers.ts";
+import { FakeCdpSession, FakeConnection, closePuppeteerStreamWssOnIdle, makeFakeCdpPage, noop, pendingBodyFetch } from "../testing.helpers.ts";
+import { TestClock, settle } from "homebridge-plugin-utils/testing";
 import { afterEach, describe, mock, test } from "node:test";
 import type { ObservedHlsPlaylist } from "./hlsPlaylistObserver.ts";
 import assert from "node:assert/strict";
 import { observeHlsPlaylists } from "./hlsPlaylistObserver.ts";
+
+// The manifest body fetch's own window, mirrored from hlsPlaylistObserver.ts so a row advances exactly the bound the module arms.
+const MANIFEST_BODY_FETCH_TIMEOUT = 5000;
 
 // Schedule background-server cleanup on a 0ms unref'd timer so the runner exits cleanly after the suite resolves.
 closePuppeteerStreamWssOnIdle();
@@ -248,6 +252,47 @@ describe("observeHlsPlaylists", () => {
     await new Promise((r) => setTimeout(r, 20));
 
     assert.equal(observed.length, 2, "differently-tokenized URLs each fire a callback");
+
+    observer.dispose();
+  });
+
+  test("delivers no playlist when the body-fetch bound lapses with the body still open", async () => {
+
+    /* A manifest whose headers arrive and whose body then stalls must end at the observer's own bound rather than holding the observation open for the life of
+     * the tab. The bound has to span the text() read for that to happen, which is what this row drives: the stub errors its body only when the request's signal
+     * aborts, so a bound cancelled at header arrival would leave the read pending and this row waiting.
+     */
+    const connection = new FakeConnection();
+    const rootSession = new FakeCdpSession(connection);
+    const url = "https://cdn.test/stalled.m3u8";
+    const clock = new TestClock();
+
+    mock.method(globalThis, "fetch", async (_url: string | URL, init?: RequestInit): Promise<Response> => pendingBodyFetch(init));
+
+    const observed: ObservedHlsPlaylist[] = [];
+    const observer = await observeHlsPlaylists(makeFakeCdpPage(rootSession), {
+
+      clock,
+      logCategory: "test:hls",
+      onPlaylist: (p): void => { observed.push(p); }
+    });
+
+    assert.ok(observer, "observer installed");
+
+    rootSession.emitResponse(url);
+
+    assert.equal(clock.pending, 1, "the body-fetch bound is armed on the clock the options carry");
+    assert.deepEqual(clock.requested, [MANIFEST_BODY_FETCH_TIMEOUT], "and it waits the manifest body fetch's own window");
+
+    // Let the headers land and the body read begin, so the advance below lapses a bound that is spanning an open body rather than an unstarted request.
+    await settle();
+
+    clock.advance(MANIFEST_BODY_FETCH_TIMEOUT);
+
+    await settle();
+
+    assert.equal(observed.length, 0, "a body the bound abandoned delivers no playlist");
+    assert.equal(clock.pending, 0, "and the bound was cancelled rather than left armed");
 
     observer.dispose();
   });

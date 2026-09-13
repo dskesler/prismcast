@@ -4,6 +4,7 @@
  */
 import type { Frame, Page } from "puppeteer-core";
 import { composeSignals, waitWithSignal } from "homebridge-plugin-utils";
+import type { Clock } from "homebridge-plugin-utils";
 import { getStreamId } from "./streamContext.ts";
 import { timeoutSignal } from "./delay.ts";
 
@@ -98,6 +99,20 @@ export class EvaluateAbortError extends Error {
 }
 
 /**
+ * What a call can say about its own bound: where the bound's time comes from, and how long it is. One options object rather than a second positional parameter,
+ * because only a few call sites name a timeout at all and none of them should have to write an undefined placeholder to reach past it.
+ */
+export interface EvaluateOptions {
+
+  // The clock the per-call bound arms on. A caller inside a poll its policy drives on an injected clock passes that clock, so the read's own bound comes due on
+  // the same timeline as the poll around it. Defaults to the system clock.
+  readonly clock?: Clock;
+
+  // How long the read may take before the bound interrupts it, in milliseconds. Defaults to DEFAULT_EVALUATE_TIMEOUT.
+  readonly timeoutMs?: number;
+}
+
+/**
  * Executes a Puppeteer evaluate call with abort and timeout support. This wrapper provides immediate cancellation when a stream is terminated and a safety timeout to
  * prevent hanging on unresponsive browsers.
  *
@@ -105,7 +120,7 @@ export class EvaluateAbortError extends Error {
  * @param context - The Page or Frame to evaluate in.
  * @param pageFunction - The function to evaluate in the browser context.
  * @param args - Arguments to pass to the function (optional).
- * @param timeoutMs - Timeout in milliseconds (default: 15000).
+ * @param options - The clock the bound arms on and how long the bound is.
  * @returns The result of the evaluate call.
  * @throws EvaluateAbortError if the stream was terminated.
  * @throws EvaluateTimeoutError if the timeout was reached.
@@ -115,9 +130,10 @@ export async function evaluateWithAbort<T, Args extends unknown[]>(
   context: Frame | Page,
   pageFunction: (...args: Args) => T,
   args?: Args,
-  timeoutMs?: number
+  options: EvaluateOptions = {}
 ): Promise<T> {
 
+  const { clock, timeoutMs } = options;
   const timeout = timeoutMs ?? DEFAULT_EVALUATE_TIMEOUT;
 
   // Get stream context to find the abort signal.
@@ -141,7 +157,7 @@ export async function evaluateWithAbort<T, Args extends unknown[]>(
   // platform's AbortError for a stream termination. Those two can never be confused, and an evaluate rejection is never the signal's reason at all, so it falls
   // through verbatim. When there is no stream signal, composeSignals hands back the timeout signal unwrapped and the bound is the whole story.
   const timeoutReason = new EvaluateTimeoutError(timeout);
-  const timeoutHandle = timeoutSignal(timeout, timeoutReason);
+  const timeoutHandle = timeoutSignal(timeout, { clock, reason: timeoutReason });
   const signal = composeSignals(streamSignal, timeoutHandle.signal);
 
   try {

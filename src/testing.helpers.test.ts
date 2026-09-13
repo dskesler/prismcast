@@ -42,6 +42,7 @@ const EXPECTED_FUNCTION_EXPORTS = [
   "makeFakePage",
   "noop",
   "nthOf",
+  "pendingBodyFetch",
   "seedVideoSelector",
   "silentLog",
   "withDocument",

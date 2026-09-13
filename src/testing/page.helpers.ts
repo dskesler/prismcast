@@ -2,7 +2,9 @@
  *
  * page.helpers.ts: A general Puppeteer Page double for tests that drive page-shaped production code without a browser.
  */
+import type { Clock } from "homebridge-plugin-utils";
 import type { Page } from "puppeteer-core";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* This is the general Page surface double: a stand-in for the handful of Page members that page-driving production code touches, with every asynchronous member
  * held open so the test decides when - and whether - it answers. Holding a call open is the point. A test that needs to observe what happens while an evaluate
@@ -13,12 +15,12 @@ import type { Page } from "puppeteer-core";
  */
 
 /**
- * One call the double received, held open for the test to settle. The timestamp is read at issue time, so a test driving mock timers can assert when production
- * code chose to make the call.
+ * One call the double received, held open for the test to settle. The timestamp is read at issue time, so a test driving a clock can assert when production code
+ * chose to make the call.
  */
 export interface PendingPageCall<T> {
 
-  // Value of Date.now() when the call was issued.
+  // The double's clock reading when the call was issued.
   readonly at: number;
 
   // Rejects the call with the supplied error.
@@ -33,6 +35,10 @@ export interface PendingPageCall<T> {
  * handler that settles the call decides the answer, and one that leaves it alone leaves the call pending for the test to settle later.
  */
 export interface FakePageOptions {
+
+  // The clock each call's issue timestamp is read from. A test driving production code on a virtual clock passes that clock, so the stamps it reads back sit on
+  // the same timeline as the code it is driving. Defaults to the system clock.
+  clock?: Clock;
 
   // What frames() reports. Defaults to an empty list.
   frames?: readonly unknown[];
@@ -79,13 +85,14 @@ export interface FakePage {
 
 /**
  * Records a call and hands back both the promise the double returns and the handle the test settles it with.
+ * @param clock - The clock the issue timestamp is read from.
  * @returns The pending-call handle and the promise to hand back to the caller under test.
  */
-function openCall<T>(): { call: PendingPageCall<T>; promise: Promise<T> } {
+function openCall<T>(clock: Clock): { call: PendingPageCall<T>; promise: Promise<T> } {
 
   const { promise, reject, resolve } = Promise.withResolvers<T>();
 
-  return { call: { at: Date.now(), reject, resolve }, promise };
+  return { call: { at: clock.now(), reject, resolve }, promise };
 }
 
 /**
@@ -97,6 +104,7 @@ function openCall<T>(): { call: PendingPageCall<T>; promise: Promise<T> } {
  */
 export function makeFakePage(options: FakePageOptions = {}): FakePage {
 
+  const clock = options.clock ?? systemClock;
   const evaluations: PendingPageCall<unknown>[] = [];
   const navigations: PendingPageCall<null>[] = [];
   const selectorWaits: PendingPageCall<unknown>[] = [];
@@ -109,7 +117,7 @@ export function makeFakePage(options: FakePageOptions = {}): FakePage {
     browser: (): unknown => ({ pages: async (): Promise<readonly unknown[]> => options.pages ?? [] }),
     evaluate: (): Promise<unknown> => {
 
-      const { call, promise } = openCall<unknown>();
+      const { call, promise } = openCall<unknown>(clock);
 
       evaluations.push(call);
       options.onEvaluate?.(call, evaluations.length - 1);
@@ -119,7 +127,7 @@ export function makeFakePage(options: FakePageOptions = {}): FakePage {
     frames: (): readonly unknown[] => options.frames ?? [],
     goto: (): Promise<null> => {
 
-      const { call, promise } = openCall<null>();
+      const { call, promise } = openCall<null>(clock);
 
       navigations.push(call);
       options.onGoto?.(call, navigations.length - 1);
@@ -130,7 +138,7 @@ export function makeFakePage(options: FakePageOptions = {}): FakePage {
     url: (): string => currentUrl,
     waitForSelector: (): Promise<unknown> => {
 
-      const { call, promise } = openCall<unknown>();
+      const { call, promise } = openCall<unknown>(clock);
 
       selectorWaits.push(call);
       options.onWaitForSelector?.(call, selectorWaits.length - 1);

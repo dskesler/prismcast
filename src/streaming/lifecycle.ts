@@ -8,6 +8,7 @@ import { cancelPrerollTimer, getStream, unregisterStream } from "./registry.ts";
 import { formatKeyframeStatsSummary, formatSessionStatsSummary } from "./fmp4Segmenter.ts";
 import { formatRecoveryMetricsSummary, getTotalRecoveryAttempts } from "./recovery.ts";
 import { isGracefulShutdown, restartBrowserIfImpairedAndIdle, syncWindowVisibility, unregisterManagedPage } from "../browser/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import type { RecoveryMetrics } from "./recovery.ts";
 import type { StreamRegistryEntry } from "./registry.ts";
@@ -15,6 +16,7 @@ import { clearClients } from "./clients.ts";
 import { clearPretuneSafetyTimer } from "./pretuneTimers.ts";
 import { clearShowName } from "./showInfo.ts";
 import { emitStreamRemoved } from "./statusEmitter.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* This module provides the authoritative stream termination logic. All code paths that need to terminate a stream should call terminateStream() from this module. This
  * ensures consistent cleanup behavior including:
@@ -158,8 +160,9 @@ function disposeStreamResources(entry: StreamRegistryEntry): void {
  * @param streamId - The numeric stream ID.
  * @param channelName - The channel name for channel mapping cleanup.
  * @param reason - The reason for termination (e.g., "idle timeout", "circuit breaker").
+ * @param clock - The clock the termination summary's duration reads; defaults to the system clock.
  */
-export function terminateStream(streamId: number, channelName: string, reason: string): void {
+export function terminateStream(streamId: number, channelName: string, reason: string, clock: Clock = systemClock): void {
 
   // The guard makes redundant terminate calls a no-op (callers can issue them freely) and suppresses spurious warnings from in-flight segmenter/monitor callbacks.
   if(terminationInitiated.has(streamId)) {
@@ -170,7 +173,7 @@ export function terminateStream(streamId: number, channelName: string, reason: s
   terminationInitiated.add(streamId);
 
   const streamInfo = getStream(streamId);
-  const durationMs = streamInfo ? (Date.now() - streamInfo.startTime.getTime()) : 0;
+  const durationMs = streamInfo ? (clock.now() - streamInfo.startTime) : 0;
 
   // Prologue: snapshot every statistic the termination summary needs while the resources are still live. Each capture-mode resource is a node exposing a read
   // alongside its dispose - the segmenter (via the capture session), the native proxy, and the health monitor - read here, disposed below. The counters remain valid

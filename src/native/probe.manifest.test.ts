@@ -9,10 +9,22 @@
 /* eslint-disable sort-keys -- fixture route maps are ordered by HLS resolution chain (master -> variant -> key), not alphabetical key strings, so the logical
  * dependency direction is visible to readers. */
 import type { PipelineShape, ProbeCacheIdentity } from "./probe.ts";
+import { TestClock, settle } from "homebridge-plugin-utils/testing";
 import { afterEach, beforeEach, describe, mock, test } from "node:test";
 import { buildProbeCacheStamp, clearProbeCache, getCachedEncryption, probeManifest } from "./probe.ts";
 import { LOG } from "../utils/index.ts";
 import assert from "node:assert/strict";
+import { pendingBodyFetch } from "../testing.helpers.ts";
+import { systemClock } from "homebridge-plugin-utils";
+
+/* The instant these rows read the probe cache at. The entries they assert on are stamped by a probe left on its own default reading, so one reading of
+ * the same source taken here is inside the TTL window of every one of them: a read at this instant reports whether the entry exists, which is what those rows
+ * ask. The TTL boundary itself has its own row, which states its stamp and every instant it reads at outright.
+ */
+const CACHE_READ_INSTANT_MS = systemClock.now();
+
+// The probe's own fetch window, mirrored from probe.ts so a row advances exactly the bound the module arms.
+const FETCH_TIMEOUT = 10000;
 
 /* makeFetchRouter installs a mock for globalThis.fetch that dispatches to URL-keyed responses. Tests register their fixtures keyed by URL prefix; any request to
  * an unregistered URL returns a 404. This keeps each test focused on the single classification branch it exercises - master returns variant URL, variant returns
@@ -325,7 +337,7 @@ describe("probeManifest", () => {
     });
 
     await probeManifest(masterUrl, PROBE_IDENTITY);
-    assert.equal(getCachedEncryption(PROBE_IDENTITY), "drm", "first probe cached DRM");
+    assert.equal(getCachedEncryption(PROBE_IDENTITY, CACHE_READ_INSTANT_MS), "drm", "first probe cached DRM");
 
     // Reset the mock - if the function re-fetches, the request will fail.
     mock.reset();
@@ -361,7 +373,7 @@ describe("probeManifest", () => {
     });
 
     await probeManifest(masterUrl, PROBE_IDENTITY);
-    assert.equal(getCachedEncryption(PROBE_IDENTITY), "clear", "first probe cached clear");
+    assert.equal(getCachedEncryption(PROBE_IDENTITY, CACHE_READ_INSTANT_MS), "clear", "first probe cached clear");
 
     // Re-fixture: the second probe must observe a real fetch.
     mock.reset();
@@ -554,7 +566,7 @@ describe("probeManifest", () => {
 
     await probeManifest(masterUrl, PROBE_IDENTITY);
 
-    assert.equal(getCachedEncryption(PROBE_IDENTITY), "clear", "clear classification populated in cache");
+    assert.equal(getCachedEncryption(PROBE_IDENTITY, CACHE_READ_INSTANT_MS), "clear", "clear classification populated in cache");
   });
 });
 
@@ -685,13 +697,13 @@ describe("probeManifest: media-only playlists", () => {
 
     await probeManifest(playlistUrl, MEDIA_ONLY_IDENTITY);
 
-    assert.equal(getCachedEncryption(MEDIA_ONLY_IDENTITY), "clear", "clear classification cached for media-only path");
+    assert.equal(getCachedEncryption(MEDIA_ONLY_IDENTITY, CACHE_READ_INSTANT_MS), "clear", "clear classification cached for media-only path");
   });
 });
 
 describe("probeManifest: uncovered branches", () => {
 
-  // Mirrors PROBE_CACHE_TTL in probe.ts (24 hours). The constant is module-private, so the TTL test hardcodes the same 24h value and steps Date.now() past it.
+  // Mirrors PROBE_CACHE_TTL in probe.ts (24 hours). The constant is module-private, so the TTL test hardcodes the same 24h value and passes instants past it.
   const PROBE_CACHE_TTL = 24 * 60 * 60 * 1000;
 
   const PROBE_IDENTITY = makeIdentity("probe-channel", "https://cdn.test/probe-channel");
@@ -755,7 +767,7 @@ describe("probeManifest: uncovered branches", () => {
 
   test("returns null when the master fetch itself throws (network error / abort)", async () => {
 
-    // fetchManifestText wraps chromeFetch in a try/catch so a thrown fetch (DNS failure, connection reset, AbortSignal.timeout firing) surfaces as null rather
+    // fetchManifestText wraps chromeFetch in a try/catch so a thrown fetch (DNS failure, connection reset, the bound lapsing) surfaces as null rather
     // than propagating. probeManifest sees a null body and returns null so the caller falls back to capture instead of crashing.
     const masterUrl = "https://cdn.test/throwing-master.m3u8";
 
@@ -768,6 +780,31 @@ describe("probeManifest: uncovered branches", () => {
     });
 
     assert.equal(await probeManifest(masterUrl, PROBE_IDENTITY), null, "thrown fetch surfaces as null");
+  });
+
+  test("returns null when the master fetch's bound lapses with the body still open", async () => {
+
+    /* A master whose headers arrive and whose body then stalls has to end at the probe's own bound, which means that bound spans the text() read rather than the
+     * request alone. The stub is installed directly rather than through makeFetchRouter because the router hands its handlers the URL only, and this row needs
+     * the request's init to wire the body's failure to the signal the probe supplies.
+     */
+    const masterUrl = "https://cdn.test/stalled-master.m3u8";
+    const clock = new TestClock();
+
+    mock.method(globalThis, "fetch", async (_url: string | URL, init?: RequestInit): Promise<Response> => pendingBodyFetch(init));
+
+    const resultPromise = probeManifest(masterUrl, PROBE_IDENTITY, { clock });
+
+    assert.equal(clock.pending, 1, "the master fetch's bound is armed on the clock the probe was handed");
+    assert.deepEqual(clock.requested, [FETCH_TIMEOUT], "and it waits the probe fetch's own window");
+
+    // Let the headers land and the body read begin, so the advance below lapses a bound that is spanning an open body rather than an unstarted request.
+    await settle();
+
+    clock.advance(FETCH_TIMEOUT);
+
+    assert.equal(await resultPromise, null, "the lapsed bound abandons the open body and the probe returns null");
+    assert.equal(clock.pending, 0, "and the bound was cancelled rather than left armed");
   });
 
   test("downgrades AES-128 to 'drm' when the key fetch throws", async () => {
@@ -797,9 +834,11 @@ describe("probeManifest: uncovered branches", () => {
 
   test("expires a cache entry older than PROBE_CACHE_TTL and treats it as a miss", async () => {
 
-    // getCachedEncryption reads Date.now() directly to compute entry age. We seed the cache with a real DRM probe (timestamp = real Date.now()), then mock
-    // Date.now() to a value more than 24h past the seed so the entry is stale. getCachedEncryption must delete the entry and return null. To prove the entry was
-    // deleted (not merely compared against the clock), we then rewind Date.now() back inside the TTL window and confirm the lookup still misses.
+    /* The cache compares an entry's age against the instant its reader is handed, so this row states every instant it uses. The entry is stamped at a fixed
+     * reading, read back at exactly the TTL boundary where the strictly-greater test still admits it, and read again one millisecond past that boundary where it
+     * is a miss. The final read rewinds to the stamp instant: a live entry would answer there, so a miss proves the expiry deleted the entry rather than merely
+     * comparing it.
+     */
     const masterUrl = "https://cdn.test/ttl-master.m3u8";
     const variantUrl = "https://cdn.test/ttl-variant.m3u8";
 
@@ -809,22 +848,13 @@ describe("probeManifest: uncovered branches", () => {
       [variantUrl]: () => new Response("#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://x\"\n", { status: 200 })
     });
 
-    const seededAt = Date.now();
+    const seededAt = 1700000000000;
 
-    await probeManifest(masterUrl, PROBE_IDENTITY);
-    assert.equal(getCachedEncryption(PROBE_IDENTITY), "drm", "seed probe cached drm before any clock manipulation");
-
-    // Advance the clock past the TTL. The seed timestamp is >= seededAt, so this difference is guaranteed to exceed PROBE_CACHE_TTL.
-    let nowValue = seededAt + PROBE_CACHE_TTL + 1000;
-
-    mock.method(Date, "now", () => nowValue);
-
-    assert.equal(getCachedEncryption(PROBE_IDENTITY), null, "entry older than the TTL is treated as a miss");
-
-    // Rewind the clock inside the TTL window. A live entry would now read as fresh; a deleted one stays a miss. This distinguishes deletion from a pure age check.
-    nowValue = seededAt;
-
-    assert.equal(getCachedEncryption(PROBE_IDENTITY), null, "the stale entry was deleted, not merely compared against the clock");
+    await probeManifest(masterUrl, PROBE_IDENTITY, { clock: new TestClock(seededAt) });
+    assert.equal(getCachedEncryption(PROBE_IDENTITY, seededAt), "drm", "the seed probe stamped drm at the instant it was handed");
+    assert.equal(getCachedEncryption(PROBE_IDENTITY, seededAt + PROBE_CACHE_TTL), "drm", "an entry read at exactly the TTL boundary is still live");
+    assert.equal(getCachedEncryption(PROBE_IDENTITY, seededAt + PROBE_CACHE_TTL + 1), null, "one millisecond past the boundary it reads as a miss");
+    assert.equal(getCachedEncryption(PROBE_IDENTITY, seededAt), null, "the expired entry was deleted, not merely compared against the instant");
   });
 });
 
@@ -1692,7 +1722,7 @@ describe("probeManifest: static-playlist tune admission", () => {
     assert.equal(logged[0], "native:probe", "the rejection logs under the existing probe category");
     assert.equal(logged[2], "static-channel", "the channel name is interpolated");
     assert.equal(logged[3], 1, "the count comes from the resolved variant body, not the master");
-    assert.equal(getCachedEncryption(STATIC_IDENTITY), null, "a refused playlist contributes no channel-level encryption fact");
+    assert.equal(getCachedEncryption(STATIC_IDENTITY, CACHE_READ_INSTANT_MS), null, "a refused playlist contributes no channel-level encryption fact");
   });
 
   test("probes the same bumper bytes exactly as the flag-less path does", async () => {
@@ -1710,7 +1740,7 @@ describe("probeManifest: static-playlist tune admission", () => {
     assert.equal(result.bandwidth, 1800000, "bandwidth from the master's BANDWIDTH attribute");
     assert.equal(result.codec, "H264", "codec from the master's CODECS attribute");
     assert.equal(result.resolution, "1280x720", "resolution from the master's RESOLUTION attribute");
-    assert.equal(getCachedEncryption(STATIC_IDENTITY), "clear", "the flag-less path writes the probe cache");
+    assert.equal(getCachedEncryption(STATIC_IDENTITY, CACHE_READ_INSTANT_MS), "clear", "the flag-less path writes the probe cache");
   });
 
   test("declines a one-segment VOD window, since liveness tagging does not make a window consumable", async () => {
@@ -1892,16 +1922,16 @@ describe("probeManifest: binding-stamped cache entries", () => {
 
     await probeManifest(masterUrl, PROBING_IDENTITY);
 
-    assert.equal(getCachedEncryption(PROBING_IDENTITY), "drm", "the probing identity reads back its own classification");
-    assert.equal(getCachedEncryption(CHANGED_URL), null, "a changed url reads the entry as absent");
+    assert.equal(getCachedEncryption(PROBING_IDENTITY, CACHE_READ_INSTANT_MS), "drm", "the probing identity reads back its own classification");
+    assert.equal(getCachedEncryption(CHANGED_URL, CACHE_READ_INSTANT_MS), null, "a changed url reads the entry as absent");
 
     await probeManifest(masterUrl, PROBING_IDENTITY);
 
-    assert.equal(getCachedEncryption(CHANGED_SELECTOR), null, "a changed channelSelector reads the entry as absent");
+    assert.equal(getCachedEncryption(CHANGED_SELECTOR, CACHE_READ_INSTANT_MS), null, "a changed channelSelector reads the entry as absent");
 
     await probeManifest(masterUrl, PROBING_IDENTITY);
 
-    assert.equal(getCachedEncryption(CHANGED_PROFILE), null, "a changed profile reads the entry as absent");
+    assert.equal(getCachedEncryption(CHANGED_PROFILE, CACHE_READ_INSTANT_MS), null, "a changed profile reads the entry as absent");
 
     const beforeEviction = masterFetches();
 
@@ -1921,7 +1951,7 @@ describe("probeManifest: binding-stamped cache entries", () => {
     assert.ok(result, "the probe still resolves through the fallback variant");
     assert.equal(result.encryption, "drm", "the returned feed carries the fallback variant's classification");
     assert.equal(result.bestVariantUrl, lowerVariantUrl, "and the fallback variant is the feed URL");
-    assert.equal(getCachedEncryption(PROBING_IDENTITY), null, "no channel-level classification is recorded from a fallback variant");
+    assert.equal(getCachedEncryption(PROBING_IDENTITY, CACHE_READ_INSTANT_MS), null, "no channel-level classification is recorded from a fallback variant");
 
     const beforeReprobe = masterFetches();
 
@@ -1940,7 +1970,7 @@ describe("probeManifest: binding-stamped cache entries", () => {
 
     assert.ok(result, "the probe resolves through the top variant");
     assert.equal(result.bestVariantUrl, topVariantUrl, "the top-ranked variant is the feed URL");
-    assert.equal(getCachedEncryption(PROBING_IDENTITY), "drm", "the top variant's classification is recorded for the identity");
+    assert.equal(getCachedEncryption(PROBING_IDENTITY, CACHE_READ_INSTANT_MS), "drm", "the top variant's classification is recorded for the identity");
 
     const beforeReprobe = masterFetches();
 

@@ -16,8 +16,9 @@
  * the new tail, before any await, so concurrent calls establish a deterministic same-tick order. A waiter that gives up on its turn-wait bound forwards its
  * settlement to its predecessor's own settlement rather than resolving it directly, so a give-up never advances the chain past an operation that is still running.
  */
-import type { Clock } from "../utils/index.ts";
-import { realClock } from "../utils/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
+import { systemClock } from "homebridge-plugin-utils";
+import { waitWithTimeout } from "../utils/index.ts";
 
 // Error classes. The messages of the turn-timeout and deadline errors are part of the compatibility contract: isCaptureInfrastructureError (recovery.ts) classifies
 // by substring, so callers rely on the exact text. Each class carries its narrative comment above it.
@@ -64,7 +65,7 @@ export class CaptureAbandonedError extends Error {
  */
 export interface CaptureLockOptions {
 
-  // The time port used for the turn-wait race, the task deadline race, and the wedge sleep. Defaults to realClock; tests pass a fake clock.
+  // The time port used for the turn-wait race, the task deadline race, and the wedge sleep. Defaults to the system clock; tests pass a virtual clock.
   readonly clock?: Clock;
 
   // The wedge-derivation policy: a task's wedge bound is max(wedgeFloorMs, deadlineMs + wedgeMarginMs), computed per run() call. Deriving from the task's own
@@ -117,7 +118,7 @@ export interface CaptureLock {
  */
 export function createCaptureLock(options: CaptureLockOptions): CaptureLock {
 
-  const { clock = realClock, wedgeFloorMs, wedgeMarginMs } = options;
+  const { clock = systemClock, wedgeFloorMs, wedgeMarginMs } = options;
 
   // The FIFO tail. Each run() call reads this as its predecessor and replaces it with its own settlement promise, synchronously, before any await. The first call
   // sees an already-resolved predecessor and is granted its turn immediately.
@@ -143,7 +144,7 @@ export function createCaptureLock(options: CaptureLockOptions): CaptureLock {
     // is what keeps a give-up from advancing the chain past an unsettled predecessor.
     try {
 
-      await clock.waitWithTimeout(predecessor, runOptions.turnWaitMs, new CaptureTurnTimeoutError());
+      await waitWithTimeout(predecessor, runOptions.turnWaitMs, { clock, reason: new CaptureTurnTimeoutError() });
     } catch(error) {
 
       void predecessor.then(signalSettled, signalSettled);
@@ -170,7 +171,7 @@ export function createCaptureLock(options: CaptureLockOptions): CaptureLock {
 
     // Arm the wedge as a flag-guarded sleep rather than a cancellable timer: if the task has not settled by the derived bound, invoke onWedge once. A late wakeup
     // after the task already settled is a cheap no-op, so no timer handle or cancellation bookkeeping is needed. The wedge only signals; it never releases the turn.
-    void clock.sleep(wedgeBoundMs).then(() => {
+    void clock.delay(wedgeBoundMs).then(() => {
 
       if(!workSettled) {
 
@@ -182,7 +183,7 @@ export function createCaptureLock(options: CaptureLockOptions): CaptureLock {
     // resource retire it - and reject the caller. The turn is NOT released here; the settlement subscription above keeps holding it until the work truly settles.
     try {
 
-      return await clock.waitWithTimeout(work, runOptions.deadlineMs, new CaptureDeadlineError(runOptions.deadlineMessage));
+      return await waitWithTimeout(work, runOptions.deadlineMs, { clock, reason: new CaptureDeadlineError(runOptions.deadlineMessage) });
     } catch(error) {
 
       if(error instanceof CaptureDeadlineError) {

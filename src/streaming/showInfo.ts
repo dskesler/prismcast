@@ -2,11 +2,13 @@
  *
  * showInfo.ts: Channels DVR API integration for show name and channel logo lookup.
  */
-import { LOG, formatError, normalizeClientAddress } from "../utils/index.ts";
+import { LOG, formatError, normalizeClientAddress, timeoutSignal } from "../utils/index.ts";
+import { TimerRegistry, systemClock } from "homebridge-plugin-utils";
 import { clearChannelLogos, getAllChannels, getChannelListing, getChannelLogo, getChannelStationId, setChannelLogo,
   setChannelLogos } from "../config/userChannels.ts";
 import { mutateConfig, readConfig } from "../config/userConfig.ts";
 import { CONFIG } from "../config/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import { emitChannelUpdate } from "./statusEmitter.ts";
 import { getAllStreams } from "./registry.ts";
@@ -40,7 +42,7 @@ import { getAllStreams } from "./registry.ts";
  *
  * Caching strategy:
  * - Last known DVR host: Persists across poll cycles, resets on shutdown
- * - Device channel mappings: Cached for 5 minutes per host (rarely change)
+ * - Device channel mappings: Cached for 5 minutes per host, aged on the poller's clock (rarely change)
  * - Recording jobs and guide data: Fetched fresh each poll cycle (30 seconds)
  * - Channel logos: Cached by station ID in userChannels.ts, refreshed every 24 hours
  *
@@ -173,8 +175,13 @@ interface TmsStationResult {
 
 // State.
 
-// Interval handle for periodic polling.
-let pollInterval: Nullable<ReturnType<typeof setInterval>> = null;
+/* The poller's timers, on the library's lifetime-bound registry: the show-name poll under "poll", the 24-hour logo refresh under "logos", and the debounced
+ * trigger under "trigger". Null while the poller is stopped, so the binding is also the statement of whether it is running.
+ */
+let timers: Nullable<TimerRegistry> = null;
+
+// The clock the poller's own reads take their instant from. Set at start and reset at stop, so an operation that begins under one poller never mixes two clocks.
+let pollingClock: Clock = systemClock;
 
 // Cache of show names by stream ID.
 const showNameCache = new Map<number, string>();
@@ -182,15 +189,9 @@ const showNameCache = new Map<number, string>();
 // Cache of device channel mappings by DVR host.
 const deviceMappingsByHost = new Map<string, DeviceMappingsCache>();
 
-// Interval handle for 24-hour logo refresh.
-let logoRefreshInterval: Nullable<ReturnType<typeof setInterval>> = null;
-
 // Last known Channels DVR host that had matching M3U devices. Used to look up show names for all streams, including those initiated by non-DVR clients
 // (e.g., Plex). Persists across poll cycles but resets on shutdown. Updated whenever getDeviceMappings() finds matching devices on a host.
 let lastKnownDvrHost: Nullable<string> = null;
-
-// Pending debounced trigger for immediate show name updates.
-let pendingTrigger: Nullable<ReturnType<typeof setTimeout>> = null;
 
 // Public API.
 
@@ -238,13 +239,17 @@ export function setDvrHost(host: string): void {
 
 /**
  * Starts the show info polling interval. Should be called on server startup.
+ * @param clock - The clock the poll cadences, the debounce, and the mapping cache's refresh instant read; defaults to the system clock.
  */
-export function startShowInfoPolling(): void {
+export function startShowInfoPolling(clock: Clock = systemClock): void {
 
-  if(pollInterval) {
+  if(timers) {
 
     return;
   }
+
+  pollingClock = clock;
+  timers = new TimerRegistry({ clock });
 
   // Load the persisted DVR host from the config file so the pretune module can begin polling immediately on startup.
   void loadPersistedDvrHost();
@@ -252,13 +257,13 @@ export function startShowInfoPolling(): void {
   // Run immediately on startup, then every 30 seconds.
   void updateShowNames();
 
-  pollInterval = setInterval(() => {
+  timers.setInterval("poll", () => {
 
     void updateShowNames();
   }, POLL_INTERVAL_MS);
 
   // Start the 24-hour logo refresh. The initial population is triggered by loadPersistedDvrHost() or setDvrHost() when a DVR host becomes known.
-  logoRefreshInterval = setInterval(() => {
+  timers.setInterval("logos", () => {
 
     void populateChannelLogos();
   }, LOGO_REFRESH_INTERVAL_MS);
@@ -269,25 +274,10 @@ export function startShowInfoPolling(): void {
  */
 export function stopShowInfoPolling(): void {
 
-  if(pollInterval) {
-
-    clearInterval(pollInterval);
-    pollInterval = null;
-  }
-
-  // Clear the logo refresh interval.
-  if(logoRefreshInterval) {
-
-    clearInterval(logoRefreshInterval);
-    logoRefreshInterval = null;
-  }
-
-  // Clear pending trigger.
-  if(pendingTrigger) {
-
-    clearTimeout(pendingTrigger);
-    pendingTrigger = null;
-  }
+  // Disposing the registry drains the two intervals and any pending trigger together, and makes a later arm on it inert.
+  timers?.dispose();
+  timers = null;
+  pollingClock = systemClock;
 
   // Clear caches and cached DVR host on shutdown.
   showNameCache.clear();
@@ -302,16 +292,9 @@ export function stopShowInfoPolling(): void {
  */
 export function triggerShowNameUpdate(): void {
 
-  // Clear any pending trigger to reset the debounce timer.
-  if(pendingTrigger) {
-
-    clearTimeout(pendingTrigger);
-  }
-
-  // Schedule the update after the debounce delay.
-  pendingTrigger = setTimeout(() => {
-
-    pendingTrigger = null;
+  // Registering under the same key replaces whatever the key held, which is the debounce: the latest trigger wins. A call made before the poller has started, or
+  // after it has stopped, arms nothing.
+  timers?.setTimeout("trigger", () => {
 
     void updateShowNames();
   }, TRIGGER_DEBOUNCE_MS);
@@ -344,6 +327,8 @@ export function clearShowName(streamId: number): void {
  */
 async function updateShowNames(): Promise<void> {
 
+  // One instant for the whole operation, read at its start, so a stop landing mid-operation cannot split this update's cache reads across two clocks.
+  const now = pollingClock.now();
   const streams = getAllStreams();
 
   if(streams.length === 0) {
@@ -370,7 +355,7 @@ async function updateShowNames(): Promise<void> {
   await Promise.all(
     Array.from(discoveryHosts).map(async (host) => {
 
-      const mappings = await getDeviceMappings(host);
+      const mappings = await getDeviceMappings(host, now);
 
       if(mappings.size > 0) {
 
@@ -382,7 +367,7 @@ async function updateShowNames(): Promise<void> {
   // Lookup phase: use the cached DVR host for show name lookups across all streams.
   if(lastKnownDvrHost) {
 
-    await updateShowNamesForHost(lastKnownDvrHost, allStreamEntries);
+    await updateShowNamesForHost(lastKnownDvrHost, allStreamEntries, now);
 
     return;
   }
@@ -398,11 +383,12 @@ async function updateShowNames(): Promise<void> {
  * Updates show names for streams from a single DVR host.
  * @param host - The DVR server hostname or IP address.
  * @param hostStreams - Array of streams from this host with their channel keys.
+ * @param now - The instant the calling update read at its start, threaded so the whole operation ages the cache against one reading.
  */
-async function updateShowNamesForHost(host: string, hostStreams: { channelKey: string; id: number }[]): Promise<void> {
+async function updateShowNamesForHost(host: string, hostStreams: { channelKey: string; id: number }[], now: number): Promise<void> {
 
   // Ensure we have fresh device mappings.
-  const mappings = await getDeviceMappings(host);
+  const mappings = await getDeviceMappings(host, now);
 
   if(mappings.size === 0) {
 
@@ -524,12 +510,12 @@ export function matchesM3uDevice(deviceChannelIds: Set<string>, prismcastChannel
 /**
  * Gets device channel mappings for a DVR host, refreshing the cache if needed.
  * @param host - The DVR server hostname or IP address.
+ * @param now - The instant the cache's freshness is measured against.
  * @returns Map of DeviceID -> (Map of GuideNumber -> channel ID).
  */
-export async function getDeviceMappings(host: string): Promise<Map<string, Map<string, string>>> {
+export async function getDeviceMappings(host: string, now: number): Promise<Map<string, Map<string, string>>> {
 
   const cached = deviceMappingsByHost.get(host);
-  const now = Date.now();
 
   // Return cached mappings if they're fresh enough.
   if(cached && ((now - cached.lastRefresh) < MAPPINGS_REFRESH_INTERVAL_MS)) {
@@ -662,18 +648,25 @@ async function getGuideShowNames(host: string): Promise<Map<string, string>> {
  * Fetches JSON data from a Channels DVR API endpoint.
  * @param host - The DVR server hostname or IP address.
  * @param path - The API path (e.g., "/devices" or "/dvr/jobs").
+ * @param clock - The clock this request's bound arms on. Defaults to the poller's own clock, read at call time, so a request the poller makes and a request the
+ *                pretune scheduler makes each land on the timeline its caller is driving.
  * @returns Array of results, empty array on any error.
  */
-export async function fetchFromDvr<T>(host: string, path: string): Promise<T[]> {
+export async function fetchFromDvr<T>(host: string, path: string, clock: Clock = pollingClock): Promise<T[]> {
 
   const url = "http://" + host + ":" + String(CONFIG.channelsDvr.port) + path;
+
+  // The bound carries this error as its abort reason, which is what lets the catch below tell our own lapse apart from every other failure by reference rather
+  // than by parsing a name the platform chooses.
+  const lapse = new Error("Channels DVR request to " + host + " timed out after " + String(API_TIMEOUT_MS) + "ms.");
+  const bound = timeoutSignal(API_TIMEOUT_MS, { clock, reason: lapse });
 
   try {
 
     const response = await fetch(url, {
 
       headers: { "Accept": "application/json" },
-      signal: AbortSignal.timeout(API_TIMEOUT_MS)
+      signal: bound.signal
     });
 
     if(!response.ok) {
@@ -686,14 +679,17 @@ export async function fetchFromDvr<T>(host: string, path: string): Promise<T[]> 
 
     if(error instanceof Error) {
 
-      // Don't log abort errors (timeouts) - they're expected for unreachable servers.
-      if(error.name !== "AbortError") {
+      // Our own lapse is the ordinary outcome for an unreachable server, so it stays silent; anything else is a failure worth a line.
+      if(error !== lapse) {
 
         LOG.debug("streaming:showinfo", "Failed to fetch %s from %s: %s.", path, host, formatError(error));
       }
     }
 
     return [];
+  } finally {
+
+    bound.cancel();
   }
 }
 
@@ -755,9 +751,12 @@ async function populateChannelLogos(): Promise<void> {
     return;
   }
 
+  // One instant for the whole operation, as the show-name update reads one for its own.
+  const now = pollingClock.now();
+
   // Tier 1: fetch device data and extract logos. getDeviceMappings() handles the /devices fetch, device matching, and logo extraction into the cache as a side
   // effect. The 5-minute mapping cache means we don't re-fetch if show name polling already called this recently.
-  await getDeviceMappings(lastKnownDvrHost);
+  await getDeviceMappings(lastKnownDvrHost, now);
 
   // Tier 2: search TMS by channel name for channels with station IDs not covered by tier 1. This covers disabled channels, channels without an enabled service,
   // and any channels the DVR device didn't include logos for.

@@ -28,23 +28,23 @@
  * not prevent the file from exiting cleanly.
  */
 import type { Browser, Page } from "puppeteer-core";
+import type { Nullable, StreamingMode } from "../types/index.ts";
+import { TestClock, drainClock } from "homebridge-plugin-utils/testing";
 import { afterEach, before, beforeEach, describe, test } from "node:test";
 import { buildLaunchOptions, confirmSharedWindowPlacement, createDiscoveryPage, emitCurrentSystemStatus, emulateCaptureSurface, emulateLayoutSurface,
   ensureDataDirectory, findChromeProcessesUsingProfile, getBrowserInstance, getCaptureImpairment, getChromeVersion, getExecutablePath, healActivatedCaptureTab,
   installActivationHeal, isBrowserConnected, isCarrierPage, isGracefulShutdown, makeFocusReaffirmCallback, mirrorPlacement, noteSharedWindow, pickCarrierPage,
-  registerManagedPage, resolveSharedWindowCarrier, seedProfilePreferences, setGracefulShutdown, unregisterManagedPage } from "./index.ts";
+  registerManagedPage, resolveSharedWindowCarrier, seedProfilePreferences, setGracefulShutdown, startBrowserRestartChecking, startStalePageCleanup,
+  stopBrowserRestartChecking, stopStalePageCleanup, unregisterManagedPage } from "./index.ts";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { CONFIG } from "../config/index.ts";
-import type { Clock } from "../utils/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import { LOG } from "../utils/index.ts";
-import type { Nullable } from "../types/index.ts";
 import type { StreamRegistryEntry } from "../streaming/registry.ts";
-import type { StreamingMode } from "../types/index.ts";
 import assert from "node:assert/strict";
 import { getPresetViewport } from "../config/presets.ts";
 import { setImmediate as immediate } from "node:timers/promises";
 import { initializeDataDir } from "../config/paths.ts";
-import { makeFakeClock } from "../utils/clock.helpers.ts";
 import { makeNativeIdentity } from "../streaming/registry.helpers.ts";
 import { makePendingCaptureIdentity } from "../streaming/registry.ts";
 import os from "node:os";
@@ -1076,12 +1076,27 @@ describe("makeFocusReaffirmCallback", () => {
     targets.push(target);
   };
 
-  const recordWaits = (timeline: string[]): Clock => makeFakeClock({ sleep: async (ms: number): Promise<void> => {
+  /* A Clock that records each wait into a shared timeline as the ladder asks for it and forwards every call to a TestClock of its own. Recording at registration
+   * is what keeps a row's literal timeline exact: the entry lands in the order the ladder requested the wait, not the order the drain later releases it. The
+   * inner clock is handed back so a row drains exactly the schedule it recorded.
+   */
+  const recordWaits = (timeline: string[], prefix = "sleep:"): Clock & { inner: TestClock } => {
 
-    timeline.push("sleep:" + String(ms));
+    const inner = new TestClock();
 
-    await Promise.resolve();
-  } }).clock;
+    return {
+
+      delay: async (ms: number, init?: { signal?: AbortSignal }): Promise<void> => {
+
+        timeline.push(prefix + String(ms));
+
+        return inner.delay(ms, init);
+      },
+      inner,
+      now: (): number => inner.now(),
+      schedule: (callback: () => void, ms: number, init?: { repeat?: boolean }): Disposable => inner.schedule(callback, ms, init)
+    };
+  };
 
   test("runs the full interleaved ladder from one invocation, every shot against its own page", async () => {
 
@@ -1092,8 +1107,11 @@ describe("makeFocusReaffirmCallback", () => {
     const page = {} as unknown as Page;
     const targets: Page[] = [];
     const timeline: string[] = [];
+    const clock = recordWaits(timeline);
+    const running = makeFocusReaffirmCallback(page, recordShot(timeline, targets), clock)();
 
-    await makeFocusReaffirmCallback(page, recordShot(timeline, targets), recordWaits(timeline))();
+    await drainClock(clock.inner);
+    await running;
 
     assert.deepEqual(timeline, [ "shot", "sleep:250", "shot", "sleep:500", "shot", "sleep:750", "shot", "sleep:1500", "shot" ],
       "an immediate shot and four rungs, each waiting only the distance left to its own offset from the activation");
@@ -1110,43 +1128,24 @@ describe("makeFocusReaffirmCallback", () => {
     const targets: Page[] = [];
     const timeline: string[] = [];
 
-    // eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- Standard pattern for signal promises.
-    const { promise: released, resolve: release } = Promise.withResolvers<void>();
-
-    let waits = 0;
-
-    const clock = makeFakeClock({ sleep: async (ms: number): Promise<void> => {
-
-      timeline.push("sleep:" + String(ms));
-
-      waits++;
-
-      // Park the first ladder on its first rung so the second activation lands squarely inside it, which is the case the counter exists for.
-      if(waits === 1) {
-
-        await released;
-      }
-
-      await Promise.resolve();
-    } }).clock;
-
+    // The virtual clock parks the first ladder on its first rung, so the second activation lands squarely inside it - the case the generation counter exists for.
+    const clock = recordWaits(timeline);
     const callback = makeFocusReaffirmCallback(page, recordShot(timeline, targets), clock);
-
     const superseded = callback();
 
     await immediate();
 
     assert.equal(targets.length, 1, "the first activation fired its immediate shot and parked on its first rung");
+    assert.equal(clock.inner.pending, 1, "and that rung is the only wait registered");
 
-    await callback();
+    const newer = callback();
 
-    assert.equal(targets.length, 6, "the second activation fired its own immediate shot and its own four rungs");
-
-    release();
-
+    await drainClock(clock.inner);
+    await newer;
     await superseded;
 
-    assert.equal(targets.length, 6, "the superseded ladder returned at its generation check rather than firing again");
+    assert.equal(targets.length, 6, "the second activation fired its own immediate shot and its own four rungs, and the superseded ladder returned at its " +
+      "generation check rather than firing again");
     assert.deepEqual(timeline, [ "shot", "sleep:250", "shot", "sleep:250", "shot", "sleep:500", "shot", "sleep:750", "shot", "sleep:1500", "shot" ],
       "the second activation's rungs are spaced from its own moment, not from what the first activation had left to run");
   });
@@ -1160,9 +1159,12 @@ describe("makeFocusReaffirmCallback", () => {
     const targets: Page[] = [];
     const timeline: string[] = [];
 
-    const callback = makeFocusReaffirmCallback(page, recordShot(timeline, targets), recordWaits(timeline));
+    const clock = recordWaits(timeline);
+    const callback = makeFocusReaffirmCallback(page, recordShot(timeline, targets), clock);
+    const both = Promise.all([ callback(), callback() ]);
 
-    await Promise.all([ callback(), callback() ]);
+    await drainClock(clock.inner);
+    await both;
 
     assert.equal(targets.length, 6, "two immediate shots and exactly one full rung schedule");
 
@@ -1181,6 +1183,7 @@ describe("makeFocusReaffirmCallback", () => {
     const timeline: string[] = [];
 
     const record = recordShot(timeline, targets);
+    const clock = recordWaits(timeline);
 
     const callback = makeFocusReaffirmCallback(page, async (target: Page): Promise<void> => {
 
@@ -1190,9 +1193,16 @@ describe("makeFocusReaffirmCallback", () => {
 
         throw new Error("synthetic re-issue rejection");
       }
-    }, recordWaits(timeline));
+    }, clock);
 
-    await assert.doesNotReject(() => callback(), "the callback resolves rather than rejecting into the page's focus handler");
+    const running = callback();
+
+    // The expectation is attached before the clock is driven, so a rejection escaping mid-drive is observed rather than left unhandled.
+    const settled = assert.doesNotReject(() => running, "the callback resolves rather than rejecting into the page's focus handler");
+
+    await drainClock(clock.inner);
+    await settled;
+
     assert.equal(targets.length, 5, "the immediate shot's rejection did not stop the four rungs behind it");
   });
 
@@ -1207,18 +1217,29 @@ describe("makeFocusReaffirmCallback", () => {
     const timeline: string[] = [];
 
     const record = recordShot(timeline, targets);
+    const clock = recordWaits(timeline);
 
     const callback = makeFocusReaffirmCallback(page, async (target: Page): Promise<void> => {
 
       await record(target);
 
       throw new Error("synthetic re-issue rejection");
-    }, recordWaits(timeline));
+    }, clock);
 
-    await assert.doesNotReject(() => callback(), "the first activation resolves even though every one of its shots failed");
+    const first = callback();
+    const firstSettled = assert.doesNotReject(() => first, "the first activation resolves even though every one of its shots failed");
+
+    await drainClock(clock.inner);
+    await firstSettled;
+
     assert.equal(targets.length, 5, "every rung fired, none of them skipped over the failures ahead of it");
 
-    await assert.doesNotReject(() => callback(), "so does the activation after it");
+    const second = callback();
+    const secondSettled = assert.doesNotReject(() => second, "so does the activation after it");
+
+    await drainClock(clock.inner);
+    await secondSettled;
+
     assert.equal(targets.length, 10, "a fresh activation runs a fresh full ladder");
   });
 
@@ -1232,34 +1253,23 @@ describe("makeFocusReaffirmCallback", () => {
     const targets: Page[] = [];
     const timeline: string[] = [];
 
-    // eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- Standard pattern for signal promises.
-    const { promise: released, resolve: release } = Promise.withResolvers<void>();
-
-    let waits = 0;
-
-    const firstClock = makeFakeClock({ sleep: async (ms: number): Promise<void> => {
-
-      timeline.push("first:sleep:" + String(ms));
-
-      waits++;
-
-      // Park the first page's ladder on its first rung, so the second page's activation lands while that ladder is genuinely mid-schedule.
-      if(waits === 1) {
-
-        await released;
-      }
-
-      await Promise.resolve();
-    } }).clock;
-
+    // Each page's ladder runs on a clock of its own, so the first page's stays parked on its first rung while the second page's activation runs to completion -
+    // which is what makes the second landing genuinely mid-schedule rather than after the fact.
+    const firstClock = recordWaits(timeline, "first:sleep:");
+    const secondClock = recordWaits(timeline);
     const record = recordShot(timeline, targets);
     const firstRun = makeFocusReaffirmCallback(firstPage, record, firstClock)();
 
     await immediate();
-    await makeFocusReaffirmCallback(secondPage, record, recordWaits(timeline))();
 
-    release();
+    assert.equal(firstClock.inner.pending, 1, "the first page's ladder is parked on its first rung");
 
+    const secondRun = makeFocusReaffirmCallback(secondPage, record, secondClock)();
+
+    await drainClock(secondClock.inner);
+    await secondRun;
+
+    await drainClock(firstClock.inner);
     await firstRun;
 
     assert.equal(targets.filter((target) => target === firstPage).length, 5, "the first page's ladder ran its full schedule across the second page's activation");
@@ -1280,6 +1290,7 @@ describe("makeFocusReaffirmCallback", () => {
     const { promise: hung, resolve: settleHungShot } = Promise.withResolvers<void>();
 
     const record = recordShot(timeline, targets);
+    const clock = recordWaits(timeline);
 
     const callback = makeFocusReaffirmCallback(page, async (target: Page): Promise<void> => {
 
@@ -1290,15 +1301,21 @@ describe("makeFocusReaffirmCallback", () => {
 
         await hung;
       }
-    }, recordWaits(timeline));
+    }, clock);
 
     void callback();
 
     await immediate();
 
     assert.equal(targets.length, 1, "the first activation is parked inside its immediate shot");
+    assert.equal(clock.inner.pending, 0, "a ladder parked inside a shot holds no wait at all");
 
-    await assert.doesNotReject(() => callback(), "a second activation runs to completion regardless");
+    const second = callback();
+    const secondSettled = assert.doesNotReject(() => second, "a second activation runs to completion regardless");
+
+    await drainClock(clock.inner);
+    await secondSettled;
+
     assert.equal(targets.length, 6, "the parked ladder cost the second activation nothing");
 
     settleHungShot();
@@ -1314,11 +1331,12 @@ describe("healActivatedCaptureTab", () => {
   /* Every row here enrolls its pages through installActivationHeal itself rather than around it, because the enrollment and the exposed binding holding the same
    * callback instance is the whole of the two-triggers-one-ladder guarantee - an enrollment built beside the install point would prove nothing about it. The page
    * double records the binding it is handed, and the injected collaborators are what make the enrolled callback observable: the recording re-issue counts the
-   * shots a report produced, and the fake clock's immediate sleeps let a ladder run to its end inside the row.
+   * shots a report produced, and the virtual clock the row drains lets a ladder run to its end without waiting out its rungs.
    */
-  const enroll = async (): Promise<{ binding: () => Promise<void>; page: Page; shots: Page[] }> => {
+  const enroll = async (): Promise<{ binding: () => Promise<void>; clock: TestClock; page: Page; shots: Page[] }> => {
 
     const bindings: (() => Promise<void>)[] = [];
+    const clock = new TestClock();
     const shots: Page[] = [];
 
     const page = {
@@ -1327,14 +1345,14 @@ describe("healActivatedCaptureTab", () => {
       exposeFunction: async (_name: string, handler: () => Promise<void>): Promise<void> => { bindings.push(handler); }
     } as unknown as Page;
 
-    await installActivationHeal(page, { clock: makeFakeClock().clock, reaffirm: async (target: Page): Promise<void> => { shots.push(target); } });
+    await installActivationHeal(page, { clock, reaffirm: async (target: Page): Promise<void> => { shots.push(target); } });
 
     const binding = bindings[0];
 
     assert.ok(binding, "the install point handed the page a binding");
     assert.equal(bindings.length, 1, "and exactly one");
 
-    return { binding, page, shots };
+    return { binding, clock, page, shots };
   };
 
   // A registry entry as the match reads one: an identity and a page. Nothing else on an entry is looked at, so nothing else is built.
@@ -1370,15 +1388,17 @@ describe("healActivatedCaptureTab", () => {
      * behavioral rather than structural: the report starts a ladder, the binding's invocation lands inside it, and what follows is the collapse signature of two
      * invocations of one callback - both immediate shots and a single rung schedule - rather than the ten shots two independent ladders would have produced.
      */
-    const { binding, page, shots } = await enroll();
+    const { binding, clock, page, shots } = await enroll();
     const deps = makeDeps([streamEntry(page, "capture")], new Map([[ page, 42 ]]));
 
     healActivatedCaptureTab(42, deps);
 
     assert.equal(shots.length, 1, "the report's immediate shot is away before anything yields");
 
-    await binding();
-    await immediate();
+    const bound = binding();
+
+    await drainClock(clock);
+    await bound;
 
     assert.equal(shots.length, 6, "two immediate shots and one rung schedule: the binding superseded the report's ladder instead of running beside it");
     assert.ok(shots.every((target) => target === page), "and every shot went to the page the report named");
@@ -1409,6 +1429,8 @@ describe("healActivatedCaptureTab", () => {
 
     await immediate();
 
+    assert.equal(native.clock.pending, 0, "no ladder started, so neither page's clock carries a rung");
+    assert.equal(capture.clock.pending, 0, "and the enrolled capture page's clock carries none either");
     assert.equal(native.shots.length, 0, "a native stream's page is never re-issued against, enrolled and matched by id though it is");
     assert.equal(capture.shots.length, 0, "and the one enrolled capture page went unnamed by all three reports");
   });
@@ -1424,14 +1446,14 @@ describe("healActivatedCaptureTab", () => {
 
     healActivatedCaptureTab(1, deps);
 
-    await immediate();
+    await drainClock(first.clock);
 
     assert.equal(first.shots.length, 5, "the named page ran its full ladder");
     assert.equal(second.shots.length, 0, "and the other page's heal never ran");
 
     healActivatedCaptureTab(2, deps);
 
-    await immediate();
+    await drainClock(second.clock);
 
     assert.equal(second.shots.length, 5, "the second report ran the second page's ladder");
     assert.equal(first.shots.length, 5, "without adding anything to the first page's");
@@ -1651,15 +1673,69 @@ describe("seedProfilePreferences", () => {
   });
 });
 
+describe("the lifecycle timers arm on the injected clock", () => {
+
+  /* Both owners hold module-level registry bindings, so a row that ended without stopping its owner would leave the next start a no-op. Stopping both here is a
+   * no-op when nothing is running and keeps each row independent of the one before it.
+   */
+  afterEach(() => {
+
+    stopStalePageCleanup();
+    stopBrowserRestartChecking();
+  });
+
+  test("the stale-page sweep arms one interval, ignores a second start, and is drained by its stop", () => {
+
+    const clock = new TestClock();
+
+    startStalePageCleanup(clock);
+
+    assert.equal(clock.pending, 1, "the sweep's interval is armed on the injected clock");
+    assert.deepEqual(clock.requested, [CONFIG.recovery.stalePageCleanupInterval], "the interval is the configured sweep cadence");
+
+    // A second start while one is running changes nothing: without the running guard it would arm a second interval and orphan the first registry.
+    startStalePageCleanup(clock);
+
+    assert.equal(clock.pending, 1, "a second start armed nothing further");
+    assert.equal(clock.requested.length, 1, "and asked the clock for nothing further");
+
+    stopStalePageCleanup();
+
+    // The drain is the proof the registry was disposed rather than merely forgotten: a skipped disposal would leave the interval on the clock's pending set.
+    assert.equal(clock.pending, 0, "the stop drained the interval off the clock");
+  });
+
+  test("the restart check arms one interval, ignores a second start, and is drained by its stop", () => {
+
+    // BROWSER_RESTART_CHECK_INTERVAL is module-private, so the row states its value (30 seconds) rather than reaching for the constant.
+    const checkIntervalMs = 30000;
+    const clock = new TestClock();
+
+    startBrowserRestartChecking(clock);
+
+    assert.equal(clock.pending, 1, "the eligibility check's interval is armed on the injected clock");
+    assert.deepEqual(clock.requested, [checkIntervalMs], "the interval is the 30-second check cadence");
+
+    startBrowserRestartChecking(clock);
+
+    assert.equal(clock.pending, 1, "a second start armed nothing further");
+    assert.equal(clock.requested.length, 1, "and asked the clock for nothing further");
+
+    stopBrowserRestartChecking();
+
+    assert.equal(clock.pending, 0, "the stop drained the check off the clock");
+  });
+});
+
 /* Deferred to e2e (require Puppeteer/Chrome integration):
  *
  * - getCurrentBrowser, launchReadyBrowser, launchWithCustomArgs, detectBrowserCapabilities (every step here drives Puppeteer or executes JS in a real browser context).
  *
  * - closeBrowser (sends SIGTERM/SIGKILL to a real Chrome ChildProcess and waits for the exit event).
  *
- * - cleanupStalePages, startStalePageCleanup, stopStalePageCleanup (browser.pages() + page.close()).
+ * - cleanupStalePages (browser.pages() + page.close()).
  *
- * - startBrowserRestartChecking, stopBrowserRestartChecking, executeBrowserRestart (full restart cycle drives closeBrowser + getCurrentBrowser).
+ * - executeBrowserRestart (full restart cycle drives closeBrowser + getCurrentBrowser).
  *
  * - getBrowserPages (browser.pages() against a real session). The window-visibility executor is not deferred: its factory takes injected primitives and an
  *   injected page resolver, so windowSync.test.ts drives the whole loop with fakes and only the resolver wired in here needs a real browser.

@@ -67,7 +67,7 @@ function sendDiscoveryError(res: Response, label: string, error: unknown): void 
  * parameter threaded from setupServicesEndpoint through the route handler into runDiscovery, so a test can substitute stubs at the same injection point - no loader mock
  * - while production uses the real defaultServiceDiscoveryDeps built from the functions this module already imports. getProviderBySlug earns its place here because the
  * provider registry is module-private with no registration hook, so injecting the lookup is the only way a test drives the route with a stub provider. This is the
- * collaborator-injection form of the Clock port (utils/clock.ts), matching VideoTuneDeps in browser/video.ts and PrecachingDeps in browser/precaching.ts.
+ * collaborator-injection form of the library's Clock port, matching VideoTuneDeps in browser/video.ts and PrecachingDeps in browser/precaching.ts.
  */
 export interface ServiceDiscoveryDeps {
 
@@ -395,7 +395,7 @@ export function setupServicesEndpoint(app: Express, deps: ServiceDiscoveryDeps =
 
           try {
 
-            await waitWithTimeout(doomed.promise, DISCOVERY_SETTLEMENT_TIMEOUT_MS, settlementTimeout);
+            await waitWithTimeout(doomed.promise, DISCOVERY_SETTLEMENT_TIMEOUT_MS, { reason: settlementTimeout });
           } catch(error) {
 
             // An aborted walk rejects by design and stays quiet, and a genuine walk failure was already reported to that walk's own requesters. The timeout

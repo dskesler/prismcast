@@ -21,11 +21,11 @@
  * this module was written against and derives the settings-object shape from the extension's own source, so a dependency bump that changes either fails the
  * suite with instructions rather than failing a capture in the field.
  */
-import { LOG, formatError, pollUntil, realClock, startTimer } from "../utils/index.ts";
+import { LOG, formatError, pollUntil, startTimer } from "../utils/index.ts";
 import type { RawData, WebSocket, WebSocketServer } from "ws";
 import { getExtensionPage, wss } from "puppeteer-stream";
 import { CAPTURE_SOURCE_UNAVAILABLE_MESSAGE } from "../types/index.ts";
-import type { Clock } from "../utils/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { IncomingMessage } from "node:http";
 import type { Nullable } from "../types/index.ts";
 import type { Page } from "puppeteer-core";
@@ -33,6 +33,7 @@ import { PassThrough } from "node:stream";
 import type { Readable } from "node:stream";
 import type { SelectedTab } from "./tabSelection.ts";
 import { readWindowState } from "./cdp.ts";
+import { systemClock } from "homebridge-plugin-utils";
 import { withTabSelected } from "./tabSelection.ts";
 
 /* The extension's options page publishes these two names on its global scope, and they exist only there. Declaring them at module scope rather than in the
@@ -161,7 +162,7 @@ export interface TabCaptureDeps {
  */
 export interface AcquireCaptureStreamContext {
 
-  // The time port driving the grant poll and the elapsed measurements. Defaults to realClock; tests inject a fake.
+  // The time port driving the grant poll and the elapsed measurements. Defaults to the system clock; tests inject a virtual clock.
   readonly clock?: Clock;
 
   // The library collaborators. Defaults to the real ones.
@@ -480,7 +481,7 @@ function attachCaptureControls(attempt: CaptureAttempt, extension: Page, server:
 export async function acquireCaptureStream(page: Page, options: CaptureStreamOptions,
   context: AcquireCaptureStreamContext = {}): Promise<CaptureStream> {
 
-  const { clock = realClock, deps = defaultTabCaptureDeps, signal } = context;
+  const { clock = systemClock, deps = defaultTabCaptureDeps, signal } = context;
   const acquisitionElapsed = startTimer(clock);
   const extension = await deps.getExtensionPage(page.browser());
   const server = await deps.wss;

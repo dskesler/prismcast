@@ -7,6 +7,7 @@
 import { afterEach, beforeEach, describe, mock, test } from "node:test";
 import { checkForUpdates, fetchLatestVersion, getChangelogItems, getPackageVersion, getVersionInfo, isVersionLessThan, normalizeVersion, startUpdateChecking,
   stopUpdateChecking } from "./version.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 
 describe("normalizeVersion", () => {
@@ -478,5 +479,116 @@ describe("extractVersionChangelog regex boundaries (via getChangelogItems)", () 
     const result = await getChangelogItems("1.0.8");
 
     assert.equal(result, null, "literal dots are required - regex did not match the metacharacter-style header");
+  });
+});
+
+describe("the update checker on an injected clock", () => {
+
+  /* The checker takes its clock at the start, and every deadline it owns from then on - the periodic check and each fetch's bound - is armed on that clock.
+   * These rows drive all three off one virtual timeline: the debounce window, the interval, and a request that only its bound can end.
+   */
+
+  // The module's debounce window, periodic interval, and npm-registry fetch bound, restated here because all three are private to version.ts.
+  const UPDATE_CHECK_DEBOUNCE_MS = 60000;
+  const UPDATE_CHECK_INTERVAL_MS = 7200000;
+  const FETCH_BOUND_MS = 5000;
+
+  /* The instant every clock in this describe starts from. It is deliberately behind any host reading, so a checker started here treats its own immediate
+   * check as inside the debounce window of whatever stamped the last check before it, and the rows count only the requests they issue themselves.
+   */
+  const BASE_TIME_MS = 1700000000000;
+
+  afterEach(() => {
+
+    stopUpdateChecking();
+    mock.reset();
+  });
+
+  test("collapses a check inside the debounce window and admits one at its boundary", async () => {
+
+    const clock = new TestClock(BASE_TIME_MS);
+
+    let fetchCalls = 0;
+
+    mock.method(globalThis, "fetch", async (): Promise<Response> => {
+
+      fetchCalls += 1;
+
+      return new Response(JSON.stringify({ "dist-tags": { latest: "5.5.5" } }), { status: 200 });
+    });
+
+    // Stamp the last-check instant at the host's reading, so the start below reads its own immediate check as debounced and issues nothing of its own.
+    await checkForUpdates("1.0.0", true);
+
+    startUpdateChecking("1.0.0", clock);
+
+    // A forced check restamps the window's start at the injected clock's instant, so the two checks after it are measured from a reading this row chose.
+    await checkForUpdates("1.0.0", true);
+
+    const afterForced = fetchCalls;
+
+    await checkForUpdates("1.0.0");
+
+    assert.equal(fetchCalls, afterForced, "a check inside the window issues no request");
+
+    clock.advance(UPDATE_CHECK_DEBOUNCE_MS);
+
+    await checkForUpdates("1.0.0");
+
+    assert.ok(fetchCalls > afterForced, "a check at the window's boundary issues its request");
+  });
+
+  test("a start arms one periodic check, a second start leaves it alone, and a stop disposes it", async () => {
+
+    const clock = new TestClock(BASE_TIME_MS);
+    const successor = new TestClock(BASE_TIME_MS);
+
+    mock.method(globalThis, "fetch", async (): Promise<Response> => new Response(JSON.stringify({ "dist-tags": { latest: "1.0.0" } }), { status: 200 }));
+
+    // Stamp the last-check instant at the host's reading, so neither start below issues a request whose bound would join the ledger these assertions read.
+    await checkForUpdates("1.0.0", true);
+
+    startUpdateChecking("1.0.0", clock);
+
+    assert.equal(clock.pending, 1, "the start armed exactly one repeating check");
+    assert.deepEqual(clock.requested, [UPDATE_CHECK_INTERVAL_MS], "the arm waits the update-check interval");
+
+    startUpdateChecking("1.0.0", successor);
+
+    assert.equal(clock.pending, 1, "a second start leaves the running checker's one timer alone");
+    assert.equal(successor.pending, 0, "a second start arms nothing on the clock it was handed");
+
+    stopUpdateChecking();
+
+    assert.equal(clock.pending, 0, "the stop disposed the periodic check");
+  });
+
+  test("abandons a request that never settles once the clock passes the fetch bound", async () => {
+
+    const clock = new TestClock(BASE_TIME_MS);
+
+    // A request that settles only when its signal aborts, so the bound is the one thing that can end the wait.
+    mock.method(globalThis, "fetch", async (_url: string, init?: { signal?: AbortSignal }): Promise<Response> => {
+
+      const { promise, reject }: PromiseWithResolvers<Response> = Promise.withResolvers();
+
+      init?.signal?.addEventListener("abort", () => reject(new Error("The request was abandoned.")));
+
+      return promise;
+    });
+
+    startUpdateChecking("1.0.0", clock);
+
+    const armedBefore = clock.pending;
+    const pendingFetch = fetchLatestVersion();
+
+    /* The bound is composed synchronously, before the request is awaited, so the count moves by exactly one the moment the call is issued. A bound left on the
+     * system clock adds nothing here and fails this assertion at once rather than passing the row seconds later.
+     */
+    assert.equal(clock.pending, armedBefore + 1, "the request composed its bound on the injected clock");
+
+    clock.advance(FETCH_BOUND_MS);
+
+    assert.equal(await pendingFetch, null, "the lapsed bound abandoned the request and the caller reads it as unavailable");
   });
 });

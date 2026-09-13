@@ -6,7 +6,7 @@
  * subprocess, and Express runtime to exercise as written. The unit-testable surface here is the module's pure, browser-free helpers, which translate inputs to
  * values without touching the browser or the registry beyond config lookups.
  *
- * The login-mode 503 branch lives in a sibling file (hls.loginMode.test.ts), which drives the real isLoginModeActive() flag through the setBrowserAccessors()
+ * The login-mode 503 branch lives in a sibling file (hls.loginMode.test.ts), which drives the real isLoginModeActive() flag through the setLoginDeps()
  * dependency injection point - the same one browser/index.ts wires at startup - with a stub browser and page, rather than substituting the accessor.
  */
 import { afterEach, beforeEach, describe, mock, test } from "node:test";

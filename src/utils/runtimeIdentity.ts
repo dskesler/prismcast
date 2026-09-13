@@ -92,6 +92,10 @@ export interface RuntimeIdentityContext {
 
   // Returns whether a given PID belongs to a process that is currently alive. Conventionally proxies isProcessRunning() from pid.ts.
   readonly isProcessRunning: (pid: number) => boolean;
+
+  // Returns the instant the claim record stamps as its start, in epoch milliseconds, so a test asserts the record's startedAt against a fixed value.
+  // Conventionally the system clock's reading.
+  readonly now: () => number;
 }
 
 /**
@@ -173,7 +177,7 @@ export function claim(filePath: string, metadata: { version: string }, ctx: Runt
 
     bootId: ctx.getBootSessionId(),
     pid: process.pid,
-    startedAt: new Date().toISOString(),
+    startedAt: new Date(ctx.now()).toISOString(),
     version: metadata.version
   };
 

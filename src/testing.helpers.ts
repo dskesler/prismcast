@@ -7,6 +7,7 @@
  *   - cleanup.helpers.ts      closePuppeteerStreamWss, closePuppeteerStreamWssOnIdle
  *   - document.helpers.ts     withDocument (a happy-dom document and window installed as the process globals for a body's duration), seedVideoSelector
  *   - exec.helpers.ts         FakeExecFileResult, FakeExecFile, bufferOrStringToString, makeExecFileError, execFileFromMap, execFileAlwaysSucceeds
+ *   - fetch.helpers.ts        pendingBodyFetch (a Response whose headers land at once and whose body ends only on the request signal's abort)
  *   - fn.helpers.ts           noop, flushMicrotasks
  *   - fs.helpers.ts           TMPDIR_PREFIX, withTempDir
  *   - loggers.helpers.ts      TestLogger, CapturedLogLine, silentLog, capturingLog
@@ -34,3 +35,4 @@ export { flushMicrotasks, noop } from "./testing/fn.helpers.ts";
 export { seedVideoSelector, withDocument } from "./testing/document.helpers.ts";
 export { makeFakeCdpPage } from "./testing/cdp.helpers.ts";
 export { makeFakePage } from "./testing/page.helpers.ts";
+export { pendingBodyFetch } from "./testing/fetch.helpers.ts";

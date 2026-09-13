@@ -6,13 +6,26 @@
  * lifecycle. Tests focus on the pure helpers (getShowName/clearShowName, getDvrHost/setDvrHost, fetchFromDvr success/timeout paths, matchesM3uDevice's overlap
  * boundaries) and avoid the polling start/stop which spawns intervals.
  */
+import { TestClock, settle } from "homebridge-plugin-utils/testing";
 import { afterEach, beforeEach, describe, mock, test } from "node:test";
 import { clearShowName, fetchFromDvr, getDvrHost, getShowName, matchesM3uDevice, setDvrHost } from "./showInfo.ts";
+import { closePuppeteerStreamWssOnIdle, pendingBodyFetch } from "../testing.helpers.ts";
+import { LOG } from "../utils/index.ts";
 import assert from "node:assert/strict";
-import { closePuppeteerStreamWssOnIdle } from "../testing.helpers.ts";
 
 // Schedule background-server cleanup on a 0ms unref'd timer that fires when the suite resolves so the runner can exit cleanly.
 closePuppeteerStreamWssOnIdle();
+
+// The DVR request's own window, mirrored from showInfo.ts so a row advances exactly the bound the module arms.
+const API_TIMEOUT_MS = 5000;
+
+/* Counts the debug lines carrying the module's fetch-failure template for one host - the line a lapse must not produce and a real failure must. The host narrows
+ * the count to the calling row's own request, because the spy sits on a logger every row in the file shares and other rows reach unreachable hosts of their own.
+ */
+function failureLines(spy: ReturnType<typeof mock.method>, host: string): number {
+
+  return spy.mock.calls.filter((call) => String(call.arguments[1]).startsWith("Failed to fetch") && (call.arguments[3] === host)).length;
+}
 
 describe("getShowName / clearShowName", () => {
 
@@ -39,11 +52,6 @@ describe("getDvrHost / setDvrHost", () => {
 
     // Reset to the empty state by calling setDvrHost with an empty string is not supported (it would persist). Instead, we just observe that getDvrHost returns
     // null in a fresh module state. Tests that mutate via setDvrHost reset their own state by setting it to a known sentinel.
-  });
-
-  afterEach(() => {
-
-    mock.timers.reset();
   });
 
   test("getDvrHost returns null in the initial module state", () => {
@@ -108,6 +116,7 @@ describe("fetchFromDvr", () => {
   afterEach(() => {
 
     globalThis.fetch = originalFetch;
+    mock.reset();
   });
 
   test("returns the parsed JSON array on a 200 response", async () => {
@@ -145,6 +154,8 @@ describe("fetchFromDvr", () => {
   test("returns an empty array when fetch throws (network error)", async () => {
 
     // Negative test: any thrown error from fetch (network down, DNS failure, etc.) is caught and surfaced as an empty array.
+    const debug = mock.method(LOG, "debug", () => { /* Captured via the mock. */ });
+
     globalThis.fetch = (async (): Promise<Response> => {
 
       throw new Error("Network unreachable");
@@ -153,23 +164,35 @@ describe("fetchFromDvr", () => {
     const result = await fetchFromDvr<unknown>("dvr.example.invalid", "/anything");
 
     assert.deepEqual(result, []);
+
+    // The other half of the silence contract: a failure that is not this fetch's own lapse still reports itself, so the silence below is selective rather than total.
+    assert.equal(failureLines(debug, "dvr.example.invalid"), 1, "a real failure logs exactly one line");
   });
 
-  test("returns an empty array when the AbortController fires (timeout)", async () => {
+  test("stays silent and returns an empty array when its own bound lapses", async () => {
 
-    // Negative test: timeout aborts produce an AbortError. The implementation distinguishes AbortError (silent at debug level) from other errors but surfaces
-    // empty array in both cases. Locks the silent-on-timeout contract.
-    globalThis.fetch = (async (): Promise<Response> => {
+    /* An unreachable DVR is the ordinary case here, so a lapse of this fetch's own bound has to leave no line behind while every other failure still reports
+     * itself. The bound carries the module's own error as its abort reason, which is what lets the catch tell the two apart by reference. The stub errors its
+     * body only on the request signal's abort, so the bound also has to span the json() read for this row to end at all.
+     */
+    const clock = new TestClock();
+    const debug = mock.method(LOG, "debug", () => { /* Captured via the mock. */ });
 
-      const err = new Error("aborted");
+    mock.method(globalThis, "fetch", async (_url: string | URL, init?: RequestInit): Promise<Response> => pendingBodyFetch(init));
 
-      err.name = "AbortError";
-      throw err;
-    });
+    const resultPromise = fetchFromDvr<unknown>("dvr.example.invalid", "/anything", clock);
 
-    const result = await fetchFromDvr<unknown>("dvr.example.invalid", "/anything");
+    assert.equal(clock.pending, 1, "the request's bound is armed on the clock it was handed");
+    assert.deepEqual(clock.requested, [API_TIMEOUT_MS], "and it waits the DVR request's own window");
 
-    assert.deepEqual(result, []);
+    // Let the headers land and the body read begin, so the advance below lapses a bound that is spanning an open body rather than an unstarted request.
+    await settle();
+
+    clock.advance(API_TIMEOUT_MS);
+
+    assert.deepEqual(await resultPromise, [], "the lapsed bound abandons the open body and the call surfaces an empty array");
+    assert.equal(clock.pending, 0, "and the bound was cancelled rather than left armed");
+    assert.equal(failureLines(debug, "dvr.example.invalid"), 0, "the fetch's own lapse leaves no failure line behind");
   });
 
   test("constructs the URL with the configured Channels DVR port (default 8089)", async () => {

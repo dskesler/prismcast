@@ -3,7 +3,7 @@
  * directv.ts: DirecTV Stream channel selection via webpack injection for direct tuning, with logo click fallback.
  */
 import type { ChannelSelectionProfile, ChannelSelectorResult, DiscoveredChannel, Nullable, ProviderModule } from "../../types/index.ts";
-import { LOG, boundedWait, delay, formatError } from "../../utils/index.ts";
+import { LOG, boundedWait, delay, formatError, pollUntil, startTimer } from "../../utils/index.ts";
 import { installOncePerPage, logAvailableChannels, normalizeChannelName } from "./shared.ts";
 import { CONFIG } from "../../config/index.ts";
 import type { Page } from "puppeteer-core";
@@ -1059,26 +1059,24 @@ async function discoverDirectvChannels(page: Page): Promise<DiscoveredChannel[]>
 
   await page.goto(DIRECTV_GUIDE_URL, { timeout: CONFIG.streaming.navigationTimeout, waitUntil: "load" });
 
-  // Wait for the channel lineup to be emitted by the interceptor. The Redux store extraction polls at 200ms intervals in the browser context. The page check ends
-  // the wait as soon as the page is gone: a closed page can never deliver another console signal, so waiting out the remaining clock would only postpone this
-  // walk's settlement - and a refresh that cancelled this walk by closing its page waits on that settlement before it clears the caches. The empty-result path
-  // below handles the early exit.
-  const discoveryStart = Date.now();
+  /* Wait for the channel lineup to be emitted by the interceptor, through the project's poll policy: read the discovery flag on a cadence under the discovery
+   * budget and stop the moment it flips. The Redux store extraction polls at 200ms intervals in the browser context. The page check ends the wait as soon as the
+   * page is gone: a closed page can never deliver another console signal, so waiting out the remaining clock would only postpone this walk's settlement - and a
+   * refresh that cancelled this walk by closing its page waits on that settlement before it clears the caches. The empty-result path below handles the early exit.
+   */
+  const elapsed = startTimer();
 
-  while(!directvFullyDiscovered && !page.isClosed() && ((Date.now() - discoveryStart) < DISCOVERY_TIMEOUT)) {
-
-    // eslint-disable-next-line no-await-in-loop
-    await delay(500);
-  }
+  await pollUntil({ cadenceMs: 500, ceilingMs: DISCOVERY_TIMEOUT, read: async (): Promise<boolean> => directvFullyDiscovered || page.isClosed(),
+    until: (done: boolean): boolean => done });
 
   if(!directvFullyDiscovered || (directvChannelCache.size === 0)) {
 
-    LOG.debug("tuning:directv", "Discovery timed out or returned empty results after %sms.", Date.now() - discoveryStart);
+    LOG.debug("tuning:directv", "Discovery timed out or returned empty results after %sms.", elapsed());
 
     return [];
   }
 
-  LOG.debug("tuning:directv", "Discovery completed: %s channels in %sms.", directvChannelCache.size, Date.now() - discoveryStart);
+  LOG.debug("tuning:directv", "Discovery completed: %s channels in %sms.", directvChannelCache.size, elapsed());
 
   return buildDirectvDiscoveredChannels();
 }

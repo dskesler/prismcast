@@ -2,6 +2,7 @@
  *
  * fileLogger.ts: File-based logging with automatic size-based rotation for PrismCast.
  */
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import { assertNever } from "./never.ts";
 import { boundedWait } from "./delay.ts";
@@ -10,6 +11,7 @@ import fs from "node:fs";
 import { isAnyDebugEnabled } from "./debugFilter.ts";
 import path from "node:path";
 import { styleText } from "node:util";
+import { systemClock } from "homebridge-plugin-utils";
 
 const { promises: fsPromises } = fs;
 
@@ -38,7 +40,7 @@ export type LogColor = "cyan" | "red" | "yellow" | null;
  */
 type LoggerState =
   { readonly kind: "window" } |
-  { readonly kind: "open"; readonly path: string; readonly pausedSince: Nullable<number>; readonly timer: ReturnType<typeof setInterval> } |
+  { readonly kind: "open"; readonly path: string; readonly pausedSince: Nullable<number>; readonly timer: Disposable } |
   { readonly kind: "closing"; readonly path: string } |
   { readonly kind: "closed"; readonly path: string } |
   { readonly kind: "off" };
@@ -93,6 +95,12 @@ const SHUTDOWN_DRAIN_BOUND_MS = 5000;
 // Maximum log file size, set during initialization. It is configuration the trim reads rather than lifecycle, so it stays beside the state.
 let maxLogSize = 1048576;
 
+/* The clock the flush interval arms on and the pause stamps read, set during initialization. It is per-run configuration the way the size cap is, so it stays
+ * beside the state rather than inside it: a member of the open variant would put the clock's lifetime where the file keeps lifecycle, and the closing and closed
+ * states read it too.
+ */
+let loggerClock: Clock = systemClock;
+
 // Configuration Constants.
 
 // Interval in milliseconds between buffer flushes.
@@ -118,7 +126,7 @@ function transition(next: LoggerState): void {
 
   if(("timer" in state) && (!("timer" in next) || (next.timer !== state.timer))) {
 
-    clearInterval(state.timer);
+    state.timer[Symbol.dispose]();
   }
 
   state = next;
@@ -161,8 +169,9 @@ function openFilePath(): Nullable<string> {
  * outcome leaves the startup window behind.
  * @param logPath - Absolute path to the log file, resolved by the caller via getLogFilePath().
  * @param maxSize - Maximum log file size in bytes from CONFIG.logging.maxSize.
+ * @param clock - The clock the flush interval arms on and the pause stamps read; defaults to the system clock.
  */
-export async function initializeFileLogger(logPath: string, maxSize: number): Promise<void> {
+export async function initializeFileLogger(logPath: string, maxSize: number, clock: Clock = systemClock): Promise<void> {
 
   /* This runs before the first await below, because the states it leaves must not survive into that gap. A later initialization supersedes the file the last
    * run closed, so a line landing inside these awaits is dropped rather than appended to a file this run has moved on from; a timer a still-open logger carried
@@ -174,6 +183,7 @@ export async function initializeFileLogger(logPath: string, maxSize: number): Pr
     transition({ kind: "off" });
   }
 
+  loggerClock = clock;
   maxLogSize = maxSize;
 
   try {
@@ -199,10 +209,10 @@ export async function initializeFileLogger(logPath: string, maxSize: number): Pr
     }
 
     // The timer belongs to the state that holds the file, so it is created with that state and disposed by the chokepoint when the logger leaves it.
-    const timer = setInterval((): void => {
+    const timer = clock.schedule((): void => {
 
       void flushLogBuffer();
-    }, FLUSH_INTERVAL_MS);
+    }, FLUSH_INTERVAL_MS, { repeat: true });
 
     transition({ kind: "open", path: logPath, pausedSince: null, timer });
   } catch(error) {
@@ -232,7 +242,7 @@ export async function initializeFileLogger(logPath: string, maxSize: number): Pr
  */
 function formatLogEntry(level: string, message: string, color: LogColor, categoryTag?: string): string {
 
-  const timestamp = formatTimestamp();
+  const timestamp = formatTimestamp(loggerClock.now());
   const levelTag = categoryTag ? level.toUpperCase() + ":" + categoryTag : level.toUpperCase();
   const levelPrefix = (level === "info") ? "" : "[" + levelTag + "] ";
   const body = levelPrefix + message;
@@ -272,7 +282,7 @@ export function writeLogEntry(level: string, message: string, color: LogColor, c
 
       if((state.kind === "open") && (state.pausedSince !== null)) {
 
-        if((Date.now() - state.pausedSince) < ERROR_RETRY_DELAY_MS) {
+        if((loggerClock.now() - state.pausedSince) < ERROR_RETRY_DELAY_MS) {
 
           return;
         }
@@ -386,7 +396,7 @@ export async function flushLogBuffer(): Promise<void> {
        */
       if((state.kind === "open") && (state.path === targetPath)) {
 
-        transition({ ...state, pausedSince: Date.now() });
+        transition({ ...state, pausedSince: loggerClock.now() });
 
         // Log to console as fallback.
         // eslint-disable-next-line no-console
@@ -603,7 +613,7 @@ export async function shutdownFileLogger(): Promise<void> {
 
   // Drain the outstanding write chain so the synchronous flush below lands after every mutation already in flight rather than into a file a pending rename is
   // about to replace. The chain never rejects - serializeWrite swallows each operation's outcome - so this only ever resolves or lapses.
-  await boundedWait(writeChain, SHUTDOWN_DRAIN_BOUND_MS);
+  await boundedWait(writeChain, SHUTDOWN_DRAIN_BOUND_MS, { clock: loggerClock });
 
   // Flush remaining buffer synchronously.
   flushLogBufferSync();

@@ -7,13 +7,16 @@
  *
  * How the observer is substituted. The orchestrators sit one layer above hlsPlaylistObserver.observeHlsPlaylists(), which itself is built on the tab network
  * observer + CDP; driving the real lower layers would require a Puppeteer browser. Both orchestrators accept the observer factory as an injected parameter
- * (default observeHlsPlaylists), so we pass a controlled factory that captures the onPlaylist callback and lets tests synthesize playlist observations on
- * demand. The factory is typed as observeHlsPlaylists' own contract, so the double cannot drift from the real signature.
+ * through one options object, so we pass a controlled factory that captures the onPlaylist callback and lets tests synthesize playlist observations on demand.
+ * The factory is typed as observeHlsPlaylists' own contract, so the double cannot drift from the real signature. The same options object carries the clock the
+ * guards and the settle delay arm on, so a row that drives the interception's timing advances a TestClock rather than the global timers.
  */
 import type { HlsPlaylistObserver, HlsPlaylistObserverOptions, ObservedHlsPlaylist } from "./hlsPlaylistObserver.ts";
 import type { ManifestInterceptionResult, ManifestInterceptorHandle } from "./manifestInterceptor.ts";
+import { TestClock, settle } from "homebridge-plugin-utils/testing";
 import { awaitMatchingManifest, installManifestInterceptor } from "./manifestInterceptor.ts";
-import { beforeEach, describe, mock, test } from "node:test";
+import { beforeEach, describe, test } from "node:test";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import type { Page } from "puppeteer-core";
 import assert from "node:assert/strict";
@@ -127,14 +130,14 @@ const fakePage = {} as unknown as Page;
 
 // Install/await helpers that inject the controlled observe factory (and the fake page and explicit window), so individual tests read as behavior rather than
 // wiring. Every test drives its observer through mockPendingObserver after calling these.
-function install(timeout: number = TEST_INTERCEPTION_WINDOW): Promise<Nullable<ManifestInterceptorHandle>> {
+function install(timeout: number = TEST_INTERCEPTION_WINDOW, clock?: Clock): Promise<Nullable<ManifestInterceptorHandle>> {
 
-  return installManifestInterceptor(fakePage, timeout, mockObserveFactory);
+  return installManifestInterceptor(fakePage, timeout, { clock, observeFactory: mockObserveFactory });
 }
 
-function awaitMatch(predicate: (url: string) => boolean, timeout: number): Promise<Nullable<string>> {
+function awaitMatch(predicate: (url: string) => boolean, timeout: number, clock?: Clock): Promise<Nullable<string>> {
 
-  return awaitMatchingManifest(fakePage, predicate, timeout, mockObserveFactory);
+  return awaitMatchingManifest(fakePage, predicate, timeout, { clock, observeFactory: mockObserveFactory });
 }
 
 beforeEach(() => {
@@ -186,174 +189,172 @@ describe("installManifestInterceptor", () => {
 
     // Guide tune with no epoch declared: the channel-switch click may trigger a fresh manifest fetch that arrives milliseconds after the click handler returns.
     // finalize(false) waits the settle delay before resolving, and with no epoch the latest master wins over the page's default-channel manifest.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
 
-    try {
+    const interceptor = await install(TEST_INTERCEPTION_WINDOW, clock);
 
-      const interceptor = await install();
+    assert.ok(interceptor, "interceptor installed");
+    assert.equal(clock.pending, 1, "the interception's timeout guard is armed on the injected clock");
 
-      assert.ok(interceptor, "interceptor installed");
+    const observer = mockPendingObserver;
 
-      const observer = mockPendingObserver;
+    assert.ok(observer, "controlled observer captured");
 
-      assert.ok(observer, "controlled observer captured");
+    observer.fire({ kind: "master", url: "https://cdn.test/first-master.m3u8" });
 
-      observer.fire({ kind: "master", url: "https://cdn.test/first-master.m3u8" });
+    interceptor.finalize(false);
 
-      interceptor.finalize(false);
+    // The settle delay is 1500ms; a newer manifest arrives 500ms into the wait.
+    clock.advance(500);
+    await settle();
+    observer.fire({ kind: "master", url: "https://cdn.test/latest-master.m3u8" });
 
-      // The settle delay is 1500ms; a newer manifest arrives 500ms into the wait.
-      mock.timers.tick(500);
-      observer.fire({ kind: "master", url: "https://cdn.test/latest-master.m3u8" });
+    // Advance past the remaining settle window.
+    clock.advance(1100);
+    await settle();
 
-      // Advance past the remaining settle window.
-      mock.timers.tick(1100);
+    const result = await interceptor.promise;
 
-      const result = await interceptor.promise;
+    assert.ok(result, "promise resolved with a result");
+    assert.equal(result.manifestUrl, "https://cdn.test/latest-master.m3u8", "latest master URL wins on guide tune with no epoch");
+    assert.equal(result.selectedKind, "master");
 
-      assert.ok(result, "promise resolved with a result");
-      assert.equal(result.manifestUrl, "https://cdn.test/latest-master.m3u8", "latest master URL wins on guide tune with no epoch");
-      assert.equal(result.selectedKind, "master");
-    } finally {
-
-      mock.timers.reset();
-    }
+    // Settlement retires the registry, so neither the guard nor the finalize delay is left armed against an interception that is already resolved.
+    assert.equal(clock.pending, 0, "settlement drained every timer off the clock");
   });
 
   test("a master wins over a later live media on a guide tune when no epoch was declared", async () => {
 
     // With no channel-selection epoch stamped, a live media arriving after a master does not override it - the override requires a declared epoch. This locks the
     // no-epoch branch of the rule that selectInterceptedManifest applies at resolution time.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
 
-    try {
+    const interceptor = await install(TEST_INTERCEPTION_WINDOW, clock);
 
-      const interceptor = await install();
+    assert.ok(interceptor, "interceptor installed");
+    assert.equal(clock.pending, 1, "the interception's timeout guard is armed on the injected clock");
 
-      assert.ok(interceptor, "interceptor installed");
+    const observer = mockPendingObserver;
 
-      const observer = mockPendingObserver;
+    assert.ok(observer, "controlled observer captured");
 
-      assert.ok(observer, "controlled observer captured");
+    observer.fire({ kind: "master", url: "https://cdn.test/master.m3u8" });
+    observer.fire({ kind: "media", live: true, url: "https://cdn.test/late-media.m3u8" });
 
-      observer.fire({ kind: "master", url: "https://cdn.test/master.m3u8" });
-      observer.fire({ kind: "media", live: true, url: "https://cdn.test/late-media.m3u8" });
+    interceptor.finalize(false);
 
-      interceptor.finalize(false);
+    clock.advance(1600);
+    await settle();
 
-      mock.timers.tick(1600);
+    const result = await interceptor.promise;
 
-      const result = await interceptor.promise;
+    assert.ok(result, "promise resolved with a result");
+    assert.equal(result.manifestUrl, "https://cdn.test/master.m3u8", "master wins over later media with no epoch declared");
+    assert.equal(result.selectedKind, "master");
 
-      assert.ok(result, "promise resolved with a result");
-      assert.equal(result.manifestUrl, "https://cdn.test/master.m3u8", "master wins over later media with no epoch declared");
-      assert.equal(result.selectedKind, "master");
-    } finally {
-
-      mock.timers.reset();
-    }
+    // Settlement retires the registry, so neither the guard nor the finalize delay is left armed against an interception that is already resolved.
+    assert.equal(clock.pending, 0, "settlement drained every timer off the clock");
   });
 
   test("falls back to media URL when no master ever arrives (media-only sites)", async () => {
 
     // Media-only direct tune: a site whose player loads only a media playlist (e.g., Angelcam from issue #34) must still resolve. The media URL is selected
     // because no master is available; the settle delay applies because the direct-tune fast path only short-circuits when a master is already captured.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
 
-    try {
+    const interceptor = await install(TEST_INTERCEPTION_WINDOW, clock);
 
-      const interceptor = await install();
+    assert.ok(interceptor, "interceptor installed");
+    assert.equal(clock.pending, 1, "the interception's timeout guard is armed on the injected clock");
 
-      assert.ok(interceptor, "interceptor installed");
+    const observer = mockPendingObserver;
 
-      const observer = mockPendingObserver;
+    assert.ok(observer, "controlled observer captured");
 
-      assert.ok(observer, "controlled observer captured");
+    observer.fire({ kind: "media", live: true, url: "https://cdn.test/only-media.m3u8" });
 
-      observer.fire({ kind: "media", live: true, url: "https://cdn.test/only-media.m3u8" });
+    interceptor.finalize(true);
 
-      interceptor.finalize(true);
+    clock.advance(1600);
+    await settle();
 
-      mock.timers.tick(1600);
+    const result = await interceptor.promise;
 
-      const result = await interceptor.promise;
+    assert.ok(result, "promise resolved with a result");
+    assert.equal(result.manifestUrl, "https://cdn.test/only-media.m3u8", "media URL selected when no master arrived");
+    assert.equal(result.selectedKind, "media");
 
-      assert.ok(result, "promise resolved with a result");
-      assert.equal(result.manifestUrl, "https://cdn.test/only-media.m3u8", "media URL selected when no master arrived");
-      assert.equal(result.selectedKind, "media");
-    } finally {
-
-      mock.timers.reset();
-    }
+    // Settlement retires the registry, so neither the guard nor the finalize delay is left armed against an interception that is already resolved.
+    assert.equal(clock.pending, 0, "settlement drained every timer off the clock");
   });
 
   test("timeout safety net resolves with the latest captured URL when finalize is never called", async () => {
 
     // Defensive contract: if a caller forgets to invoke finalize, the timeout fires at the caller-supplied window (15000ms here) and the promise resolves with
     // whatever was captured. This prevents an interceptor from hanging the calling code if the lifecycle hand-off goes wrong upstream.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
 
-    try {
+    const interceptor = await install(TEST_INTERCEPTION_WINDOW, clock);
 
-      const interceptor = await install();
+    assert.ok(interceptor, "interceptor installed");
+    assert.equal(clock.pending, 1, "the interception's timeout guard is armed on the injected clock");
 
-      assert.ok(interceptor, "interceptor installed");
+    const observer = mockPendingObserver;
 
-      const observer = mockPendingObserver;
+    assert.ok(observer, "controlled observer captured");
 
-      assert.ok(observer, "controlled observer captured");
+    observer.fire({ kind: "master", url: "https://cdn.test/captured.m3u8" });
 
-      observer.fire({ kind: "master", url: "https://cdn.test/captured.m3u8" });
+    // Do NOT call finalize. Advance past the supplied 15000ms window.
+    clock.advance(15100);
+    await settle();
 
-      // Do NOT call finalize. Advance past the supplied 15000ms window.
-      mock.timers.tick(15100);
+    const result = await interceptor.promise;
 
-      const result = await interceptor.promise;
+    assert.ok(result, "timeout still resolves with the captured URL");
+    assert.equal(result.manifestUrl, "https://cdn.test/captured.m3u8", "latest URL selected on timeout (mirrors guide-tune semantics)");
+    assert.equal(result.selectedKind, "master");
 
-      assert.ok(result, "timeout still resolves with the captured URL");
-      assert.equal(result.manifestUrl, "https://cdn.test/captured.m3u8", "latest URL selected on timeout (mirrors guide-tune semantics)");
-      assert.equal(result.selectedKind, "master");
-    } finally {
-
-      mock.timers.reset();
-    }
+    // Settlement retires the registry, so neither the guard nor the finalize delay is left armed against an interception that is already resolved.
+    assert.equal(clock.pending, 0, "settlement drained every timer off the clock");
   });
 
   test("timeout with no captured manifest resolves null and disposes the observer", async () => {
 
     // Negative path: no manifest captured, no finalize, timeout fires. The promise must resolve null (rather than hang) and the observer must be disposed so
     // resources are reclaimed.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
 
-    try {
+    const interceptor = await install(TEST_INTERCEPTION_WINDOW, clock);
 
-      const interceptor = await install();
+    assert.ok(interceptor, "interceptor installed");
+    assert.equal(clock.pending, 1, "the interception's timeout guard is armed on the injected clock");
 
-      assert.ok(interceptor, "interceptor installed");
+    const observer = mockPendingObserver;
 
-      const observer = mockPendingObserver;
+    assert.ok(observer, "controlled observer captured");
 
-      assert.ok(observer, "controlled observer captured");
+    clock.advance(15100);
+    await settle();
 
-      mock.timers.tick(15100);
+    const result = await interceptor.promise;
 
-      const result = await interceptor.promise;
+    assert.equal(result, null, "timeout with no captures resolves null");
+    assert.equal(observer.disposed, true, "observer disposed even on the empty-timeout path");
 
-      assert.equal(result, null, "timeout with no captures resolves null");
-      assert.equal(observer.disposed, true, "observer disposed even on the empty-timeout path");
-    } finally {
-
-      mock.timers.reset();
-    }
+    // Settlement retires the registry, so neither the guard nor the finalize delay is left armed against an interception that is already resolved.
+    assert.equal(clock.pending, 0, "settlement drained every timer off the clock");
   });
 
   test("dispose() before finalize resolves the promise with null and tears down the observer", async () => {
 
     // Cancellation path: a caller may abandon the interception before finalize fires (e.g., the upstream tune step threw). dispose() must settle the promise so
     // awaiters do not hang and the underlying observer must be released.
-    const interceptor = await install();
+    const clock = new TestClock();
+    const interceptor = await install(TEST_INTERCEPTION_WINDOW, clock);
 
     assert.ok(interceptor, "interceptor installed");
+    assert.equal(clock.pending, 1, "the timeout guard is armed on the injected clock");
 
     const observer = mockPendingObserver;
 
@@ -367,6 +368,9 @@ describe("installManifestInterceptor", () => {
 
     assert.equal(result, null, "dispose resolves the promise with null even when captures exist");
     assert.equal(observer.disposed, true, "underlying observer disposed");
+
+    // dispose() is its own settlement path, so it retires the registry itself: a disposal it skipped would leave the guard armed against a settled interception.
+    assert.equal(clock.pending, 0, "the dispose drained the guard off the clock");
   });
 
   test("dispose() after finalize is a safe no-op (repeat-safe lifecycle)", async () => {
@@ -460,7 +464,7 @@ describe("installManifestInterceptor", () => {
   });
 });
 
-/* Epoch, membership, and liveness orchestration. These drive the full state machine through the injected observer and mock.timers, exercising the guide-tune
+/* Epoch, membership, and liveness orchestration. These drive the full state machine through the injected observer and an injected clock, exercising the guide-tune
  * three-signal rule end-to-end: the mark plumbing, wire-ordered slot updates, and the epoch-free timeout. Each scenario asserts selectedKind on the resolved
  * result so the kind the verifier gate depends on is asserted, not inferred.
  */
@@ -476,108 +480,105 @@ describe("installManifestInterceptor epoch and membership orchestration", () => 
     // arrives after the mark. finalize(false) plus the settle tick resolves the media - the clicked channel's playlist - rather than the stale master. This same
     // observation sequence resolves the master under a categorical master-preference and the media under the three-signal epoch rule; the opposite resolution from
     // one sequence is the behavioral assertion, since no executable red-before compiles against the widened signature.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
 
-    try {
+    const interceptor = await install(TEST_INTERCEPTION_WINDOW, clock);
 
-      const interceptor = await install();
+    assert.ok(interceptor, "interceptor installed");
+    assert.equal(clock.pending, 1, "the interception's timeout guard is armed on the injected clock");
 
-      assert.ok(interceptor, "interceptor installed");
+    const observer = mockPendingObserver;
 
-      const observer = mockPendingObserver;
+    assert.ok(observer, "controlled observer captured");
 
-      assert.ok(observer, "controlled observer captured");
+    observer.fire({ childUrls: PAGE_MASTER_CHILDREN, kind: "master", url: PAGE_MASTER });
+    interceptor.markChannelSelectionStart();
+    observer.fire({ kind: "media", live: true, url: CLICKED_MEDIA });
 
-      observer.fire({ childUrls: PAGE_MASTER_CHILDREN, kind: "master", url: PAGE_MASTER });
-      interceptor.markChannelSelectionStart();
-      observer.fire({ kind: "media", live: true, url: CLICKED_MEDIA });
+    interceptor.finalize(false);
+    clock.advance(1600);
+    await settle();
 
-      interceptor.finalize(false);
-      mock.timers.tick(1600);
+    const result = await interceptor.promise;
 
-      const result = await interceptor.promise;
+    assert.ok(result, "promise resolved with a result");
+    assert.equal(result.manifestUrl, CLICKED_MEDIA, "the post-epoch live non-member media overrides the pre-epoch page-load master");
+    assert.equal(result.selectedKind, "media");
 
-      assert.ok(result, "promise resolved with a result");
-      assert.equal(result.manifestUrl, CLICKED_MEDIA, "the post-epoch live non-member media overrides the pre-epoch page-load master");
-      assert.equal(result.selectedKind, "media");
-    } finally {
-
-      mock.timers.reset();
-    }
+    // Settlement retires the registry, so neither the guard nor the finalize delay is left armed against an interception that is already resolved.
+    assert.equal(clock.pending, 0, "settlement drained every timer off the clock");
   });
 
   test("a healthy master-based tune resolves the post-mark master categorically despite a later foreign live media", async () => {
 
     // Master-based guide site: the mark is stamped, the click's fresh master arrives after it, and a member media plus a foreign live media follow. The post-mark
     // master answers categorically - rule 2 fires before the media override is even considered.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
 
-    try {
+    const interceptor = await install(TEST_INTERCEPTION_WINDOW, clock);
 
-      const interceptor = await install();
+    assert.ok(interceptor, "interceptor installed");
+    assert.equal(clock.pending, 1, "the interception's timeout guard is armed on the injected clock");
 
-      assert.ok(interceptor, "interceptor installed");
+    const observer = mockPendingObserver;
 
-      const observer = mockPendingObserver;
+    assert.ok(observer, "controlled observer captured");
 
-      assert.ok(observer, "controlled observer captured");
+    const freshMaster = "https://cdn.test/clicked-chan/master.m3u8";
+    const memberMedia = "https://cdn.test/clicked-chan/720p.m3u8";
 
-      const freshMaster = "https://cdn.test/clicked-chan/master.m3u8";
-      const memberMedia = "https://cdn.test/clicked-chan/720p.m3u8";
+    interceptor.markChannelSelectionStart();
+    observer.fire({ childUrls: [memberMedia], kind: "master", url: freshMaster });
+    observer.fire({ kind: "media", live: true, url: memberMedia });
+    observer.fire({ kind: "media", live: true, url: "https://cdn.test/other-chan/chunklist.m3u8" });
 
-      interceptor.markChannelSelectionStart();
-      observer.fire({ childUrls: [memberMedia], kind: "master", url: freshMaster });
-      observer.fire({ kind: "media", live: true, url: memberMedia });
-      observer.fire({ kind: "media", live: true, url: "https://cdn.test/other-chan/chunklist.m3u8" });
+    interceptor.finalize(false);
+    clock.advance(1600);
+    await settle();
 
-      interceptor.finalize(false);
-      mock.timers.tick(1600);
+    const result = await interceptor.promise;
 
-      const result = await interceptor.promise;
+    assert.ok(result, "promise resolved with a result");
+    assert.equal(result.manifestUrl, freshMaster, "the post-mark master answers the click categorically");
+    assert.equal(result.selectedKind, "master");
 
-      assert.ok(result, "promise resolved with a result");
-      assert.equal(result.manifestUrl, freshMaster, "the post-mark master answers the click categorically");
-      assert.equal(result.selectedKind, "master");
-    } finally {
-
-      mock.timers.reset();
-    }
+    // Settlement retires the registry, so neither the guard nor the finalize delay is left armed against an interception that is already resolved.
+    assert.equal(clock.pending, 0, "settlement drained every timer off the clock");
   });
 
   test("a pre-mark master with a post-mark MEMBER media only resolves the master (membership corroborates)", async () => {
 
     // The media fired after the mark is genuinely one of the master's declared children, so it corroborates the master rather than overriding it. The master's
     // childUrls literally contain the fired media URL, so a broken membership match would resolve the media and fail this case.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
 
-    try {
+    const interceptor = await install(TEST_INTERCEPTION_WINDOW, clock);
 
-      const interceptor = await install();
+    assert.ok(interceptor, "interceptor installed");
+    assert.equal(clock.pending, 1, "the interception's timeout guard is armed on the injected clock");
 
-      assert.ok(interceptor, "interceptor installed");
+    const observer = mockPendingObserver;
 
-      const observer = mockPendingObserver;
+    assert.ok(observer, "controlled observer captured");
 
-      assert.ok(observer, "controlled observer captured");
+    const memberMedia = "https://cdn.test/default-chan/720p.m3u8";
 
-      const memberMedia = "https://cdn.test/default-chan/720p.m3u8";
+    observer.fire({ childUrls: [memberMedia], kind: "master", url: PAGE_MASTER });
+    interceptor.markChannelSelectionStart();
+    observer.fire({ kind: "media", live: true, url: memberMedia });
 
-      observer.fire({ childUrls: [memberMedia], kind: "master", url: PAGE_MASTER });
-      interceptor.markChannelSelectionStart();
-      observer.fire({ kind: "media", live: true, url: memberMedia });
+    interceptor.finalize(false);
+    clock.advance(1600);
+    await settle();
 
-      interceptor.finalize(false);
-      mock.timers.tick(1600);
+    const result = await interceptor.promise;
 
-      const result = await interceptor.promise;
+    assert.ok(result, "promise resolved with a result");
+    assert.equal(result.manifestUrl, PAGE_MASTER, "a member media corroborates the master and does not override it");
+    assert.equal(result.selectedKind, "master");
 
-      assert.ok(result, "promise resolved with a result");
-      assert.equal(result.manifestUrl, PAGE_MASTER, "a member media corroborates the master and does not override it");
-      assert.equal(result.selectedKind, "master");
-    } finally {
-
-      mock.timers.reset();
-    }
+    // Settlement retires the registry, so neither the guard nor the finalize delay is left armed against an interception that is already resolved.
+    assert.equal(clock.pending, 0, "settlement drained every timer off the clock");
   });
 
   test("a pre-mark-sequenced master delivered after a post-mark media is still treated as pre-epoch (delivery-order skew)", async () => {
@@ -585,37 +586,36 @@ describe("installManifestInterceptor epoch and membership orchestration", () => 
     // Delivery-order skew: after the mark and after the post-mark media, a stale master with a pre-mark sequence is delivered last. Because the record fences on
     // wire ordinal, not delivery order, the late master stays pre-epoch and the media override wins. A delivery-order fence would resolve the last-delivered
     // master instead.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
 
-    try {
+    const interceptor = await install(TEST_INTERCEPTION_WINDOW, clock);
 
-      const interceptor = await install();
+    assert.ok(interceptor, "interceptor installed");
+    assert.equal(clock.pending, 1, "the interception's timeout guard is armed on the injected clock");
 
-      assert.ok(interceptor, "interceptor installed");
+    const observer = mockPendingObserver;
 
-      const observer = mockPendingObserver;
+    assert.ok(observer, "controlled observer captured");
 
-      assert.ok(observer, "controlled observer captured");
+    observer.fire({ childUrls: PAGE_MASTER_CHILDREN, kind: "master", sequence: 1, url: PAGE_MASTER });
+    interceptor.markChannelSelectionStart();
+    observer.fire({ kind: "media", live: true, sequence: 2, url: CLICKED_MEDIA });
 
-      observer.fire({ childUrls: PAGE_MASTER_CHILDREN, kind: "master", sequence: 1, url: PAGE_MASTER });
-      interceptor.markChannelSelectionStart();
-      observer.fire({ kind: "media", live: true, sequence: 2, url: CLICKED_MEDIA });
+    // A stale master delivered last but carrying a pre-mark wire ordinal. It must not become the "latest" master or read post-epoch.
+    observer.fire({ childUrls: PAGE_MASTER_CHILDREN, kind: "master", sequence: 1, url: "https://guide.test/default-chan/stale-master.m3u8" });
 
-      // A stale master delivered last but carrying a pre-mark wire ordinal. It must not become the "latest" master or read post-epoch.
-      observer.fire({ childUrls: PAGE_MASTER_CHILDREN, kind: "master", sequence: 1, url: "https://guide.test/default-chan/stale-master.m3u8" });
+    interceptor.finalize(false);
+    clock.advance(1600);
+    await settle();
 
-      interceptor.finalize(false);
-      mock.timers.tick(1600);
+    const result = await interceptor.promise;
 
-      const result = await interceptor.promise;
+    assert.ok(result, "promise resolved with a result");
+    assert.equal(result.manifestUrl, CLICKED_MEDIA, "a pre-mark-sequenced master delivered late does not flip the resolution to the master");
+    assert.equal(result.selectedKind, "media");
 
-      assert.ok(result, "promise resolved with a result");
-      assert.equal(result.manifestUrl, CLICKED_MEDIA, "a pre-mark-sequenced master delivered late does not flip the resolution to the master");
-      assert.equal(result.selectedKind, "media");
-    } finally {
-
-      mock.timers.reset();
-    }
+    // Settlement retires the registry, so neither the guard nor the finalize delay is left armed against an interception that is already resolved.
+    assert.equal(clock.pending, 0, "settlement drained every timer off the clock");
   });
 
   test("the first slot holds the lower-sequenced master when a lower ordinal is delivered after a higher one", async () => {
@@ -646,34 +646,33 @@ describe("installManifestInterceptor epoch and membership orchestration", () => 
 
     // Wire-order latest-slot guard: a master with ordinal 2 is delivered, then one with ordinal 1. The latest slot must keep the higher ordinal. Marking before
     // any observation makes the ordinal-2 master post-epoch, so it wins categorically - a proof the latest slot still holds it.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
 
-    try {
+    const interceptor = await install(TEST_INTERCEPTION_WINDOW, clock);
 
-      const interceptor = await install();
+    assert.ok(interceptor, "interceptor installed");
+    assert.equal(clock.pending, 1, "the interception's timeout guard is armed on the injected clock");
 
-      assert.ok(interceptor, "interceptor installed");
+    const observer = mockPendingObserver;
 
-      const observer = mockPendingObserver;
+    assert.ok(observer, "controlled observer captured");
 
-      assert.ok(observer, "controlled observer captured");
+    interceptor.markChannelSelectionStart();
+    observer.fire({ kind: "master", sequence: 2, url: "https://cdn.test/master-high.m3u8" });
+    observer.fire({ kind: "master", sequence: 1, url: "https://cdn.test/master-low.m3u8" });
 
-      interceptor.markChannelSelectionStart();
-      observer.fire({ kind: "master", sequence: 2, url: "https://cdn.test/master-high.m3u8" });
-      observer.fire({ kind: "master", sequence: 1, url: "https://cdn.test/master-low.m3u8" });
+    interceptor.finalize(false);
+    clock.advance(1600);
+    await settle();
 
-      interceptor.finalize(false);
-      mock.timers.tick(1600);
+    const result = await interceptor.promise;
 
-      const result = await interceptor.promise;
+    assert.ok(result, "promise resolved with a result");
+    assert.equal(result.manifestUrl, "https://cdn.test/master-high.m3u8", "the late lower-sequenced master did not displace the higher-sequenced latest fact");
+    assert.equal(result.selectedKind, "master");
 
-      assert.ok(result, "promise resolved with a result");
-      assert.equal(result.manifestUrl, "https://cdn.test/master-high.m3u8", "the late lower-sequenced master did not displace the higher-sequenced latest fact");
-      assert.equal(result.selectedKind, "master");
-    } finally {
-
-      mock.timers.reset();
-    }
+    // Settlement retires the registry, so neither the guard nor the finalize delay is left armed against an interception that is already resolved.
+    assert.equal(clock.pending, 0, "settlement drained every timer off the clock");
   });
 
   test("re-marking moves the epoch past a second master so a later foreign media wins (latest stamp wins)", async () => {
@@ -681,36 +680,35 @@ describe("installManifestInterceptor epoch and membership orchestration", () => 
     // A master arrives, the epoch is stamped, a second master arrives, then the epoch is re-stamped past it, then a post-mark live foreign media arrives. Under
     // latest-stamp-wins the second master is pre-epoch and the media wins; a set-once-mark bug would leave the second master post-epoch and resolve it instead,
     // so the outcomes diverge and this asserts the re-mark semantics.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
 
-    try {
+    const interceptor = await install(TEST_INTERCEPTION_WINDOW, clock);
 
-      const interceptor = await install();
+    assert.ok(interceptor, "interceptor installed");
+    assert.equal(clock.pending, 1, "the interception's timeout guard is armed on the injected clock");
 
-      assert.ok(interceptor, "interceptor installed");
+    const observer = mockPendingObserver;
 
-      const observer = mockPendingObserver;
+    assert.ok(observer, "controlled observer captured");
 
-      assert.ok(observer, "controlled observer captured");
+    observer.fire({ childUrls: PAGE_MASTER_CHILDREN, kind: "master", url: "https://guide.test/default-chan/master-1.m3u8" });
+    interceptor.markChannelSelectionStart();
+    observer.fire({ childUrls: PAGE_MASTER_CHILDREN, kind: "master", url: "https://guide.test/default-chan/master-2.m3u8" });
+    interceptor.markChannelSelectionStart();
+    observer.fire({ kind: "media", live: true, url: CLICKED_MEDIA });
 
-      observer.fire({ childUrls: PAGE_MASTER_CHILDREN, kind: "master", url: "https://guide.test/default-chan/master-1.m3u8" });
-      interceptor.markChannelSelectionStart();
-      observer.fire({ childUrls: PAGE_MASTER_CHILDREN, kind: "master", url: "https://guide.test/default-chan/master-2.m3u8" });
-      interceptor.markChannelSelectionStart();
-      observer.fire({ kind: "media", live: true, url: CLICKED_MEDIA });
+    interceptor.finalize(false);
+    clock.advance(1600);
+    await settle();
 
-      interceptor.finalize(false);
-      mock.timers.tick(1600);
+    const result = await interceptor.promise;
 
-      const result = await interceptor.promise;
+    assert.ok(result, "promise resolved with a result");
+    assert.equal(result.manifestUrl, CLICKED_MEDIA, "the re-mark pushed the second master pre-epoch, so the later foreign media wins");
+    assert.equal(result.selectedKind, "media");
 
-      assert.ok(result, "promise resolved with a result");
-      assert.equal(result.manifestUrl, CLICKED_MEDIA, "the re-mark pushed the second master pre-epoch, so the later foreign media wins");
-      assert.equal(result.selectedKind, "media");
-    } finally {
-
-      mock.timers.reset();
-    }
+    // Settlement retires the registry, so neither the guard nor the finalize delay is left armed against an interception that is already resolved.
+    assert.equal(clock.pending, 0, "settlement drained every timer off the clock");
   });
 
   test("the epoch-free timeout resolves the master on a record where finalize would have resolved the media", async () => {
@@ -718,34 +716,33 @@ describe("installManifestInterceptor epoch and membership orchestration", () => 
     // The defensive timeout resolves epoch-free, so on a diverging record - a pre-epoch master plus a post-epoch live non-member media - it resolves the MASTER,
     // whereas finalize(false) with the epoch present would resolve the media. The two resolutions differ, which is what makes this distinguish the epoch-free
     // path (a direct tune the timeout may be guarding must never reach the epoch rule).
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
 
-    try {
+    const interceptor = await install(TEST_INTERCEPTION_WINDOW, clock);
 
-      const interceptor = await install();
+    assert.ok(interceptor, "interceptor installed");
+    assert.equal(clock.pending, 1, "the interception's timeout guard is armed on the injected clock");
 
-      assert.ok(interceptor, "interceptor installed");
+    const observer = mockPendingObserver;
 
-      const observer = mockPendingObserver;
+    assert.ok(observer, "controlled observer captured");
 
-      assert.ok(observer, "controlled observer captured");
+    observer.fire({ childUrls: PAGE_MASTER_CHILDREN, kind: "master", url: PAGE_MASTER });
+    interceptor.markChannelSelectionStart();
+    observer.fire({ kind: "media", live: true, url: CLICKED_MEDIA });
 
-      observer.fire({ childUrls: PAGE_MASTER_CHILDREN, kind: "master", url: PAGE_MASTER });
-      interceptor.markChannelSelectionStart();
-      observer.fire({ kind: "media", live: true, url: CLICKED_MEDIA });
+    // Do NOT finalize. Advance past the interception window so the epoch-free timeout resolves the record.
+    clock.advance(15100);
+    await settle();
 
-      // Do NOT finalize. Advance past the interception window so the epoch-free timeout resolves the record.
-      mock.timers.tick(15100);
+    const result = await interceptor.promise;
 
-      const result = await interceptor.promise;
+    assert.ok(result, "promise resolved with a result");
+    assert.equal(result.manifestUrl, PAGE_MASTER, "the epoch-free timeout resolves the master, unlike the epoch-present finalize path");
+    assert.equal(result.selectedKind, "master");
 
-      assert.ok(result, "promise resolved with a result");
-      assert.equal(result.manifestUrl, PAGE_MASTER, "the epoch-free timeout resolves the master, unlike the epoch-present finalize path");
-      assert.equal(result.selectedKind, "master");
-    } finally {
-
-      mock.timers.reset();
-    }
+    // Settlement retires the registry, so neither the guard nor the finalize delay is left armed against an interception that is already resolved.
+    assert.equal(clock.pending, 0, "settlement drained every timer off the clock");
   });
 });
 
@@ -823,31 +820,28 @@ describe("awaitMatchingManifest", () => {
   test("resolves null when the timeout elapses without a predicate match", async () => {
 
     // Negative path: the predicate keeps returning false, the timer elapses, the function resolves null. The observer must be disposed on the timeout path.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
 
-    try {
+    const interceptor = awaitMatch(() => false, 200, clock);
 
-      const interceptor = awaitMatch(() => false, 200);
+    await Promise.resolve();
 
-      await Promise.resolve();
+    const observer = mockPendingObserver;
 
-      const observer = mockPendingObserver;
+    assert.ok(observer, "controlled observer captured");
+    assert.equal(clock.pending, 1, "the verification guard is armed on the injected clock");
 
-      assert.ok(observer, "controlled observer captured");
+    // Feed a master that the predicate rejects.
+    observer.fire({ kind: "master", url: "https://cdn.test/no-match.m3u8" });
 
-      // Feed a master that the predicate rejects.
-      observer.fire({ kind: "master", url: "https://cdn.test/no-match.m3u8" });
+    // Advance past the timeout.
+    clock.advance(250);
+    await settle();
 
-      // Advance past the timeout.
-      mock.timers.tick(250);
+    const result = await interceptor;
 
-      const result = await interceptor;
-
-      assert.equal(result, null, "timeout without match resolves null");
-      assert.equal(observer.disposed, true, "observer disposed on timeout");
-    } finally {
-
-      mock.timers.reset();
-    }
+    assert.equal(result, null, "timeout without match resolves null");
+    assert.equal(observer.disposed, true, "observer disposed on timeout");
+    assert.equal(clock.pending, 0, "the guard's own fire left nothing armed on the clock");
   });
 });

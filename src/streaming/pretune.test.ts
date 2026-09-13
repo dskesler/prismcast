@@ -1,7 +1,8 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * pretune.test.ts: Unit tests for the predictive channel pretune subsystem. pretune.ts polls the Channels DVR /api/v1/jobs endpoint, schedules a setTimeout that
- * fires PRETUNE_LEAD_MS (30s) before each upcoming recording, and tears down unclaimed pretuned streams after a safety timeout. The public surface is the
+ * pretune.test.ts: Unit tests for the predictive channel pretune subsystem. pretune.ts polls the Channels DVR /api/v1/jobs endpoint, arms a per-job timer on the
+ * scheduler's clock that fires PRETUNE_LEAD_MS (30s) before each upcoming recording, and tears down unclaimed pretuned streams after a safety timeout. The public
+ * surface is the
  * startPretunePolling()/stopPretunePolling() lifecycle pair plus clearPretuneSafetyTimer(), which terminateStream() calls to drop a pretuned stream's safety timer
  * when the stream is claimed and torn down normally. The polling functions depend on side effects (intervals, async DVR fetches, stream initialization) that
  * require deep mocking, so the reachable test surface is verifying the start/stop pair is safe to call more than once, that stop cleanly drains active
@@ -20,8 +21,8 @@ describe("startPretunePolling / stopPretunePolling", () => {
 
   test("startPretunePolling on a second call is a no-op", () => {
 
-    // The implementation guards on `if(pollInterval) { return; }` so a second call has no effect. Locks the contract that startup paths can call multiple times
-    // without spawning duplicate intervals.
+    // The implementation guards on the scheduler binding, so a second call has no effect. Locks the contract that startup paths can call multiple times without
+    // spawning duplicate intervals.
     assert.doesNotThrow(() => {
 
       startPretunePolling();
@@ -44,7 +45,7 @@ describe("startPretunePolling / stopPretunePolling", () => {
 
   test("stopPretunePolling is a no-op when polling has not been started", () => {
 
-    // Negative test: callers (graceful shutdown) may invoke stop on a never-started module. The early return on null pollInterval must keep this safe.
+    // Negative test: callers (graceful shutdown) may invoke stop on a never-started module. The optional access on the null scheduler binding must keep this safe.
     assert.doesNotThrow(() => {
 
       stopPretunePolling();
@@ -68,13 +69,13 @@ describe("startPretunePolling / stopPretunePolling", () => {
 
   test("stopPretunePolling clears pending timers even when called immediately after start", () => {
 
-    // The implementation iterates the activeTimers Map directly and clearTimeout's each entry, then clears the safety timers via clearAllPretuneSafetyTimers() (the
-    // pretuneTimers.ts registry that owns and iterates the safetyTimers Map). With no DVR host configured, the polling function returns early before scheduling any
-    // timers, so this test mostly exercises the no-timer cleanup path. Locks that the empty-Map iteration is harmless.
+    // The implementation disposes the scheduler's two registries, which drains the poll cadence and every per-job timer together, then drains the safety timers via
+    // clearAllPretuneSafetyTimers() (the pretuneTimers.ts registry that owns them). With no DVR host configured, the polling function returns early before arming any
+    // per-job timer, so this test mostly exercises the no-timer cleanup path. Locks that the empty-registry drain is harmless.
     startPretunePolling();
     stopPretunePolling();
 
-    // Calling stop a second time must also be safe - the Maps are still empty after the first stop cleared them.
+    // Calling stop a second time must also be safe - the scheduler binding is null after the first stop.
     assert.doesNotThrow(() => {
 
       stopPretunePolling();

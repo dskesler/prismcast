@@ -14,6 +14,7 @@ import type { NativeProxy } from "./proxy.ts";
 import type { Nullable } from "../types/index.ts";
 import type { Page } from "puppeteer-core";
 import type { RefreshedFeedMetadata } from "./index.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { refreshNativeManifest } from "./index.ts";
 import { subscribeToLogs } from "../utils/index.ts";
@@ -80,47 +81,15 @@ const SEPARATE_AUDIO_TS_PIPELINE: PipelineShape = { container: "ts", encryption:
 // The third shape, used by the fixture whose candidate declares AES-128: a relay that decrypts as it goes, which is a different pipeline from a clear one.
 const AES128_TS_PIPELINE: PipelineShape = { container: "ts", encryption: "aes128", separateAudio: false };
 
-/* scheduledTimerDelays records the delay every setTimeout call was scheduled with, keyed by the timer handle it produced. The spyScheduledTimers helper installs a
- * globalThis.setTimeout spy that populates this map so the proxy stub can recover the delay of the timer handed to setTokenRefreshTimer. A WeakMap keeps the entries
- * garbage-collectable once the handles are cleared, and survives across mock.reset (which only restores the spy, not module state).
+/* The instant every clock in this file is seeded at. Each row hands the refresh a clock of its own at this reading, so the expiries it builds and the reschedule
+ * delay it asserts are exact values rather than readings of the host wall clock taken a moment apart.
  */
-const scheduledTimerDelays = new WeakMap<object, number>();
-
-/* The callback of the most recent timer the spy observed. The proxy stub cancels every timer handed to it, so a scheduled refresh never fires on its own; a test
- * that wants to watch the NEXT cycle - the one a fired timer starts - invokes this callback itself. Only tests that install the spy read it, and each of those
- * schedules exactly once before reading, so the module-level lifetime is deterministic.
- */
-let lastScheduledCallback: (() => void) | null = null;
-
-/* spyScheduledTimers replaces globalThis.setTimeout with a spy that records each call's delay against the timer it returns, then delegates to the real (unref'd)
- * implementation already installed at the top of this file. Tests that need to assert on the scheduled refresh delay install this spy; mock.reset in afterEach
- * restores the plain unref'd wrapper.
- */
-function spyScheduledTimers(): void {
-
-  const wrapped = globalThis.setTimeout;
-
-  lastScheduledCallback = null;
-
-  mock.method(globalThis, "setTimeout", ((handler: TimerHandler, timeout?: number, ...args: unknown[]): NodeJS.Timeout => {
-
-    const timer = (wrapped as unknown as (h: TimerHandler, t?: number, ...a: unknown[]) => NodeJS.Timeout)(handler, timeout, ...args);
-
-    scheduledTimerDelays.set(timer, timeout ?? 0);
-
-    if(typeof handler === "function") {
-
-      lastScheduledCallback = handler as () => void;
-    }
-
-    return timer;
-  }) as unknown as typeof globalThis.setTimeout);
-}
+const BASE_TIME_MS = 1700000000000;
 
 /* makeFakeProxy returns a NativeProxy-shaped stub paired with mutable hooks. The hooks let tests observe what the orchestrator did to the proxy without poking at
- * the proxy's internal state. The setTokenRefreshTimer hook auto-cancels the supplied timer so tests do not leak handles into the next test.
+ * the proxy's internal state. The clock is the row's own, so the stub can read the window each arm was registered with off its ledger.
  */
-function makeFakeProxy(hooks: ProxyStubHooks): NativeProxy {
+function makeFakeProxy(hooks: ProxyStubHooks, clock: TestClock): NativeProxy {
 
   /* The single-flight slot and the consecutive-failure count live inside the stub, the way the real proxy holds them, rather than on the hooks: no assertion reads
    * either one directly. What the tests watch is what the coordinator does with them - one master fetch for two concurrent callers, a retry armed at a delay the
@@ -150,16 +119,15 @@ function makeFakeProxy(hooks: ProxyStubHooks): NativeProxy {
 
       pendingRefresh = refresh;
     },
-    setTokenRefreshTimer: (timer: ReturnType<typeof setTimeout>): void => {
+    setTokenRefreshTimer: (_timer: Disposable): void => {
 
       hooks.setTokenRefreshTimerCalls++;
 
-      // Recover the delay this timer was scheduled with (populated by spyScheduledTimers, if installed) so tests can assert the refresh cadence. Falls back to null
-      // when the spy is not active for this test.
-      hooks.lastRefreshDelayMs = scheduledTimerDelays.get(timer) ?? null;
-
-      // Cancel the timer so the test does not leak it into the next case.
-      clearTimeout(timer);
+      /* Read the window this arm was registered with off the clock's ledger, which records every delay the chain asked for in call order: the arm being handed
+       * over is the most recent one. The handle is left live rather than cancelled - a virtual timer costs the runner nothing, and a row that wants the cycle it
+       * starts fires it by advancing the clock.
+       */
+      hooks.lastRefreshDelayMs = clock.requested.at(-1) ?? null;
     },
     start: noop,
     stop: noop,
@@ -302,15 +270,17 @@ describe("refreshNativeManifest", () => {
       return new Response("should not be reached", { status: 500 });
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: true, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
     const result = await refreshNativeManifest({
 
       channelName: "stopped-channel",
+      clock,
       page: makeFakePage(),
       probeIdentity: refreshIdentity("stopped-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "stopped-stream",
       url: "https://example.test/channel"
@@ -323,15 +293,17 @@ describe("refreshNativeManifest", () => {
   test("returns false when no masterUrl is provided and the page is closed (no recovery path available)", async () => {
 
     // Boundary: when the L2 recovery path runs (no masterUrl) and the page itself is closed, the function has nothing to do and returns false.
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
     const result = await refreshNativeManifest({
 
       channelName: "closed-page-channel",
+      clock,
       page: makeFakePage(true),
       probeIdentity: refreshIdentity("closed-page-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "closed-page-stream",
       url: "https://example.test/channel"
@@ -344,7 +316,7 @@ describe("refreshNativeManifest", () => {
 
     // Happy path: when the master URL is still valid, the direct fetch returns a fresh manifest. The function calls proxy.updateVariantUrl with the new variant
     // URL. We verify by capturing the updateVariantUrl invocation through the proxy stub.
-    const expirySeconds = Math.floor(Date.now() / 1000) + 600;
+    const expirySeconds = Math.floor(BASE_TIME_MS / 1000) + 600;
     const masterUrl = "https://cdn.test/refresh-master.m3u8?exp=" + String(expirySeconds);
     const variantUrl = "https://cdn.test/refresh-variant.m3u8?exp=" + String(expirySeconds);
 
@@ -355,6 +327,7 @@ describe("refreshNativeManifest", () => {
       "https://cdn.test/refresh-variant.m3u8": () => new Response("#EXTM3U\n#EXTINF:2,\nseg.ts\n", { status: 200 })
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -363,10 +336,11 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "refresh-channel",
+      clock,
       masterUrl,
       page: makeFakePage(),
       probeIdentity: refreshIdentity("refresh-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "refresh-stream",
       url: "https://example.test/channel"
@@ -401,6 +375,7 @@ describe("refreshNativeManifest", () => {
       }
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -409,10 +384,11 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "flip-channel",
+      clock,
       masterUrl,
       page: makeFakePage(true),
       probeIdentity: refreshIdentity("flip-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "flip-stream",
       url: "https://example.test/channel"
@@ -437,16 +413,18 @@ describe("refreshNativeManifest", () => {
       [masterUrl]: () => new Response("server error", { status: 500 })
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
     const result = await refreshNativeManifest({
 
       channelName: "refresh-fail-channel",
+      clock,
       masterUrl,
       page: makeFakePage(true),
       probeIdentity: refreshIdentity("refresh-fail-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "refresh-fail-stream",
       url: "https://example.test/channel"
@@ -475,6 +453,7 @@ describe("refreshNativeManifest", () => {
       [videoUrl]: () => new Response("#EXTM3U\n#EXTINF:2,\nseg.ts\n", { status: 200 })
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: SEPARATE_AUDIO_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -483,10 +462,11 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "refresh-dai-channel",
+      clock,
       masterUrl,
       page: makeFakePage(),
       probeIdentity: refreshIdentity("refresh-dai-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "refresh-dai-stream",
       url: "https://example.test/channel"
@@ -503,7 +483,7 @@ describe("refreshNativeManifest", () => {
      * MIN_REFRESH_DELAY floor (30s), so the schedule never degenerates into a per-cycle re-probe of the still-valid master. With a master expiring in ~90s and a
      * variant carrying no token, the boundary is the master's 90s, so the reschedule must fire at ~90s and not at the 30s floor.
      */
-    const expirySeconds = Math.floor(Date.now() / 1000) + 90;
+    const expirySeconds = Math.floor(BASE_TIME_MS / 1000) + 90;
     const masterUrl = "https://cdn.test/inside-margin-master.m3u8?exp=" + String(expirySeconds);
 
     makeFetchRouter({
@@ -513,8 +493,7 @@ describe("refreshNativeManifest", () => {
       "https://cdn.test/inside-margin-variant.m3u8": () => new Response("#EXTM3U\n#EXTINF:2,\nseg.ts\n", { status: 200 })
     });
 
-    spyScheduledTimers();
-
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -523,10 +502,11 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "inside-margin-channel",
+      clock,
       masterUrl,
       page: makeFakePage(),
       probeIdentity: refreshIdentity("inside-margin-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "inside-margin-stream",
       url: "https://example.test/channel"
@@ -539,7 +519,7 @@ describe("refreshNativeManifest", () => {
     // The boundary is the master's ~90s expiry. Assert the reschedule fires near that boundary and well above the 30s MIN_REFRESH_DELAY floor that the old
     // busy-loop produced. A 2-second tolerance absorbs the wall-clock read inside scheduleTokenRefresh.
     assert.ok((hooks.lastRefreshDelayMs!) > 30000, "reschedule does NOT collapse to the MIN_REFRESH_DELAY busy-loop floor");
-    assert.ok(Math.abs((hooks.lastRefreshDelayMs!) - 90000) <= 2000, "reschedule is aimed at the ~90s expiry boundary");
+    assert.equal(hooks.lastRefreshDelayMs, 90000, "reschedule is aimed at the 90s expiry boundary");
   });
 
   test("leads the boundary by TOKEN_REFRESH_MARGIN when the master token has comfortable margin", async () => {
@@ -548,7 +528,7 @@ describe("refreshNativeManifest", () => {
      * the fresh manifest is ready well ahead of expiry. With a master expiring in ~900s, the reschedule must fire at ~600s (900 - 300), confirming the margin lead
      * is still applied outside the busy-loop window.
      */
-    const expirySeconds = Math.floor(Date.now() / 1000) + 900;
+    const expirySeconds = Math.floor(BASE_TIME_MS / 1000) + 900;
     const masterUrl = "https://cdn.test/comfortable-master.m3u8?exp=" + String(expirySeconds);
 
     makeFetchRouter({
@@ -558,8 +538,7 @@ describe("refreshNativeManifest", () => {
       "https://cdn.test/comfortable-variant.m3u8": () => new Response("#EXTM3U\n#EXTINF:2,\nseg.ts\n", { status: 200 })
     });
 
-    spyScheduledTimers();
-
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -568,10 +547,11 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "comfortable-channel",
+      clock,
       masterUrl,
       page: makeFakePage(),
       probeIdentity: refreshIdentity("comfortable-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "comfortable-stream",
       url: "https://example.test/channel"
@@ -581,7 +561,7 @@ describe("refreshNativeManifest", () => {
     assert.equal(hooks.setTokenRefreshTimerCalls, 1, "exactly one refresh scheduled");
 
     // 900s boundary minus the 300s margin lead -> ~600s. A 2-second tolerance absorbs the wall-clock read.
-    assert.ok(Math.abs((hooks.lastRefreshDelayMs!) - 600000) <= 2000, "reschedule leads the boundary by TOKEN_REFRESH_MARGIN");
+    assert.equal(hooks.lastRefreshDelayMs, 600000, "reschedule leads the boundary by TOKEN_REFRESH_MARGIN");
   });
 
   test("clamps a boundary beyond the platform timer ceiling to the largest delay a timer can carry", async () => {
@@ -593,7 +573,7 @@ describe("refreshNativeManifest", () => {
 
     // Mirrors MAX_TIMER_DELAY_MS in index.ts, which is module-private, so the assertion restates the same ceiling. The expiry sits roughly 34 days out, well past it.
     const MAX_TIMER_DELAY_MS = 2147483647;
-    const expirySeconds = Math.floor(Date.now() / 1000) + 3000000;
+    const expirySeconds = Math.floor(BASE_TIME_MS / 1000) + 3000000;
     const masterUrl = "https://cdn.test/far-future-master.m3u8?exp=" + String(expirySeconds);
 
     makeFetchRouter({
@@ -603,8 +583,7 @@ describe("refreshNativeManifest", () => {
       "https://cdn.test/far-future-variant.m3u8": () => new Response("#EXTM3U\n#EXTINF:2,\nseg.ts\n", { status: 200 })
     });
 
-    spyScheduledTimers();
-
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -613,10 +592,11 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "far-future-channel",
+      clock,
       masterUrl,
       page: makeFakePage(),
       probeIdentity: refreshIdentity("far-future-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "far-future-stream",
       url: "https://example.test/channel"
@@ -636,7 +616,7 @@ describe("refreshNativeManifest", () => {
 
     // Mirrors MIN_REFRESH_DELAY in index.ts, which is module-private.
     const MIN_REFRESH_DELAY = 30000;
-    const expirySeconds = Math.floor(Date.now() / 1000) - 60;
+    const expirySeconds = Math.floor(BASE_TIME_MS / 1000) - 60;
     const masterUrl = "https://cdn.test/past-due-master.m3u8?exp=" + String(expirySeconds);
 
     makeFetchRouter({
@@ -646,8 +626,7 @@ describe("refreshNativeManifest", () => {
       "https://cdn.test/past-due-variant.m3u8": () => new Response("#EXTM3U\n#EXTINF:2,\nseg.ts\n", { status: 200 })
     });
 
-    spyScheduledTimers();
-
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -656,10 +635,11 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "past-due-channel",
+      clock,
       masterUrl,
       page: makeFakePage(),
       probeIdentity: refreshIdentity("past-due-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "past-due-stream",
       url: "https://example.test/channel"
@@ -676,8 +656,8 @@ describe("refreshNativeManifest", () => {
      * a dead variant. With a master valid for ~900s but a variant expiring in ~120s, the boundary is the variant's 120s; the single reschedule must fire near 120s,
      * not near the master's 900s (or its 600s margin lead).
      */
-    const masterExpirySeconds = Math.floor(Date.now() / 1000) + 900;
-    const variantExpirySeconds = Math.floor(Date.now() / 1000) + 120;
+    const masterExpirySeconds = Math.floor(BASE_TIME_MS / 1000) + 900;
+    const variantExpirySeconds = Math.floor(BASE_TIME_MS / 1000) + 120;
     const masterUrl = "https://cdn.test/variant-bound-master.m3u8?exp=" + String(masterExpirySeconds);
     const variantPath = "variant-bound-variant.m3u8?exp=" + String(variantExpirySeconds);
     const variantUrl = "https://cdn.test/" + variantPath;
@@ -689,8 +669,7 @@ describe("refreshNativeManifest", () => {
       "https://cdn.test/variant-bound-variant.m3u8": () => new Response("#EXTM3U\n#EXTINF:2,\nseg.ts\n", { status: 200 })
     });
 
-    spyScheduledTimers();
-
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -699,10 +678,11 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "variant-bound-channel",
+      clock,
       masterUrl,
       page: makeFakePage(),
       probeIdentity: refreshIdentity("variant-bound-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "variant-bound-stream",
       url: "https://example.test/channel"
@@ -713,7 +693,7 @@ describe("refreshNativeManifest", () => {
     assert.equal(hooks.setTokenRefreshTimerCalls, 1, "exactly one refresh scheduled");
 
     // The 120s variant boundary is inside the margin, so no lead is applied and the reschedule fires at ~120s. A 2-second tolerance absorbs the wall-clock read.
-    assert.ok(Math.abs((hooks.lastRefreshDelayMs!) - 120000) <= 2000, "reschedule is tied to the earlier variant expiry, not the master expiry");
+    assert.equal(hooks.lastRefreshDelayMs, 120000, "reschedule is tied to the earlier variant expiry, not the master expiry");
   });
 
   test("discards a direct-fetched variant whose token expires within MIN_USABLE_TOKEN_LIFETIME and falls through to page reload", async () => {
@@ -726,7 +706,7 @@ describe("refreshNativeManifest", () => {
      */
     // Mirrors MIN_REFRESH_DELAY in index.ts, which is module-private. It is the delay a first consecutive failure retries at.
     const MIN_REFRESH_DELAY = 30000;
-    const variantExpirySeconds = Math.floor(Date.now() / 1000) + 2;
+    const variantExpirySeconds = Math.floor(BASE_TIME_MS / 1000) + 2;
     const masterUrl = "https://cdn.test/near-expiry-master.m3u8";
     const variantPath = "near-expiry-variant.m3u8?exp=" + String(variantExpirySeconds);
     const fetched: string[] = [];
@@ -747,8 +727,7 @@ describe("refreshNativeManifest", () => {
       }
     });
 
-    spyScheduledTimers();
-
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -757,10 +736,11 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "near-expiry-channel",
+      clock,
       masterUrl,
       page: makeFakePage(true),
       probeIdentity: refreshIdentity("near-expiry-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "near-expiry-stream",
       url: "https://example.test/channel"
@@ -786,6 +766,7 @@ describe("refreshNativeManifest", () => {
     const masterUrl = "https://cdn.test/stop-midprobe-master.m3u8";
     const variantUrl = "https://cdn.test/stop-midprobe-variant.m3u8";
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -807,10 +788,11 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "stop-midprobe-channel",
+      clock,
       masterUrl,
       page: makeFakePage(),
       probeIdentity: refreshIdentity("stop-midprobe-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "stop-midprobe-stream",
       url: "https://example.test/channel"
@@ -846,6 +828,7 @@ describe("refreshNativeManifest", () => {
       [topUrl]: () => new Response("server error", { status: 500 })
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -854,10 +837,11 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "held-channel",
+      clock,
       masterUrl,
       page: makeFakePage(true),
       probeIdentity: refreshIdentity("held-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "held-stream",
       url: "https://example.test/channel"
@@ -879,7 +863,7 @@ describe("refreshNativeManifest", () => {
      * can present after a discontinuity or a short producer stall - must not tear down a running stream. Here the refreshed variant carries a single segment and
      * the refresh succeeds exactly as it would with a full window.
      */
-    const expirySeconds = Math.floor(Date.now() / 1000) + 600;
+    const expirySeconds = Math.floor(BASE_TIME_MS / 1000) + 600;
     const masterUrl = "https://cdn.test/thin-window-master.m3u8?exp=" + String(expirySeconds);
     const variantUrl = "https://cdn.test/thin-window-variant.m3u8?exp=" + String(expirySeconds);
 
@@ -890,6 +874,7 @@ describe("refreshNativeManifest", () => {
       "https://cdn.test/thin-window-variant.m3u8": () => new Response("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nseg0.ts\n", { status: 200 })
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -898,10 +883,11 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "thin-window-channel",
+      clock,
       masterUrl,
       page: makeFakePage(),
       probeIdentity: refreshIdentity("thin-window-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "thin-window-stream",
       url: "https://example.test/channel"
@@ -919,7 +905,7 @@ describe("refreshNativeManifest", () => {
      * nothing durable. So the refresh probes under the stream's own identity, stamped from the configured binding. The two-sided assertion is what gives this
      * assertion teeth: the classification is readable under the threaded identity AND absent under an identity stamped from the master URL.
      */
-    const expirySeconds = Math.floor(Date.now() / 1000) + 600;
+    const expirySeconds = Math.floor(BASE_TIME_MS / 1000) + 600;
     const masterUrl = "https://cdn.test/stamp-master.m3u8?token=rotates-every-refresh&exp=" + String(expirySeconds);
     const configuredUrl = "https://example.test/stamp-channel";
 
@@ -930,6 +916,7 @@ describe("refreshNativeManifest", () => {
       "https://cdn.test/stamp-variant.m3u8": () => new Response("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nseg0.ts\n#EXTINF:6,\nseg1.ts\n", { status: 200 })
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
     const identity = refreshIdentity("stamp-channel", configuredUrl);
@@ -939,18 +926,19 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "stamp-channel",
+      clock,
       masterUrl,
       page: makeFakePage(),
       probeIdentity: identity,
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "stamp-stream",
       url: configuredUrl
     });
 
     assert.equal(result, true, "the direct-fetch refresh succeeds");
-    assert.equal(getCachedEncryption(identity), "clear", "the classification is readable under the identity the refresh was threaded with");
-    assert.equal(getCachedEncryption(refreshIdentity("stamp-channel", masterUrl)), null,
+    assert.equal(getCachedEncryption(identity, BASE_TIME_MS), "clear", "the classification is readable under the identity the refresh was threaded with");
+    assert.equal(getCachedEncryption(refreshIdentity("stamp-channel", masterUrl), BASE_TIME_MS), null,
       "and is absent under an identity stamped from the master URL, which the refresh must never stamp with");
   });
 
@@ -982,6 +970,7 @@ describe("refreshNativeManifest", () => {
       }
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: SEPARATE_AUDIO_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -990,10 +979,11 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "topology-channel",
+      clock,
       masterUrl,
       page: makeFakePage(true),
       probeIdentity: refreshIdentity("topology-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "topology-stream",
       url: "https://example.test/channel"
@@ -1039,6 +1029,7 @@ describe("refreshNativeManifest", () => {
       }
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: AES128_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -1048,10 +1039,11 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "deadkey-channel",
+      clock,
       masterUrl,
       page: makeFakePage(true),
       probeIdentity: refreshIdentity("deadkey-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "deadkey-stream",
       url: "https://example.test/channel"
@@ -1069,7 +1061,7 @@ describe("refreshNativeManifest", () => {
      * it reports upward through this callback, exactly as it reports proxy errors - and the caller's closure records the bandwidth, codec, and resolution the
      * stream is now actually serving.
      */
-    const expirySeconds = Math.floor(Date.now() / 1000) + 600;
+    const expirySeconds = Math.floor(BASE_TIME_MS / 1000) + 600;
     const masterUrl = "https://cdn.test/quality-master.m3u8?exp=" + String(expirySeconds);
     const applied: RefreshedFeedMetadata[] = [];
 
@@ -1084,6 +1076,7 @@ describe("refreshNativeManifest", () => {
       "https://cdn.test/quality-variant.m3u8": () => new Response("#EXTM3U\n#EXTINF:2,\nseg.ts\n", { status: 200 })
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -1092,6 +1085,7 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "quality-channel",
+      clock,
       masterUrl,
       onFeedApplied: (metadata) => {
 
@@ -1099,7 +1093,7 @@ describe("refreshNativeManifest", () => {
       },
       page: makeFakePage(),
       probeIdentity: refreshIdentity("quality-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "quality-stream",
       url: "https://example.test/channel"
@@ -1116,7 +1110,7 @@ describe("refreshNativeManifest", () => {
      * happened: the URLs are swapped, the stream is playing on fresh tokens, and reporting the outcome as a failure would re-arm a retry against a refresh that
      * worked. The stale status metadata is the smaller harm, so the throw is warned about and the cycle carries on to its reschedule.
      */
-    const expirySeconds = Math.floor(Date.now() / 1000) + 600;
+    const expirySeconds = Math.floor(BASE_TIME_MS / 1000) + 600;
     const masterUrl = "https://cdn.test/throwing-master.m3u8?exp=" + String(expirySeconds);
     const variantUrl = "https://cdn.test/throwing-variant.m3u8?exp=" + String(expirySeconds);
 
@@ -1127,6 +1121,7 @@ describe("refreshNativeManifest", () => {
       "https://cdn.test/throwing-variant.m3u8": () => new Response("#EXTM3U\n#EXTINF:2,\nseg.ts\n", { status: 200 })
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -1135,6 +1130,7 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "throwing-channel",
+      clock,
       masterUrl,
       onFeedApplied: () => {
 
@@ -1142,7 +1138,7 @@ describe("refreshNativeManifest", () => {
       },
       page: makeFakePage(),
       probeIdentity: refreshIdentity("throwing-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "throwing-stream",
       url: "https://example.test/channel"
@@ -1182,16 +1178,18 @@ describe("refreshNativeManifest", () => {
     assert.equal(seeded?.encryption, "drm", "the seeding probe classified the channel as DRM");
     assert.equal(masterFetches, 1, "and paid one fetch to do it");
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
     const result = await refreshNativeManifest({
 
       channelName: "cached-drm-channel",
+      clock,
       masterUrl,
       page: makeFakePage(true),
       probeIdentity: identity,
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "cached-drm-stream",
       url: "https://example.test/channel"
@@ -1202,9 +1200,9 @@ describe("refreshNativeManifest", () => {
     assert.equal(hooks.audioVariantUrl, "", "and no audio URL is applied either");
 
     // The decline left the entry alone, which is the contract: an unconstrained probe still short-circuits on it, spending no fetch to do so.
-    assert.equal(getCachedEncryption(identity), "drm", "the classification survives the decline");
+    assert.equal(getCachedEncryption(identity, BASE_TIME_MS), "drm", "the classification survives the decline");
 
-    const afterwards = await probeManifest(masterUrl, identity);
+    const afterwards = await probeManifest(masterUrl, identity, { clock: new TestClock(BASE_TIME_MS) });
 
     assert.equal(afterwards?.encryption, "drm", "an unconstrained probe still reads the entry");
     assert.equal(masterFetches, 1, "and reads it from the cache, without going back to the network");
@@ -1217,7 +1215,7 @@ describe("refreshNativeManifest", () => {
      * refreshing perfectly well while its reported quality quietly freezes at whatever the tune bound. This assertion fires the scheduled timer and watches the second
      * cycle report.
      */
-    const expirySeconds = Math.floor(Date.now() / 1000) + 600;
+    const expirySeconds = Math.floor(BASE_TIME_MS / 1000) + 600;
     const masterUrl = "https://cdn.test/chained-master.m3u8?exp=" + String(expirySeconds);
     const applied: RefreshedFeedMetadata[] = [];
     const { promise: secondCycleReported, resolve: reportSecondCycle } = Promise.withResolvers<RefreshedFeedMetadata>();
@@ -1229,8 +1227,7 @@ describe("refreshNativeManifest", () => {
       "https://cdn.test/chained-variant.m3u8": () => new Response("#EXTM3U\n#EXTINF:2,\nseg.ts\n", { status: 200 })
     });
 
-    spyScheduledTimers();
-
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -1239,6 +1236,7 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "chained-channel",
+      clock,
       masterUrl,
       onFeedApplied: (metadata) => {
 
@@ -1251,7 +1249,7 @@ describe("refreshNativeManifest", () => {
       },
       page: makeFakePage(),
       probeIdentity: refreshIdentity("chained-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "chained-stream",
       url: "https://example.test/channel"
@@ -1260,10 +1258,10 @@ describe("refreshNativeManifest", () => {
     assert.equal(result, true, "the first cycle succeeds");
     assert.equal(applied.length, 1, "and reports once");
     assert.equal(hooks.setTokenRefreshTimerCalls, 1, "having armed the timer that starts the next cycle");
-    assert.notEqual(lastScheduledCallback, null, "the spy captured that timer's callback");
+    assert.notEqual(hooks.lastRefreshDelayMs, null, "the clock's ledger carries the window that arm was registered with");
 
-    // Fire the timer the way the platform would, then wait for the cycle it starts to report.
-    lastScheduledCallback?.();
+    // Cross that window on the clock the arm was registered against, then wait for the cycle it starts to report.
+    clock.advance(hooks.lastRefreshDelayMs ?? 0);
 
     const second = await secondCycleReported;
 
@@ -1278,7 +1276,7 @@ describe("refreshNativeManifest", () => {
      * real attempt, not a stand-in outcome: the monitor decides whether to escalate on the boolean it reads back, so a caller told "someone else is handling it"
      * would be steering on a fiction. The gate below holds the first attempt's master fetch open until the second caller has arrived.
      */
-    const expirySeconds = Math.floor(Date.now() / 1000) + 600;
+    const expirySeconds = Math.floor(BASE_TIME_MS / 1000) + 600;
     const masterUrl = "https://cdn.test/shared-master.m3u8?exp=" + String(expirySeconds);
     const gate = Promise.withResolvers<string>();
     let masterFetches = 0;
@@ -1294,6 +1292,7 @@ describe("refreshNativeManifest", () => {
       "https://cdn.test/shared-variant.m3u8": () => new Response("#EXTM3U\n#EXTINF:2,\nseg.ts\n", { status: 200 })
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -1302,10 +1301,11 @@ describe("refreshNativeManifest", () => {
     const options = {
 
       channelName: "shared-channel",
+      clock,
       masterUrl,
       page: makeFakePage(),
       probeIdentity: refreshIdentity("shared-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "shared-stream",
       url: "https://example.test/channel"
@@ -1340,8 +1340,7 @@ describe("refreshNativeManifest", () => {
       [masterUrl]: () => new Response("server error", { status: 500 })
     });
 
-    spyScheduledTimers();
-
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -1351,10 +1350,11 @@ describe("refreshNativeManifest", () => {
     const options = {
 
       channelName: "rearm-channel",
+      clock,
       masterUrl,
       page: makeFakePage(true),
       probeIdentity: refreshIdentity("rearm-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "rearm-stream",
       url: "https://example.test/channel"
@@ -1386,8 +1386,7 @@ describe("refreshNativeManifest", () => {
       [masterUrl]: () => new Response("server error", { status: 500 })
     });
 
-    spyScheduledTimers();
-
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: true, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -1396,10 +1395,11 @@ describe("refreshNativeManifest", () => {
     const { outcome, warnings } = await captureWarnings(() => refreshNativeManifest({
 
       channelName: "stopped-rearm-channel",
+      clock,
       masterUrl,
       page: makeFakePage(true),
       probeIdentity: refreshIdentity("stopped-rearm-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "stopped-rearm-stream",
       url: "https://example.test/channel"
@@ -1416,7 +1416,7 @@ describe("refreshNativeManifest", () => {
      * escalation for the rest of its life and answer its next stumble - hours later, unrelated - with an inflated delay.
      */
     const MIN_REFRESH_DELAY = 30000;
-    const expirySeconds = Math.floor(Date.now() / 1000) + 600;
+    const expirySeconds = Math.floor(BASE_TIME_MS / 1000) + 600;
     const masterUrl = "https://cdn.test/reset-master.m3u8?exp=" + String(expirySeconds);
     let cycle = 0;
 
@@ -1434,8 +1434,7 @@ describe("refreshNativeManifest", () => {
       "https://cdn.test/reset-variant.m3u8": () => new Response("#EXTM3U\n#EXTINF:2,\nseg.ts\n", { status: 200 })
     });
 
-    spyScheduledTimers();
-
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
@@ -1444,10 +1443,11 @@ describe("refreshNativeManifest", () => {
     const options = {
 
       channelName: "reset-channel",
+      clock,
       masterUrl,
       page: makeFakePage(true),
       probeIdentity: refreshIdentity("reset-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: declineReestablishment,
       streamIdStr: "reset-stream",
       url: "https://example.test/channel"
@@ -1485,11 +1485,12 @@ describe("refreshNativeManifest", () => {
       [masterUrl]: () => new Response("server error", { status: 500 })
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
 
     // A proxy whose timer slot refuses the handle the re-arm hands it - the failure branch's last step, and the one furthest from the caller.
-    const proxy: NativeProxy = { ...makeFakeProxy(hooks), setTokenRefreshTimer: (): void => {
+    const proxy: NativeProxy = { ...makeFakeProxy(hooks, clock), setTokenRefreshTimer: (): void => {
 
       throw new Error("the timer slot refused the handle");
     } };
@@ -1499,6 +1500,7 @@ describe("refreshNativeManifest", () => {
     const { outcome, warnings } = await captureWarnings(() => refreshNativeManifest({
 
       channelName: "throwing-timer-channel",
+      clock,
       masterUrl,
       page: makeFakePage(true),
       probeIdentity: refreshIdentity("throwing-timer-channel"),
@@ -1527,6 +1529,7 @@ describe("refreshNativeManifest", () => {
       [variantUrl]: () => new Response("#EXTM3U\n#EXTINF:2,\nseg.ts\n", { status: 200 })
     });
 
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
     const capability = makeReestablishStub({ manifestUrl: masterUrl, selectedKind: "master" });
@@ -1536,9 +1539,10 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "reestablish-channel",
+      clock,
       page: makeFakePage(),
       probeIdentity: refreshIdentity("reestablish-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: capability.reestablishManifest,
       streamIdStr: "reestablish-stream",
       url: "https://example.test/channel"
@@ -1553,6 +1557,7 @@ describe("refreshNativeManifest", () => {
 
     // A null from the capability covers every way the channel could not be re-established - navigation, initialization, or a verifier rejection - and each of
     // them must leave the running proxy exactly as it was rather than half-applying anything.
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
     const capability = makeReestablishStub();
@@ -1569,9 +1574,10 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "declined-channel",
+      clock,
       page: makeFakePage(),
       probeIdentity: refreshIdentity("declined-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: capability.reestablishManifest,
       streamIdStr: "declined-stream",
       url: "https://example.test/channel"
@@ -1589,6 +1595,7 @@ describe("refreshNativeManifest", () => {
 
     // The page-closed guard sits ahead of the re-establishment for a reason: every primitive the capability composes would throw on a closed page, and the
     // counter is what asserts the ordering rather than merely the outcome.
+    const clock = new TestClock(BASE_TIME_MS);
     const hooks: ProxyStubHooks = { audioVariantUrl: "", isStopped: false, lastRefreshDelayMs: null, pipelineShape: MUXED_TS_PIPELINE,
       setTokenRefreshTimerCalls: 0, variantUrl: "" };
     const capability = makeReestablishStub({ manifestUrl: "https://cdn.test/never-read.m3u8", selectedKind: "master" });
@@ -1596,9 +1603,10 @@ describe("refreshNativeManifest", () => {
     const result = await refreshNativeManifest({
 
       channelName: "closed-before-capability-channel",
+      clock,
       page: makeFakePage(true),
       probeIdentity: refreshIdentity("closed-before-capability-channel"),
-      proxy: makeFakeProxy(hooks),
+      proxy: makeFakeProxy(hooks, clock),
       reestablishManifest: capability.reestablishManifest,
       streamIdStr: "closed-before-capability-stream",
       url: "https://example.test/channel"

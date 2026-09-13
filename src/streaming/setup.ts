@@ -9,10 +9,9 @@ import { BrowserCaptureImpairedError, BrowserSupersededError, BrowserUnavailable
   unregisterManagedPage } from "../browser/index.ts";
 import { CaptureAbandonedError, CaptureTurnTimeoutError, createCaptureLock } from "./captureLock.ts";
 import type { CaptureStream, CaptureStreamOptions } from "../browser/index.ts";
-import type { Clock, FFmpegProcess } from "../utils/index.ts";
 import { FINALIZE_SETTLE_DELAY, installManifestInterceptor } from "../browser/manifestInterceptor.ts";
-import { LOG, chromeFetch, delay, extractDomain, formatError, getStreamContext, maxRetryDuration, realClock, registerAbortController,
-  resolveFFmpegPath, retryOperation, runWithStreamContext, spawnFFmpeg, startTimer, waitWithTimeout } from "../utils/index.ts";
+import { LOG, chromeFetch, delay, extractDomain, formatError, getStreamContext, maxRetryDuration, registerAbortController,
+  resolveFFmpegPath, retryOperation, runWithStreamContext, spawnFFmpeg, startTimer, timeoutSignal, waitWithTimeout } from "../utils/index.ts";
 import type { ManifestInterceptionResult, ManifestInterceptorHandle } from "../browser/manifestInterceptor.ts";
 import type { MonitorHandle, TabReplacementResult } from "./recovery.ts";
 import type { Nullable, ResolvedChannel, ResolvedSiteProfile, TuneResult, UrlValidationResult } from "../types/index.ts";
@@ -22,6 +21,8 @@ import { getProviderByStrategy, invalidateDirectUrl, resolveDirectUrl } from "..
 import { initializePlayback, injectVideoSelector, muteExistingVideos, navigateToPage } from "../browser/video.ts";
 import { CONFIG } from "../config/index.ts";
 import type { CaptureSession } from "./captureSession.ts";
+import type { Clock } from "homebridge-plugin-utils";
+import type { FFmpegProcess } from "../utils/index.ts";
 import type { InitializePlaybackOptions } from "../browser/video.ts";
 import type { MonitorStreamInfo } from "./monitor.ts";
 import type { ProbeCacheIdentity } from "../native/probe.ts";
@@ -40,6 +41,7 @@ import { openSharedWindowTab } from "../browser/tabSelection.ts";
 import { pipeline } from "node:stream/promises";
 import { reaffirmCaptureSurface } from "../browser/cdp.ts";
 import { startOverlayHandling } from "../browser/consent.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* This module contains the common stream setup logic for HLS streaming. The core logic is split into two functions:
  *
@@ -79,7 +81,7 @@ const CAPTURE_WEDGE_MARGIN_MS = 5000;
 
 // The one production capture lock. It takes no config-derived values: setup.ts's module body runs before initializeConfiguration(), and streaming.* saves mutate the
 // live CONFIG binding mid-process, so every timing bound is read per call at the call sites instead.
-const captureLock = createCaptureLock({ clock: realClock, wedgeFloorMs: CAPTURE_WEDGE_FLOOR_MS, wedgeMarginMs: CAPTURE_WEDGE_MARGIN_MS });
+const captureLock = createCaptureLock({ clock: systemClock, wedgeFloorMs: CAPTURE_WEDGE_FLOOR_MS, wedgeMarginMs: CAPTURE_WEDGE_MARGIN_MS });
 
 // The bound on how long the capture extension may take to confirm a recording stopped, after a raw capture stream is destroyed and before the owning page is
 // closed. Destroying the stream sends the stop request; the extension answers by closing its socket once the recorder has stopped, its tracks have stopped, and
@@ -124,15 +126,15 @@ export const CAPTURE_PROBE_TIMEOUT_MESSAGE = "Capture probe timed out.";
  * It never throws. A confirmation that does not arrive inside the ceiling is warned about and then stepped past, because holding a page open for a browser that
  * has stopped answering helps nobody.
  * @param stream - The raw capture stream to retire.
- * @param clock - Clock bounding the stop confirmation. Defaults to realClock; tests inject a fake.
+ * @param clock - Clock bounding the stop confirmation. Defaults to the system clock; tests inject a virtual clock.
  */
-export async function retireRawStream(stream: CaptureStream, clock: Clock = realClock): Promise<void> {
+export async function retireRawStream(stream: CaptureStream, clock: Clock = systemClock): Promise<void> {
 
   stream.destroy();
 
   try {
 
-    await clock.waitWithTimeout(stream.stopped, STOP_RECORDING_CEILING_MS, new Error(STOP_RECORDING_CEILING_MESSAGE));
+    await waitWithTimeout(stream.stopped, STOP_RECORDING_CEILING_MS, { clock, reason: new Error(STOP_RECORDING_CEILING_MESSAGE) });
   } catch {
 
     LOG.warn("The capture extension did not confirm the recording stopped within %dms; closing the page regardless.", STOP_RECORDING_CEILING_MS);
@@ -180,7 +182,7 @@ const CAPTURE_PROBE_TIMEOUT_MS = 5000;
 
 // Wire the capture-readiness probe into the browser launch gate. setup.ts owns the capture lock and the readiness probe; browser/index.ts owns the launch
 // lifecycle. Injecting verifyCaptureSystem here (setup.ts already depends on browser/index.ts) keeps the dependency one-directional and breaks the
-// cycle, mirroring the browserAccessors boundary between login.ts and index.ts. It runs once at module load, before any browser launch.
+// cycle, mirroring the loginDeps boundary between login.ts and index.ts. It runs once at module load, before any browser launch.
 setCaptureProbe(verifyCaptureSystem);
 
 // Types.
@@ -285,8 +287,9 @@ export interface StreamSetupResult {
   // Friendly service display name derived from the URL domain via DOMAIN_CONFIG (e.g., "Hulu" for hulu.com). Used for SSE status display.
   serviceName: string;
 
-  // Timestamp when the stream started.
-  startTime: Date;
+  // The epoch millisecond instant the stream started, and the basis for the uptime and duration the status and the logs report. The ISO form is produced where the
+  // value leaves the process.
+  startTime: number;
 
   // The playback health monitor handle. Exposes the live recovery metrics (read in the termination prologue) and a self-contained dispose that stops the monitor.
   monitor: MonitorHandle;
@@ -531,7 +534,7 @@ function disposePage(page: Page): void {
  * pipeline it drives. So is the page creation itself, which is a queued turn on the tab-selection executor rather than a bare browser call, so a test observes
  * that the capture page is asked for through that primitive rather than opened wherever Chrome would put it. The remaining browser calls (registerManagedPage,
  * unregisterManagedPage) stay direct imports: they mutate an in-process page set, so they need no substitution. This is the collaborator-injection form of the
- * Clock port (utils/clock.ts).
+ * library's Clock port.
  */
 export interface CreatePageWithCaptureDeps {
 
@@ -692,7 +695,7 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
       // the turn, then reject, so no path strands a live capture on a closing page or mistakes a retired stream for a usable one.
       if(signal.aborted) {
 
-        await retireRawStream(raw, realClock);
+        await retireRawStream(raw, systemClock);
 
         throw new CaptureAbandonedError();
       }
@@ -973,20 +976,26 @@ export async function createPageWithCapture(options: CreatePageWithCaptureOption
  * FruitDeepLinks) whose domain has no profile mapping. By following redirects, we discover the actual streaming site's domain and can resolve the correct profile.
  *
  * Uses a HEAD request to avoid downloading response bodies. The 3-second timeout ensures stream startup isn't blocked by slow or unreachable indirection services.
+ * This resolver holds no clock of its own, so that bound takes the port's default, the system clock.
  *
  * @param url - The URL to resolve.
  * @returns The final URL after following all redirects, or null on any error.
  */
 async function resolveRedirectUrl(url: string): Promise<Nullable<string>> {
 
+  const bound = timeoutSignal(3000);
+
   try {
 
-    const response = await chromeFetch(url, { method: "HEAD", signal: AbortSignal.timeout(3000) });
+    const response = await chromeFetch(url, { method: "HEAD", signal: bound.signal });
 
     return response.url;
   } catch {
 
     return null;
+  } finally {
+
+    bound.cancel();
   }
 }
 
@@ -1084,7 +1093,7 @@ export function computeDirectTuneKind(options: { profile: ResolvedSiteProfile; s
 
 /* The browser-boundary collaborator establishChannelPlayback composes on. Playback initialization is the one step that drives a live page, so injecting it lets
  * the composition's choreography be driven without Chrome while production runs the real function this module already imports. This is the
- * collaborator-injection form of the Clock port (utils/clock.ts), the same shape CreatePageWithCaptureDeps uses.
+ * collaborator-injection form of the library's Clock port, the same shape CreatePageWithCaptureDeps uses.
  */
 export interface EstablishChannelPlaybackDeps {
 
@@ -1147,7 +1156,7 @@ export async function establishChannelPlayback(page: Page, profile: ResolvedSite
     void initPromise.finally(() => onInitSettled()).catch(() => { /* The bounded wait below owns the initialization's failure. */ });
   }
 
-  return waitWithTimeout(initPromise, PLAYBACK_INIT_TIMEOUT, new Error("Playback initialization timed out after " + String(PLAYBACK_INIT_TIMEOUT) + "ms."));
+  return waitWithTimeout(initPromise, PLAYBACK_INIT_TIMEOUT, { reason: new Error("Playback initialization timed out after " + String(PLAYBACK_INIT_TIMEOUT) + "ms.") });
 }
 
 /**
@@ -1195,7 +1204,8 @@ export async function setupStream(options: StreamSetupOptions, onCircuitBreak: (
   // tab replacement handler all reference the same stream identity as the pending entry in the registry.
   const streamId = options.streamId ?? generateStreamId(channelName, url);
   const numericStreamId = options.numericStreamId ?? getNextStreamId();
-  const startTime = new Date();
+  // Stream setup is a composition point - it builds the capture lock, the health monitor, and the page - so it reads the system clock at its own boundary.
+  const startTime = systemClock.now();
 
   // Create and register the AbortController for this stream. This allows pending evaluate calls to be cancelled immediately when the stream is terminated.
   const abortController = new AbortController();
@@ -1321,7 +1331,7 @@ export async function setupStream(options: StreamSetupOptions, onCircuitBreak: (
        * attempt runs, no probe fires, and the encryption cache stays untouched by that stream. The cache half avoids creating a CDP session that sits idle for
        * 15 seconds before the interceptor timeout cleans it up; every stream carries an identity, ad-hoc URLs included, so that lookup needs no guard.
        */
-      const skipInterception = (channel?.forceCapture === true) || (getCachedEncryption(probeIdentity) === "drm");
+      const skipInterception = (channel?.forceCapture === true) || (getCachedEncryption(probeIdentity, systemClock.now()) === "drm");
 
       // Build the persistResolution closure for the active channel. When the resolution layer in selectChannel() converts a category selector to a concrete call
       // sign, this closure writes the result to the user's channel store as a per-service-variant override - the same shape produced when a user manually edits
@@ -1720,10 +1730,10 @@ type CaptureProbeMode = { boundMs: number; kind: "gate" } | { boundMs: number; k
  * the acquisition is bounded - see CaptureProbeMode.
  * @param browser - The Chrome instance to probe.
  * @param mode - The operating mode: gate (internal acquisition race) or midlife (self-timed acquisition on the lock).
- * @param clock - Clock used for the mid-life self-timing and the teardown confirmation. Defaults to realClock.
+ * @param clock - Clock used for the mid-life self-timing and the teardown confirmation. Defaults to the system clock.
  * @returns Null on success, or an error message string on failure.
  */
-async function attemptCaptureProbe(browser: Browser, mode: CaptureProbeMode, clock: Clock = realClock): Promise<Nullable<string>> {
+async function attemptCaptureProbe(browser: Browser, mode: CaptureProbeMode, clock: Clock = systemClock): Promise<Nullable<string>> {
 
   /* The mid-life probe runs against a browser that is serving streams, so its page is opened as a tab of the shared window for the reason a stream's page is: a
    * probe tab rooted in a discovery window would hold that window open for as long as the probe took. The launch gate keeps the plain create: it runs pre-publish,
@@ -1790,7 +1800,7 @@ async function attemptCaptureProbe(browser: Browser, mode: CaptureProbeMode, clo
 
       try {
 
-        stream = await waitWithTimeout(streamPromise, mode.boundMs, timeoutError);
+        stream = await waitWithTimeout(streamPromise, mode.boundMs, { reason: timeoutError });
       } catch(error) {
 
         // Only the internal timeout leaves the acquisition running; an in-time rejection produced no stream to clean up and is already observed by the bounded wait.

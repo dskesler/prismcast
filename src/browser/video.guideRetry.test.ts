@@ -11,12 +11,20 @@
  * selection was taken as successful, and a tune whose selection ultimately failed never gets there.
  */
 import type { ChannelSelectionStrategy, ChannelSelectorResult, ResolvedSiteProfile } from "../types/index.ts";
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
+import { TestClock, drainClock, settle } from "homebridge-plugin-utils/testing";
+import { afterEach, beforeEach, describe, test } from "node:test";
+import { CONFIG } from "../config/index.ts";
+import { LOG } from "../utils/index.ts";
 import type { Page } from "puppeteer-core";
 import type { VideoTuneDeps } from "./video.ts";
 import assert from "node:assert/strict";
 import { initializePlayback } from "./video.ts";
 import { makeProfile } from "../config/profiles.helpers.ts";
+import { systemClock } from "homebridge-plugin-utils";
+import { useHealthStoreOnClock } from "../config/health.helpers.ts";
+
+// The teardown for the health store establishment each describe below holds, assigned by that describe's setup.
+let disposeHealthStore: () => Promise<void>;
 
 // The selection results each successive selectChannel call returns, and the page operations the stub recorded. Reset per row.
 let selectResults: ChannelSelectorResult[] = [];
@@ -32,6 +40,7 @@ const VIDEO_WAIT_FAILURE = "the video wait is where this row stops";
 const deps: VideoTuneDeps = {
 
   classifyBlockedPage: async (): Promise<never> => { throw new Error("The classifier is not reached without a requested URL."); },
+  clock: systemClock,
   getProvidersForDomain: (): never[] => [],
   selectChannel: async (): Promise<ChannelSelectorResult> => {
 
@@ -85,19 +94,20 @@ function makeGuideProfile(strategy: ChannelSelectionStrategy = "spectrumGrid"): 
 
 describe("initializePlayback - the guide-unavailable retry", () => {
 
-  beforeEach(() => {
+  beforeEach(async () => {
 
     pageEvents = [];
     selectCalls = 0;
     selectResults = [];
 
-    // Suppress any debounced health timer these paths might schedule, so nothing fires against a real data directory after a row ends.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    // Establish the health store on a clock of its own, so any debounced health timer these paths schedule arms on virtual time rather than against a real data
+    // directory after a row ends.
+    disposeHealthStore = await useHealthStoreOnClock(new TestClock());
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
-    mock.timers.reset();
+    await disposeHealthStore();
   });
 
   test("reloads, re-mutes, and re-runs selection once when the guide never rendered", async () => {
@@ -163,5 +173,78 @@ describe("initializePlayback - the guide-unavailable retry", () => {
 
     assert.equal(selectCalls, 1, "the coordinator declined to re-run selection");
     assert.deepEqual(pageEvents, [ "mute", "select" ], "nothing was reloaded");
+  });
+});
+
+describe("initializePlayback - the tune's clock reaches the video-context search", () => {
+
+  beforeEach(async () => {
+
+    pageEvents = [];
+    selectCalls = 0;
+    selectResults = [];
+
+    // Establish the health store on a clock of its own, so any debounced health timer these paths schedule arms on virtual time rather than against a real data
+    // directory after a row ends.
+    disposeHealthStore = await useHealthStoreOnClock(new TestClock());
+  });
+
+  afterEach(async () => {
+
+    await disposeHealthStore();
+  });
+
+  test("parks the search's cadence on the clock the deps carry and falls back to the main page at the ceiling", async (t) => {
+
+    /* The search is the one tune step whose pacing a row can observe end to end: an iframe-handling profile sends it scanning, a frame list holding only the main
+     * frame makes every scan a miss, and the ceiling is the configured iframe delay. Driving it through a TestClock in the deps is what proves the orchestrator's
+     * clock reaches the search rather than the search reaching for the system clock - a global timer would leave this clock empty and the drain would step nothing.
+     */
+    const debug = t.mock.method(LOG, "debug", () => { /* Captured via the mock. */ });
+    const clock = new TestClock();
+
+    // A sentinel main frame: page.frames() answers only this, and page.mainFrame() answers the same object, so every scan skips it and finds no video anywhere.
+    const mainFrame = {};
+
+    const page = {
+
+      evaluate: async (): Promise<unknown> => undefined,
+      frames: (): unknown[] => [mainFrame],
+      isClosed: (): boolean => false,
+      mainFrame: (): unknown => mainFrame,
+      url: (): string => "https://www.stub-guide-retry.test/embedded",
+      waitForSelector: async (selector: string): Promise<unknown> => {
+
+        // The iframe wait ahead of the search resolves; the readiness wait that follows the fallback is where this row stops.
+        if(selector === "video") {
+
+          throw new Error(VIDEO_WAIT_FAILURE);
+        }
+
+        return {};
+      }
+    } as unknown as Page;
+
+    const running = initializePlayback(page, makeProfile({ needsIframeHandling: true }), { skipChannelSelection: true }, { ...deps, clock });
+    const rejection = assert.rejects(running, (error: unknown) => (error as Error).message === VIDEO_WAIT_FAILURE,
+      "the tune moved past the search and stopped at the video wait");
+
+    await settle();
+    assert.equal(clock.pending, 1, "the first cadence is parked on the injected clock, not on a global timer");
+
+    await drainClock(clock);
+    await rejection;
+
+    /* The window affords one scan plus one per cadence: the ceiling is checked only after a scan, so the search keeps asking until a scan lands at or past
+     * iframeInitDelay. That is Math.ceil(iframeInitDelay / 200) cadences of 200 ms each, and one more scan than that.
+     */
+    const cadences = Math.ceil(CONFIG.playback.iframeInitDelay / 200);
+
+    assert.deepEqual(clock.requested, Array.from({ length: cadences }, () => 200), "every cadence the iframe window afforded was registered on the injected clock");
+    assert.equal(clock.pending, 0, "nothing stayed registered on the clock once the search ended");
+
+    const messages = debug.mock.calls.map((call) => String(call.arguments[1]));
+
+    assert.ok(messages.some((m) => m.includes("falling back to the main page context")), "the search reported its fallback to the main page");
   });
 });

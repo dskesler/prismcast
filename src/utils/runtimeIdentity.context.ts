@@ -17,6 +17,7 @@ import type { RuntimeIdentityContext } from "./runtimeIdentity.ts";
 import { getBootSessionId } from "./bootSession.ts";
 import { isProcessRunning } from "./pid.ts";
 import { listProcesses } from "./processInspector.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* The product-identity token searched for in a process's command line. This mirrors the package name / SERVICE_NAME identity; it lives as a local constant
  * because the runtime-identity context must remain free of sideways imports into identity.ts. Matching is case-insensitive so launcher casing differences (e.g.
@@ -34,7 +35,8 @@ export function createDefaultRuntimeIdentityContext(): RuntimeIdentityContext {
 
     getBootSessionId: () => getBootSessionId(),
     isPidOurProcess: (pid: number): Nullable<boolean> => resolvePidIdentity(pid),
-    isProcessRunning
+    isProcessRunning,
+    now: (): number => systemClock.now()
   };
 }
 

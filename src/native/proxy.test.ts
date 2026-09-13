@@ -10,11 +10,27 @@
  * them.
  */
 import { createNativeProxy, manifestFailureThreshold, pruneKeyCache, resolveSegmentIv } from "./proxy.ts";
-import { describe, mock, test } from "node:test";
+import { describe, test } from "node:test";
 import type { NativeProxyOptions } from "./proxy.ts";
 import assert from "node:assert/strict";
 import { closePuppeteerStreamWssOnIdle } from "../testing.helpers.ts";
 import { deriveIvFromSequence } from "./decrypt.ts";
+
+/* A Disposable double standing in for the handle a clock's schedule answers with, paired with the count of its own disposals. That count is the whole
+ * observation the refresh-slot rows need: the proxy's contract is that arming a successor disposes its predecessor exactly once and that the stop disposes
+ * whichever handle is live.
+ */
+function makeRefreshHandle(): { disposals: number; handle: Disposable } {
+
+  const record: { disposals: number; handle: Disposable } = { disposals: 0, handle: { [Symbol.dispose]: (): void => undefined } };
+
+  record.handle = { [Symbol.dispose]: (): void => {
+
+    record.disposals++;
+  } };
+
+  return record;
+}
 
 // Schedule background-server cleanup on a 0ms unref'd timer that fires when the suite resolves so the runner can exit cleanly.
 closePuppeteerStreamWssOnIdle();
@@ -152,30 +168,17 @@ describe("NativeProxy.stop", () => {
     assert.equal(proxy.isStopped(), true, "stopped after stop");
   });
 
-  test("clears a token refresh timer set via setTokenRefreshTimer", () => {
+  test("disposes the token refresh handle set via setTokenRefreshTimer", () => {
 
-    // We register a real setTimeout as the token refresh timer; if stop() does not clear it, the callback fires after stop and the test runner detects the
-    // assertion failure inside the callback. We use a 50ms delay and assert the callback never runs.
+    // The stop path owns whatever the refresh slot holds, so a double that counts its own disposal is the whole observation: exactly one disposal, and no
+    // handle left live to fire a refresh against a proxy that has ended.
     const proxy = createNativeProxy(makeProxyOptions());
+    const refresh = makeRefreshHandle();
 
-    let timerFired = false;
-
-    const timer = setTimeout(() => {
-
-      timerFired = true;
-    }, 50);
-
-    proxy.setTokenRefreshTimer(timer);
+    proxy.setTokenRefreshTimer(refresh.handle);
     proxy.stop();
 
-    return new Promise<void>((resolve) => {
-
-      setTimeout(() => {
-
-        assert.equal(timerFired, false, "timer was cancelled by stop()");
-        resolve();
-      }, 100);
-    });
+    assert.equal(refresh.disposals, 1, "the stop disposed the handle the slot held");
   });
 
   test("a second stop() call does not throw", () => {
@@ -200,56 +203,40 @@ describe("NativeProxy.setTokenRefreshTimer", () => {
     // Boundary: setTokenRefreshTimer is purely a side-channel for the coordinator to register a cancel handle. None of the public counters or state observers
     // should change when a timer is registered.
     const proxy = createNativeProxy(makeProxyOptions());
-    const timer = setTimeout((): void => undefined, 100000);
+    const refresh = makeRefreshHandle();
 
-    proxy.setTokenRefreshTimer(timer);
+    proxy.setTokenRefreshTimer(refresh.handle);
 
     assert.equal(proxy.isStopped(), false, "isStopped unchanged");
     assert.equal(proxy.getStats().tokenRefreshes, 0, "tokenRefreshes unchanged");
 
-    clearTimeout(timer);
     proxy.stop();
   });
 
   test("retires the previous timer when a second one is armed", () => {
 
-    /* The proxy owns a single refresh timer slot, and this setter is the only site that writes it. A reschedule must therefore cancel the handle it replaces:
+    /* The proxy owns a single refresh slot, and this setter is the only site that writes it. A reschedule must therefore dispose the handle it replaces:
      * every refresh over a long recording arms a successor, so a setter that only overwrote the slot would leave each predecessor live, firing a refresh against
-     * a proxy whose newer schedule already speaks for it. The spy records which handles were cancelled while still cancelling them for real, so the timers this
-     * test creates cannot outlive it.
+     * a proxy whose newer schedule already speaks for it. Reading each double's own disposal count separates the two ways that can go wrong - a predecessor left
+     * alive, and a setter eager enough to dispose the successor it was just handed.
      */
     const proxy = createNativeProxy(makeProxyOptions());
-    const cleared: NodeJS.Timeout[] = [];
-    const realClearTimeout = globalThis.clearTimeout;
+    const first = makeRefreshHandle();
+    const second = makeRefreshHandle();
 
-    mock.method(globalThis, "clearTimeout", (timer: NodeJS.Timeout): void => {
+    proxy.setTokenRefreshTimer(first.handle);
 
-      cleared.push(timer);
-      realClearTimeout(timer);
-    });
+    assert.equal(first.disposals, 0, "the first arming has no predecessor to retire");
 
-    try {
+    proxy.setTokenRefreshTimer(second.handle);
 
-      const first = setTimeout((): void => undefined, 50);
-      const second = setTimeout((): void => undefined, 50);
+    assert.equal(first.disposals, 1, "arming a successor disposes the handle it replaced");
+    assert.equal(second.disposals, 0, "and leaves the successor it was handed live");
 
-      proxy.setTokenRefreshTimer(first);
+    proxy.stop();
 
-      assert.equal(cleared.length, 0, "the first arming has no predecessor to retire");
-
-      proxy.setTokenRefreshTimer(second);
-
-      assert.equal(cleared.length, 1, "arming a successor cancels exactly one handle");
-      assert.equal(cleared[0], first, "and the handle it cancels is the one it replaced");
-
-      proxy.stop();
-
-      assert.equal(cleared.length, 2, "the stop path retires the handle that is live");
-      assert.equal(cleared[1], second, "which is the successor, leaving no timer behind");
-    } finally {
-
-      mock.reset();
-    }
+    assert.equal(second.disposals, 1, "the stop path disposes the handle that is live");
+    assert.equal(first.disposals, 1, "leaving the predecessor at the one disposal it already had");
   });
 });
 

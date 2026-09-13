@@ -15,8 +15,8 @@
  *
  * Architectural notes (mirroring recovery-escalation.test.ts so the precedent is followed exactly):
  *
- *   1. recovery.ts is intentionally Clock-port-free. We use mock.timers.enable({ apis: ["Date"] }) to control Date.now() inside recordRecoveryAttempt and
- *      recordRecoverySuccess, and pass an explicit `now` argument into checkCircuitBreaker - the same shape the prior recovery suite uses.
+ *   1. recovery.ts is a pure decision core and holds no clock. Every function that needs an instant takes it as a trailing `now` argument - recordRecoveryAttempt,
+ *      recordRecoverySuccess, and checkCircuitBreaker alike - so the rows below supply synthetic timestamps and no timer mocking is involved.
  *
  *   2. The harness (createIntegrationContext / initializePersistence) is omitted on purpose. recovery.ts has no module-level singletons, no persistence, and no
  *      I/O - that is in fact the guarantee under test. Importing the harness would introduce filesystem state that is irrelevant to per-stream isolation and
@@ -28,7 +28,7 @@
 import type { CircuitBreakerState, RecoveryMetrics } from "../../../src/streaming/recovery.ts";
 import { RECOVERY_METHODS, checkCircuitBreaker, createRecoveryMetrics, getRecoveryMethod, recordRecoveryAttempt, recordRecoverySuccess,
   resetCircuitBreaker } from "../../../src/streaming/recovery.ts";
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
+import { describe, test } from "node:test";
 import { CONFIG } from "../../../src/config/index.ts";
 import assert from "node:assert/strict";
 
@@ -36,16 +36,6 @@ describe("recovery state machine - per-stream isolation across concurrent stream
 
   // Same baseline as recovery-escalation.test.ts so test-failure timestamps are consistent across both tiers.
   const baseTime = 1700000000000;
-
-  beforeEach(() => {
-
-    mock.timers.enable({ apis: ["Date"], now: baseTime });
-  });
-
-  afterEach(() => {
-
-    mock.timers.reset();
-  });
 
   function freshBreaker(): CircuitBreakerState {
 
@@ -68,11 +58,9 @@ describe("recovery state machine - per-stream isolation across concurrent stream
     // Sanity: independent object references at construction. A factory regression that returned a shared singleton would fail here before any mutation.
     assert.notEqual(streamA, streamB, "createRecoveryMetrics must return distinct objects for distinct callers");
 
-    recordRecoveryAttempt(streamA, getRecoveryMethod(1));
-    mock.timers.tick(800);
-    recordRecoveryAttempt(streamA, getRecoveryMethod(2));
-    mock.timers.tick(2000);
-    recordRecoveryAttempt(streamA, getRecoveryMethod(3));
+    recordRecoveryAttempt(streamA, getRecoveryMethod(1), baseTime);
+    recordRecoveryAttempt(streamA, getRecoveryMethod(2), baseTime + 800);
+    recordRecoveryAttempt(streamA, getRecoveryMethod(3), baseTime + 2800);
 
     // Stream A's counters reflect the three attempts, one per level.
     assert.equal(streamA.playUnmuteAttempts, 1, "stream A's L1 attempt counter incremented");
@@ -91,7 +79,7 @@ describe("recovery state machine - per-stream isolation across concurrent stream
     assert.equal(streamB.currentRecoveryStartTime, null, "stream B's currentRecoveryStartTime must remain null");
 
     // The contrapositive: now drive stream B through a single L1 attempt and confirm that streamA's L1 counter does not double-count.
-    recordRecoveryAttempt(streamB, getRecoveryMethod(1));
+    recordRecoveryAttempt(streamB, getRecoveryMethod(1), baseTime + 2800);
 
     assert.equal(streamB.playUnmuteAttempts, 1, "stream B's L1 attempt counter increments on its own attempt");
     assert.equal(streamA.playUnmuteAttempts, 1, "stream A's L1 counter must remain 1 - stream B's attempt must not leak back into stream A");
@@ -151,14 +139,12 @@ describe("recovery state machine - per-stream isolation across concurrent stream
     const breakerB = freshBreaker();
 
     // Both streams accumulate one attempt each in their metrics, and one failure each in their breakers.
-    recordRecoveryAttempt(metricsA, getRecoveryMethod(1));
-    mock.timers.tick(500);
-    recordRecoverySuccess(metricsA, RECOVERY_METHODS.playUnmute);
+    recordRecoveryAttempt(metricsA, getRecoveryMethod(1), baseTime);
+    recordRecoverySuccess(metricsA, RECOVERY_METHODS.playUnmute, baseTime + 500);
     checkCircuitBreaker(breakerA, baseTime);
 
-    recordRecoveryAttempt(metricsB, getRecoveryMethod(2));
-    mock.timers.tick(500);
-    recordRecoverySuccess(metricsB, RECOVERY_METHODS.sourceReload);
+    recordRecoveryAttempt(metricsB, getRecoveryMethod(2), baseTime + 500);
+    recordRecoverySuccess(metricsB, RECOVERY_METHODS.sourceReload, baseTime + 1000);
     checkCircuitBreaker(breakerB, baseTime + 100);
 
     // Snapshot the fields that should NOT change after the reset. We use a structural snapshot rather than per-field assertions so a regression that touches a

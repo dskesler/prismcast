@@ -2,6 +2,8 @@
  *
  * health.ts: Channel health and domain authentication state persistence for PrismCast.
  */
+import { TimerRegistry, systemClock } from "homebridge-plugin-utils";
+import type { Clock } from "homebridge-plugin-utils";
 import { EventEmitter } from "node:events";
 import { LOG } from "../utils/index.ts";
 import type { Migration } from "./persistence.ts";
@@ -117,14 +119,19 @@ const HEALTH_TTL = 7 * 24 * 60 * 60 * 1000;
 // Debounce interval for writes to health.json.
 const FLUSH_DELAY = 2000;
 
-// Returns true if the given timestamp is older than HEALTH_TTL.
-const isHealthExpired = (timestamp: number): boolean => (Date.now() - timestamp) >= HEALTH_TTL;
+// The registry key the flush debounce is armed under. One key means a second arm inside the window replaces the first rather than adding to it.
+const FLUSH_TIMER_KEY = "flush";
+
+// Returns true if the given timestamp is older than HEALTH_TTL. The instant is the caller's, read once per operation, so a prune or a load compares every entry
+// against one reading rather than against a clock that moves underneath the loop.
+const isHealthExpired = (timestamp: number, now: number): boolean => (now - timestamp) >= HEALTH_TTL;
 
 /* Returns true when a domain auth entry has aged out. Only verified entries expire - verification is aging evidence with a shelf life. Needs-sign-in entries are
  * exempt: they describe a standing account condition that only new evidence (a sign-in followed by success, or an unproven-access discovery) resolves. This predicate
- * is the single expression of that status-aware TTL rule, shared by the load filter, the bulk prune, and the single-key read path.
+ * is the single expression of that status-aware TTL rule, shared by the load filter, the bulk prune, and the single-key read path. The instant is the caller's,
+ * on the same terms as isHealthExpired.
  */
-const isDomainAuthExpired = (entry: DomainAuthEntry): boolean => (entry.status === "verified") && isHealthExpired(entry.timestamp);
+const isDomainAuthExpired = (entry: DomainAuthEntry, now: number): boolean => (entry.status === "verified") && isHealthExpired(entry.timestamp, now);
 
 /* Converts a persisted domain auth value to the entry shape. Bare numbers are the legacy timestamp form, whose presence meant verified. The v1 to v2 schema migration
  * converts whole files through this function, and the load path applies it per-value as well: an older binary performing a forward-compatible read of a v2 file
@@ -135,13 +142,20 @@ const adoptDomainAuthValue = (value: number | DomainAuthEntry): DomainAuthEntry 
 
 // In-memory state.
 
+/* The maps below and the two bindings under them are the whole store. loadHealthState is what establishes it: the maps are hydrated there, and the clock and
+ * the registry are set there too, so one call decides where every stamp, every expiry test, and the flush debounce take their time from.
+ */
 const channelHealth = new Map<string, ChannelHealthEntry>();
 
 // Domain authentication state. The unknown state is the absence of an entry; verified and needs-sign-in are entry-valued per DomainAuthEntry.
 const domainAuth = new Map<string, DomainAuthEntry>();
 
-// Debounce timer for flushHealthState().
-let flushTimer: Nullable<ReturnType<typeof setTimeout>> = null;
+// The clock every stamp and every expiry test in this module reads. loadHealthState sets it, so a test's load puts the whole store on its own clock.
+let healthClock: Clock = systemClock;
+
+// The registry the flush debounce lives on. The library's default clock is the system clock, so the registry that exists before any load arms platform timers,
+// which is what a mark made before the load needs; loadHealthState replaces it with one built on the caller's clock.
+let healthTimers = new TimerRegistry();
 
 /* Whether the initial load has hydrated the maps above. Both maps start empty, so they describe real state only once loadHealthState has read health.json into
  * them...writeHealthState consults this so a shutdown signal arriving before the load completes cannot overwrite a populated health.json with the empty maps.
@@ -155,9 +169,11 @@ let healthStateLoaded = false;
  */
 const pruneExpiredEntries = (): void => {
 
+  const now = healthClock.now();
+
   for(const [ key, entry ] of channelHealth) {
 
-    if(isHealthExpired(entry.timestamp)) {
+    if(isHealthExpired(entry.timestamp, now)) {
 
       channelHealth.delete(key);
     }
@@ -165,7 +181,7 @@ const pruneExpiredEntries = (): void => {
 
   for(const [ key, entry ] of domainAuth) {
 
-    if(isDomainAuthExpired(entry)) {
+    if(isDomainAuthExpired(entry, now)) {
 
       domainAuth.delete(key);
     }
@@ -273,17 +289,26 @@ const healthStore = createFileStore<HealthState>({
 /**
  * Loads the health state from health.json into memory. Expired entries are pruned during loading. Called once at startup from app.ts. Loading is also what arms
  * persistence - writeHealthState serializes the in-memory maps only once this function has hydrated them from disk.
+ * @param clock - The clock every stamp and expiry test reads and the flush debounce arms on; defaults to the system clock.
  */
-export async function loadHealthState(): Promise<void> {
+export async function loadHealthState(clock: Clock = systemClock): Promise<void> {
+
+  /* A load is the store's one establishment, so it retires whatever debounce the previous registry held and puts the store on the caller's clock. A flush armed
+   * before the load would otherwise fire afterwards and rewrite the state the load just read.
+   */
+  healthTimers.dispose();
+  healthClock = clock;
+  healthTimers = new TimerRegistry({ clock });
 
   const result = await healthStore.read();
+  const now = clock.now();
 
   channelHealth.clear();
   domainAuth.clear();
 
   for(const [ key, entry ] of Object.entries(result.data.channels)) {
 
-    if(!isHealthExpired(entry.timestamp)) {
+    if(!isHealthExpired(entry.timestamp, now)) {
 
       channelHealth.set(key, entry);
     }
@@ -295,7 +320,7 @@ export async function loadHealthState(): Promise<void> {
     // v2-stamped file, which the migration runner never revisits.
     const entry = adoptDomainAuthValue(value);
 
-    if(!isDomainAuthExpired(entry)) {
+    if(!isDomainAuthExpired(entry, now)) {
 
       domainAuth.set(key, entry);
     }
@@ -345,18 +370,11 @@ async function writeHealthState(): Promise<void> {
 /**
  * Writes the current in-memory health state to health.json via the transactional file store. Debounced - multiple calls within FLUSH_DELAY are coalesced into a
  * single write. The store's serialization queue handles the case where a flush fires while a prior mutation is still in flight, so no in-module write-in-progress
- * tracking is needed.
+ * tracking is needed. The registry's replace-on-register rule under one key is the debounce itself: a second arm inside the window retires the first.
  */
 function flushHealthState(): void {
 
-  if(flushTimer) {
-
-    clearTimeout(flushTimer);
-  }
-
-  flushTimer = setTimeout(() => {
-
-    flushTimer = null;
+  healthTimers.setTimeout(FLUSH_TIMER_KEY, () => {
 
     void writeHealthState().catch((error: unknown) => {
 
@@ -373,11 +391,7 @@ function flushHealthState(): void {
  */
 export async function flushHealthStateNow(): Promise<void> {
 
-  if(flushTimer) {
-
-    clearTimeout(flushTimer);
-    flushTimer = null;
-  }
+  healthTimers.clear(FLUSH_TIMER_KEY);
 
   // Best-effort write: a store failure during shutdown is logged but must not propagate, or it would abort the rest of the shutdown teardown (the caller awaits this
   // without its own guard). This mirrors the debounced path's .catch above - both write paths log and continue on error rather than throwing.
@@ -415,7 +429,7 @@ function removeDomainAuth(domain: string): void {
   domainAuth.delete(domain);
 
   flushHealthState();
-  healthEmitter.emit("healthChanged", { channelKey: "", domain, status: "failed", timestamp: Date.now() } satisfies HealthEvent);
+  healthEmitter.emit("healthChanged", { channelKey: "", domain, status: "failed", timestamp: healthClock.now() } satisfies HealthEvent);
 }
 
 // Public API.
@@ -430,7 +444,7 @@ function removeDomainAuth(domain: string): void {
  */
 export function markChannelSuccess(channelKey: string, domain: string, markAuth = true): void {
 
-  const now = Date.now();
+  const now = healthClock.now();
 
   channelHealth.set(channelKey, { domain, status: "success", timestamp: now });
 
@@ -453,7 +467,7 @@ export function markChannelSuccess(channelKey: string, domain: string, markAuth 
  */
 export function markDomainAuth(domain: string): void {
 
-  setDomainVerified("", domain, Date.now());
+  setDomainVerified("", domain, healthClock.now());
 }
 
 /**
@@ -463,7 +477,7 @@ export function markDomainAuth(domain: string): void {
  */
 export function markDomainAuthRequired(domain: string): void {
 
-  const now = Date.now();
+  const now = healthClock.now();
 
   domainAuth.set(domain, { status: "needsLogin", timestamp: now });
 
@@ -495,7 +509,7 @@ export function clearDomainAuthRequirement(domain: string): void {
  */
 export function markChannelFailure(channelKey: string, domain: string): void {
 
-  const now = Date.now();
+  const now = healthClock.now();
 
   channelHealth.set(channelKey, { domain, status: "failed", timestamp: now });
 
@@ -521,7 +535,7 @@ export function getChannelHealth(channelKey: string, domain: string): Nullable<{
 
   // Stale entry - older than TTL. We delete it here as well as returning null so that a key that is read but never re-marked does not linger in memory; this read path
   // touches exactly one key, so we prune just that key rather than paying for a full-map scan.
-  if(isHealthExpired(entry.timestamp)) {
+  if(isHealthExpired(entry.timestamp, healthClock.now())) {
 
     channelHealth.delete(channelKey);
 
@@ -554,7 +568,7 @@ export function getDomainAuthState(domain: string): Nullable<DomainAuthEntry> {
 
   // Stale entry - only verified entries age out. We delete it here as well as returning null so that a domain that is read but never re-marked does not linger in
   // memory; this read path touches exactly one key, so we prune just that key rather than paying for a full-map scan.
-  if(isDomainAuthExpired(entry)) {
+  if(isDomainAuthExpired(entry, healthClock.now())) {
 
     domainAuth.delete(domain);
 

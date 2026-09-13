@@ -3,11 +3,11 @@
  * hlsSegments.readiness.test.ts: Unit tests for the playlist + init-segment readiness signals exposed by hlsSegments.ts - waitForPlaylist and waitForInitSegment.
  * Storage primitives (storeSegment, getSegment, audio/playlist/init variants) live in hlsSegments.test.ts.
  */
+import { TestClock, settle } from "homebridge-plugin-utils/testing";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { registerStream, unregisterStream } from "./registry.ts";
 import { storeInitSegment, storeNamedInitSegment, updatePlaylist, waitForInitSegment, waitForPlaylist } from "./hlsSegments.ts";
 import assert from "node:assert/strict";
-import { makeFakeClock } from "../utils/clock.helpers.ts";
 import { makeRegistryEntry } from "./registry.helpers.ts";
 
 /* makeAndRegisterStream wraps the canonical makeRegistryEntry factory with registerStream so the test setup pattern is one line.
@@ -37,31 +37,35 @@ describe("waitForPlaylist", () => {
 
   test("returns true when the playlist becomes ready before the timeout", async () => {
 
-    // Resolve the playlist before the wait so the inner promise wins the race. With the fake clock's pass-through waitWithTimeout, the result is driven by the
-    // inner promise's resolution; no real timer is involved and no scheduling order matters.
+    // Resolve the playlist before the wait so the inner promise wins the race. The virtual clock is never advanced, so the bound cannot fire and the result is
+    // driven by the inner promise's resolution alone.
     updatePlaylist(streamId, "#EXTM3U");
 
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
     const ready = await waitForPlaylist(streamId, 1000, clock);
 
     assert.equal(ready, true);
+
+    await settle();
+
+    assert.equal(clock.pending, 0, "the bound was cancelled once the readiness arm won");
   });
 
   test("returns false when the timeout fires before any playlist arrives", async () => {
 
-    // The fake clock's waitWithTimeout rejects immediately to simulate the timer winning. waitForReady's .catch maps the rejection to false. Locks the contract
-    // without depending on real-time delay budgets.
-    const { clock } = makeFakeClock({
+    // Advancing to the bound is what lets the timer win, and waitForReady's .catch maps the rejection to false. Locks the contract without depending on
+    // real-time delay budgets.
+    const clock = new TestClock();
+    const pending = waitForPlaylist(streamId, 5, clock);
 
-      waitWithTimeout: async (_promise, timeoutMs) => {
+    await settle();
 
-        throw new Error("timed out after " + String(timeoutMs) + "ms.");
-      }
-    });
+    assert.equal(clock.nextDeadline, 5, "the bound is armed at the timeout the caller asked for");
 
-    const ready = await waitForPlaylist(streamId, 5, clock);
+    clock.advance(5);
 
-    assert.equal(ready, false);
+    assert.equal(await pending, false);
+    assert.equal(clock.pending, 0, "nothing stays registered once the bound has fired");
   });
 
   test("returns false for an unknown stream", async () => {
@@ -87,28 +91,32 @@ describe("waitForInitSegment", () => {
 
   test("returns true when the init segment becomes ready before the timeout", async () => {
 
-    // Resolve the init segment before the wait so the inner promise wins the race; the fake clock's pass-through waitWithTimeout forwards the resolved value.
+    // Resolve the init segment before the wait so the inner promise wins the race; the virtual clock is never advanced, so its bound cannot fire.
     storeInitSegment(streamId, Buffer.from("init"));
 
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
     const ready = await waitForInitSegment(streamId, 1000, clock);
 
     assert.equal(ready, true);
+
+    await settle();
+
+    assert.equal(clock.pending, 0, "the bound was cancelled once the readiness arm won");
   });
 
   test("returns false when the timeout fires before any init segment arrives", async () => {
 
-    const { clock } = makeFakeClock({
+    const clock = new TestClock();
+    const pending = waitForInitSegment(streamId, 5, clock);
 
-      waitWithTimeout: async (_promise, timeoutMs) => {
+    await settle();
 
-        throw new Error("timed out after " + String(timeoutMs) + "ms.");
-      }
-    });
+    assert.equal(clock.nextDeadline, 5, "the bound is armed at the timeout the caller asked for");
 
-    const ready = await waitForInitSegment(streamId, 5, clock);
+    clock.advance(5);
 
-    assert.equal(ready, false);
+    assert.equal(await pending, false);
+    assert.equal(clock.pending, 0, "nothing stays registered once the bound has fired");
   });
 
   test("returns false for an unknown stream", async () => {
@@ -134,8 +142,8 @@ describe("readiness waits resolve on stream termination", () => {
       readinessSettled = true;
     });
 
-    // The default fake clock forwards the inner promise and never fires a timeout, so only the readiness or terminated arm can settle the race.
-    const { clock } = makeFakeClock();
+    // The virtual clock is never advanced, so its bound cannot fire and only the readiness or terminated arm can settle the race.
+    const clock = new TestClock();
     const pending = waitForPlaylist(entry.id, 30000, clock);
 
     // Emit terminated directly on the entry's emitter. The real terminateStream additionally strips every listener, which would mask the hygiene assertions below, so
@@ -165,7 +173,7 @@ describe("readiness waits resolve on stream termination", () => {
       readinessSettled = true;
     });
 
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
     const pending = waitForInitSegment(entry.id, 30000, clock);
 
     entry.hls.segmentEmitter.emit("terminated");
@@ -189,7 +197,7 @@ describe("readiness waits resolve on stream termination", () => {
 
     assert.equal(terminatedEntry.hls.segmentEmitter.listenerCount("terminated"), 0, "no terminated listeners before the wait");
 
-    const { clock: terminatedClock } = makeFakeClock();
+    const terminatedClock = new TestClock();
     const terminatedPending = waitForPlaylist(terminatedEntry.id, 30000, terminatedClock);
 
     assert.equal(terminatedEntry.hls.segmentEmitter.listenerCount("terminated"), 1, "the wait attaches exactly one terminated listener");
@@ -207,7 +215,7 @@ describe("readiness waits resolve on stream termination", () => {
 
     registerStream(readyEntry);
 
-    const { clock: readyClock } = makeFakeClock();
+    const readyClock = new TestClock();
     const readyPending = waitForPlaylist(readyEntry.id, 30000, readyClock);
 
     assert.equal(readyEntry.hls.segmentEmitter.listenerCount("terminated"), 1, "the wait attaches exactly one terminated listener");
@@ -265,7 +273,7 @@ describe("named init readiness is keyed on the video track (T13)", () => {
 
     registerStream(entry);
 
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
     const pending = waitForInitSegment(entry.id, 30000, clock);
 
     storeNamedInitSegment(entry.id, "video", "init-v0.mp4", Buffer.from("video-init"));

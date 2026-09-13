@@ -6,10 +6,10 @@
  */
 import { RECOVERY_METHODS, createRecoveryMetrics, formatRecoveryDuration, formatRecoveryMetricsSummary, getTotalRecoveryAttempts, recordRecoveryAttempt,
   recordRecoverySuccess } from "./recovery.ts";
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
+import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-// The reference instant every mocked clock in this file counts from, so a row's expected timestamps read as offsets rather than absolute epochs.
+// The reference instant every row in this file counts from, so a row's expected timestamps read as offsets rather than absolute epochs.
 const BASE_TIME_MS = 1700000000000;
 
 describe("createRecoveryMetrics", () => {
@@ -73,21 +73,11 @@ describe("getTotalRecoveryAttempts", () => {
 });
 describe("recordRecoveryAttempt", () => {
 
-  beforeEach(() => {
-
-    mock.timers.enable({ apis: ["Date"], now: BASE_TIME_MS });
-  });
-
-  afterEach(() => {
-
-    mock.timers.reset();
-  });
-
   test("increments the attempt counter for the named method", () => {
 
     const metrics = createRecoveryMetrics();
 
-    recordRecoveryAttempt(metrics, RECOVERY_METHODS.playUnmute);
+    recordRecoveryAttempt(metrics, RECOVERY_METHODS.playUnmute, BASE_TIME_MS);
 
     assert.equal(metrics.playUnmuteAttempts, 1, "play/unmute counter incremented");
     assert.equal(metrics.pageNavigationAttempts, 0, "other counters untouched");
@@ -99,9 +89,9 @@ describe("recordRecoveryAttempt", () => {
 
     const metrics = createRecoveryMetrics();
 
-    recordRecoveryAttempt(metrics, RECOVERY_METHODS.sourceReload);
+    recordRecoveryAttempt(metrics, RECOVERY_METHODS.sourceReload, BASE_TIME_MS);
 
-    assert.equal(metrics.currentRecoveryStartTime, BASE_TIME_MS, "start time captured from Date.now()");
+    assert.equal(metrics.currentRecoveryStartTime, BASE_TIME_MS, "start time captured from the supplied instant");
     assert.equal(metrics.currentRecoveryMethod, RECOVERY_METHODS.sourceReload, "current method tracked");
   });
 
@@ -111,7 +101,7 @@ describe("recordRecoveryAttempt", () => {
     // the implementation captures them unconditionally - that's the contract; locking it.
     const metrics = createRecoveryMetrics();
 
-    recordRecoveryAttempt(metrics, "totally-bogus-method");
+    recordRecoveryAttempt(metrics, "totally-bogus-method", BASE_TIME_MS);
 
     assert.equal(getTotalRecoveryAttempts(metrics), 0, "no counter should have moved for unknown method");
     assert.equal(metrics.currentRecoveryMethod, "totally-bogus-method", "current method still tracked verbatim");
@@ -121,9 +111,9 @@ describe("recordRecoveryAttempt", () => {
 
     const metrics = createRecoveryMetrics();
 
-    recordRecoveryAttempt(metrics, RECOVERY_METHODS.tabReplacement);
-    recordRecoveryAttempt(metrics, RECOVERY_METHODS.tabReplacement);
-    recordRecoveryAttempt(metrics, RECOVERY_METHODS.tabReplacement);
+    recordRecoveryAttempt(metrics, RECOVERY_METHODS.tabReplacement, BASE_TIME_MS);
+    recordRecoveryAttempt(metrics, RECOVERY_METHODS.tabReplacement, BASE_TIME_MS);
+    recordRecoveryAttempt(metrics, RECOVERY_METHODS.tabReplacement, BASE_TIME_MS);
 
     assert.equal(metrics.tabReplacementAttempts, 3, "three sequential attempts increment the counter three times");
   });
@@ -131,23 +121,12 @@ describe("recordRecoveryAttempt", () => {
 
 describe("recordRecoverySuccess", () => {
 
-  beforeEach(() => {
-
-    mock.timers.enable({ apis: ["Date"], now: BASE_TIME_MS });
-  });
-
-  afterEach(() => {
-
-    mock.timers.reset();
-  });
-
   test("increments the success counter and clears in-progress recovery state", () => {
 
     const metrics = createRecoveryMetrics();
 
-    recordRecoveryAttempt(metrics, RECOVERY_METHODS.playUnmute);
-    mock.timers.tick(2500);
-    recordRecoverySuccess(metrics, RECOVERY_METHODS.playUnmute);
+    recordRecoveryAttempt(metrics, RECOVERY_METHODS.playUnmute, BASE_TIME_MS);
+    recordRecoverySuccess(metrics, RECOVERY_METHODS.playUnmute, BASE_TIME_MS + 2500);
 
     assert.equal(metrics.playUnmuteSuccesses, 1, "success counter incremented");
     assert.equal(metrics.currentRecoveryStartTime, null, "in-progress start cleared");
@@ -158,14 +137,16 @@ describe("recordRecoverySuccess", () => {
 
     const metrics = createRecoveryMetrics();
 
-    recordRecoveryAttempt(metrics, RECOVERY_METHODS.sourceReload);
-    mock.timers.tick(1000);
-    recordRecoverySuccess(metrics, RECOVERY_METHODS.sourceReload);
+    let now = BASE_TIME_MS;
 
-    mock.timers.tick(50000);
-    recordRecoveryAttempt(metrics, RECOVERY_METHODS.sourceReload);
-    mock.timers.tick(2500);
-    recordRecoverySuccess(metrics, RECOVERY_METHODS.sourceReload);
+    recordRecoveryAttempt(metrics, RECOVERY_METHODS.sourceReload, now);
+    now += 1000;
+    recordRecoverySuccess(metrics, RECOVERY_METHODS.sourceReload, now);
+
+    now += 50000;
+    recordRecoveryAttempt(metrics, RECOVERY_METHODS.sourceReload, now);
+    now += 2500;
+    recordRecoverySuccess(metrics, RECOVERY_METHODS.sourceReload, now);
 
     assert.equal(metrics.totalRecoveryTimeMs, 3500, "two successful recoveries sum 1000ms + 2500ms");
   });
@@ -173,10 +154,10 @@ describe("recordRecoverySuccess", () => {
   test("does NOT accumulate duration when called without a preceding attempt (no start time recorded)", () => {
 
     // Negative test: if a caller invokes success without first calling attempt, the start time is null. The function must guard against that and not contribute
-    // a bogus duration (Date.now() - null would coerce to a huge number).
+    // a bogus duration (the supplied instant minus null would coerce to a huge number).
     const metrics = createRecoveryMetrics();
 
-    recordRecoverySuccess(metrics, RECOVERY_METHODS.playUnmute);
+    recordRecoverySuccess(metrics, RECOVERY_METHODS.playUnmute, BASE_TIME_MS);
 
     assert.equal(metrics.totalRecoveryTimeMs, 0, "no duration accumulated when start time was never set");
     assert.equal(metrics.playUnmuteSuccesses, 1, "but the success counter still increments");
@@ -186,9 +167,8 @@ describe("recordRecoverySuccess", () => {
 
     const metrics = createRecoveryMetrics();
 
-    recordRecoveryAttempt(metrics, RECOVERY_METHODS.tabReplacement);
-    mock.timers.tick(500);
-    recordRecoverySuccess(metrics, "totally-bogus-method");
+    recordRecoveryAttempt(metrics, RECOVERY_METHODS.tabReplacement, BASE_TIME_MS);
+    recordRecoverySuccess(metrics, "totally-bogus-method", BASE_TIME_MS + 500);
 
     assert.equal(metrics.tabReplacementSuccesses, 0, "unknown method does not increment any success counter");
     assert.equal(metrics.currentRecoveryMethod, null, "in-progress state still cleared");
@@ -198,38 +178,28 @@ describe("recordRecoverySuccess", () => {
 
 describe("formatRecoveryDuration", () => {
 
-  beforeEach(() => {
-
-    mock.timers.enable({ apis: ["Date"], now: 1700000010500 });
-  });
-
-  afterEach(() => {
-
-    mock.timers.reset();
-  });
-
   test("formats elapsed milliseconds since startTime as seconds with one decimal", () => {
 
     // 10500ms elapsed -> "10.5s".
-    assert.equal(formatRecoveryDuration(BASE_TIME_MS), "10.5s");
+    assert.equal(formatRecoveryDuration(BASE_TIME_MS, 1700000010500), "10.5s");
   });
 
   test("rounds to the nearest tenth at the boundary", () => {
 
     // 1499ms -> "1.5s" via toFixed(1).
-    assert.equal(formatRecoveryDuration(1700000009001), "1.5s");
+    assert.equal(formatRecoveryDuration(1700000009001, 1700000010500), "1.5s");
   });
 
   test("returns 0.0s for a startTime equal to now (zero elapsed)", () => {
 
     // Boundary: zero elapsed.
-    assert.equal(formatRecoveryDuration(1700000010500), "0.0s");
+    assert.equal(formatRecoveryDuration(1700000010500, 1700000010500), "0.0s");
   });
 
   test("handles a future startTime (negative elapsed) without throwing", () => {
 
     // Boundary: clock skew or out-of-order calls. The function does not guard against negative input; we lock the resulting "-N.Ns" rather than crashing.
-    assert.equal(formatRecoveryDuration(1700000011500), "-1.0s");
+    assert.equal(formatRecoveryDuration(1700000011500, 1700000010500), "-1.0s");
   });
 });
 

@@ -8,14 +8,21 @@
  */
 import type { AddressInfo, Server } from "node:net";
 import type { Express, Request, Response } from "express";
-import { after, before, describe, mock, test } from "node:test";
+import { after, before, describe, test } from "node:test";
 import { makeExpressStub, makeReqRes } from "./express.helpers.ts";
+import { registerStream, unregisterStream } from "../streaming/registry.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { RouteCapture } from "./express.helpers.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { closePuppeteerStreamWss } from "../testing.helpers.ts";
 import { emitChannelUpdate } from "../streaming/statusEmitter.ts";
 import express from "express";
+import { makeRegistryEntry } from "../streaming/registry.helpers.ts";
 import { setupStreamsEndpoint } from "./streams.ts";
+
+// The heartbeat cadence the installer arms, as sse.test.ts declares it, so the row below advances exactly one interval at a time.
+const HEARTBEAT_INTERVAL_MS = 30000;
 
 interface StreamsListResponse {
 
@@ -29,11 +36,11 @@ interface ErrorResponse {
   error?: string;
 }
 
-function makeServer(): Promise<{ port: number; server: Server }> {
+function makeServer(clock?: Clock): Promise<{ port: number; server: Server }> {
 
   const app = express();
 
-  setupStreamsEndpoint(app);
+  setupStreamsEndpoint(app, clock);
 
   return new Promise((resolve, reject) => {
 
@@ -111,6 +118,32 @@ describe("setupStreamsEndpoint - GET /streams", () => {
 
     assert.match(res.headers.get("content-type") ?? "", /application\/json/);
     await res.json();
+  });
+
+  test("measures each stream's duration against the injected clock", async () => {
+
+    // A virtual clock a minute in and a stream registered five seconds before it: the wall clock would report a duration in the billions of seconds.
+    const clock = new TestClock();
+
+    clock.advance(60000);
+
+    const created = await makeServer(clock);
+    const entry = makeRegistryEntry({ startTime: clock.now() - 5000 });
+
+    registerStream(entry);
+
+    try {
+
+      const res = await fetch("http://127.0.0.1:" + String(created.port) + "/streams");
+      const body = await res.json() as StreamsListResponse;
+      const listed = body.streams.find((stream) => (stream as { id: number }).id === entry.id) as { duration: number } | undefined;
+
+      assert.equal(listed?.duration, 5, "the duration is measured against the clock the factory was given");
+    } finally {
+
+      unregisterStream(entry.id);
+      await closeServer(created.server);
+    }
   });
 });
 
@@ -230,11 +263,11 @@ describe("setupStreamsEndpoint - GET /streams/status (SSE handshake)", () => {
 // This asserts the named-event forwarding contract (subsequent live events from subscribeToStatus reach the wire as `event: <name>\ndata: <json>\n\n`) and the
 // close-cleanup guarantee (post-close emits do not reach the wire AND the heartbeat stops). The named-event forwarding is what no tier currently observes
 // beyond the initial snapshot frame - a regression that swapped subscribeToStatus for a no-op would still pass the existing fetch-based suite.
-function findStreamsStatusHandler(): RouteCapture {
+function findStreamsStatusHandler(clock?: Clock): RouteCapture {
 
   const stub = makeExpressStub();
 
-  setupStreamsEndpoint(stub.app as Express);
+  setupStreamsEndpoint(stub.app as Express, clock);
 
   const route = stub.routes.find((r) => (r.method === "get") && (r.path === "/streams/status"));
 
@@ -328,33 +361,27 @@ describe("setupStreamsEndpoint - GET /streams/status (direct-handler wire bytes)
 
   test("req.on('close') handler clears the heartbeat - subsequent ticks do not produce writes", () => {
 
-    // Asserts streams.ts - the req.on("close") teardown handler must run sse.close(), which clears the heartbeat interval. We use mock.timers to drive the interval
-    // deterministically: confirm one tick fires before close, then call the close handler and confirm subsequent ticks produce no writes.
-    mock.timers.enable({ apis: ["setInterval"] });
+    // Asserts streams.ts - the req.on("close") teardown handler must run sse.close(), which disposes the heartbeat. The heartbeat is driven on the clock the
+    // factory is handed, so one advance while the connection is open produces a frame, and an advance after close produces none.
+    const clock = new TestClock();
+    const route = findStreamsStatusHandler(clock);
+    const { req, res, triggerReqEvent, write } = makeReqRes();
 
-    try {
+    invokeStreamsStatusHandler(route, req, res);
 
-      const route = findStreamsStatusHandler();
-      const { req, res, triggerReqEvent, write } = makeReqRes();
+    // The snapshot writes happened synchronously at install. Reset so we only observe the heartbeat.
+    write.mock.resetCalls();
 
-      invokeStreamsStatusHandler(route, req, res);
+    // The heartbeat fires every 30s; confirm it ticks before close.
+    clock.advance(HEARTBEAT_INTERVAL_MS);
+    assert.equal(write.mock.callCount(), 1, "heartbeat fires while connection is open");
+    assert.deepEqual(write.mock.calls[0]?.arguments, ["event: heartbeat\ndata: \n\n"]);
 
-      // The snapshot writes happened synchronously at install. Reset so we only observe the heartbeat.
-      write.mock.resetCalls();
+    triggerReqEvent("close");
 
-      // The heartbeat fires every 30s; confirm it ticks before close.
-      mock.timers.tick(30000);
-      assert.equal(write.mock.callCount(), 1, "heartbeat fires while connection is open");
-      assert.deepEqual(write.mock.calls[0]?.arguments, ["event: heartbeat\ndata: \n\n"]);
-
-      triggerReqEvent("close");
-
-      // Advance another full interval - no further writes.
-      mock.timers.tick(30000);
-      assert.equal(write.mock.callCount(), 1, "no heartbeat after close()");
-    } finally {
-
-      mock.timers.reset();
-    }
+    // Advance another full interval - no further writes.
+    clock.advance(HEARTBEAT_INTERVAL_MS);
+    assert.equal(write.mock.callCount(), 1, "no heartbeat after close()");
+    assert.equal(clock.pending, 0, "the close disposed the heartbeat");
   });
 });

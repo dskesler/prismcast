@@ -14,18 +14,23 @@
  *      cleared in runPrecacheCycle's finally block.
  */
 import type { AuthWallIndicators, DiscoveredChannel, Nullable, ProviderModule } from "../types/index.ts";
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
+import { afterEach, beforeEach, describe, test } from "node:test";
+import { defaultPrecachingDeps, recordDiscoveryOutcome, startPrecaching, stopPrecaching } from "./precaching.ts";
 import { getDomainAuthState, markDomainAuth, markDomainAuthRequired } from "../config/health.ts";
-import { recordDiscoveryOutcome, startPrecaching } from "./precaching.ts";
 import { CONFIG } from "../config/index.ts";
 import { LOG } from "../utils/index.ts";
 import type { Page } from "puppeteer-core";
 import type { PersistedLineupChannel } from "../config/providerLineups.ts";
 import type { PrecachingDeps } from "./precaching.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
+import { useHealthStoreOnClock } from "../config/health.helpers.ts";
 
-// The reference instant every mocked clock in this file counts from, so a row's expected timestamps read as offsets rather than absolute epochs.
+// The reference instant every clock in this file counts from, so a row's expected timestamps read as offsets rather than absolute epochs.
 const BASE_TIME_MS = 1700000000000;
+
+// The teardown for the health store establishment the discovery-outcome rows hold, assigned by that describe's setup.
+let disposeHealthStore: () => Promise<void>;
 
 // The lineup writes the recorder issues, captured by the injected port below so each case can assert what was persisted without touching a real file.
 let persistedLineups: { channels: PersistedLineupChannel[]; slug: string }[] = [];
@@ -48,6 +53,10 @@ const recorderDeps = {
 
 describe("startPrecaching", () => {
 
+  // The delay the scheduler waits before the cycle runs, mirroring the module-private PRECACHE_DELAY in precaching.ts so the ledger below reads as a number the
+  // row states rather than one it imports.
+  const PRECACHE_DELAY_MS = 5000;
+
   let originalServices: string[];
 
   beforeEach(() => {
@@ -61,84 +70,92 @@ describe("startPrecaching", () => {
   afterEach(() => {
 
     CONFIG.channels.precacheServices = originalServices;
-    mock.timers.reset();
+
+    // Drain whatever a row left scheduled, so a pending cycle cannot outlive the test that armed it. A no-op when nothing is pending.
+    stopPrecaching();
   });
 
   test("returns immediately and schedules no work when precacheServices is empty", () => {
 
-    // The first guard: with no services configured, the function must return without scheduling any timer. We enable mock.timers and verify the timer queue
-    // remains empty after the call.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    // The first guard: with no services configured, the function must return without arming anything on the clock its dependencies carry. The clock's own pending
+    // count is the instrument - an arm that slipped past the guard would show up there.
+    const clock = new TestClock();
 
     assert.doesNotThrow(() => {
 
-      startPrecaching();
+      startPrecaching({ ...defaultPrecachingDeps, clock });
     }, "empty precache list -> clean no-op");
 
-    // mock.timers' tick exposes whether anything is queued by examining the internal queue. We tick a long way; if any callback fires it will throw because the
-    // cycle would try to call getCurrentBrowser. The empty-list guard means tick is a clean no-op.
-    assert.doesNotThrow(() => {
-
-      mock.timers.runAll();
-    }, "no scheduled work means runAll completes without invoking the cycle");
+    assert.equal(clock.pending, 0, "the empty-list guard armed nothing on the injected clock");
   });
 
   test("returns silently when precacheServices contains only entries (the no-services-configured case is a no-op even after mutation)", () => {
 
     // Boundary: the guard explicitly checks length === 0. This test confirms that with an empty array the early-exit short-circuits and the function remains safely
     // callable without scheduling any work.
+    const clock = new TestClock();
+
     CONFIG.channels.precacheServices = [];
 
     assert.doesNotThrow(() => {
 
-      startPrecaching();
+      startPrecaching({ ...defaultPrecachingDeps, clock });
     }, "empty list short-circuits regardless of prior state");
+
+    assert.equal(clock.pending, 0, "the empty-list guard armed nothing on the injected clock");
   });
 
   test("does not throw on repeated calls with an empty precacheServices list", () => {
 
     // Repeat safety: callers (browser launch sequence) may invoke startPrecaching once per launch, including after browser crash recovery. With no services
     // configured, every call must be a clean no-op.
+    const clock = new TestClock();
+
     for(let i = 0; i < 3; i++) {
 
       assert.doesNotThrow(() => {
 
-        startPrecaching();
+        startPrecaching({ ...defaultPrecachingDeps, clock });
       }, "iteration " + String(i + 1));
     }
+
+    assert.equal(clock.pending, 0, "no call in the sequence armed anything on the injected clock");
   });
 
   test("schedules a deferred cycle when precacheServices is non-empty (timer queued)", () => {
 
-    // Boundary: with at least one service configured, the function schedules the cycle via setTimeout. We use mock.timers to detect that a timer was queued
-    // without actually running it - tick(0) lets timers due at the current time fire, but the precache delay is 5000ms so a tick(0) does not trigger the cycle.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    // Boundary: with at least one service configured, the function arms the cycle on the clock its dependencies carry. Reading the clock's ledger proves the arm
+    // without firing it - firing the cycle would drive Puppeteer, so that path is deferred to e2e.
+    const clock = new TestClock();
 
     CONFIG.channels.precacheServices = ["never-registered-slug"];
 
-    startPrecaching();
+    startPrecaching({ ...defaultPrecachingDeps, clock });
 
-    // Ticking less than the precache delay confirms the timer is in flight without firing it. This test only proves a timer was queued, not that its body runs;
-    // actually firing the cycle would drive Puppeteer, so that path is deferred to e2e.
-    mock.timers.tick(0);
+    assert.equal(clock.pending, 1, "the cycle is armed on the injected clock");
+    assert.deepEqual(clock.requested, [PRECACHE_DELAY_MS], "the arm waits the precache delay");
+
+    stopPrecaching();
+
+    assert.equal(clock.pending, 0, "the stop drained the pending cycle off the clock");
   });
 });
 
 describe("recordDiscoveryOutcome", () => {
 
-  beforeEach(() => {
+  beforeEach(async () => {
 
     persistedLineups = [];
     savedLineup = null;
 
-    // We mock Date for deterministic timestamps and setTimeout to suppress the 2-second debounced health flush timer the mark calls below schedule. Each test uses
-    // unique synthetic domains so state from one scenario cannot color another.
-    mock.timers.enable({ apis: [ "Date", "setTimeout" ], now: BASE_TIME_MS });
+    // Establishing the health store on a clock seeded at BASE_TIME_MS is what makes the marks below stamp a fixed instant and their debounced flush arm on virtual
+    // time, so nothing writes to a real data directory after the row. Each test uses unique synthetic domains so state from one scenario cannot color another.
+    disposeHealthStore = await useHealthStoreOnClock(new TestClock(BASE_TIME_MS));
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
-    mock.timers.reset();
+    await disposeHealthStore();
   });
 
   /* Builds a minimal ProviderModule carrying only the fields recordDiscoveryOutcome reads (authWallIndicators, exportDurableLineup, guideUrl, label, slug,
