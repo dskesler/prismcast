@@ -18,8 +18,8 @@ interface FoxChannelInfo {
   stationCode: string;
 }
 
-// Cached discovery results. Populated by the first discoverFoxChannels call (discovery endpoint). Fox tuning is stateless (no tuning cache exists), so only
-// the discovery endpoint populates this cache. Cleared on browser disconnect via clearFoxCache().
+// Cached discovery results, filled by whichever caller reads them first: the discovery endpoint's discoverFoxChannels call, or the tune path, where
+// resolveFoxCategorySelector falls through to an in-line discovery walk on a cold cache. Cleared on browser disconnect via clearFoxCache().
 let cachedDiscoveredChannels: Nullable<DiscoveredChannel[]> = null;
 
 // Single source of truth for Fox's category-selector membership. Read by foxProvider.categoryResolution.selectors so the resolution layer in selectChannel() knows which
