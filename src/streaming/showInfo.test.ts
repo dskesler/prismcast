@@ -19,8 +19,11 @@ closePuppeteerStreamWssOnIdle();
 // The DVR request's own window, mirrored from showInfo.ts so a row advances exactly the bound the module arms.
 const API_TIMEOUT_MS = 5000;
 
+// The macrotask boundaries a drain crosses so a request chain the module fired without awaiting has run to completion before the next row starts.
+const SETTLE_TURNS = 10;
+
 /* Counts the debug lines carrying the module's fetch-failure template for one host - the line a lapse must not produce and a real failure must. The host narrows
- * the count to the calling row's own request, because the spy sits on a logger every row in the file shares and other rows reach unreachable hosts of their own.
+ * the count to the calling row's own request, because the spy sits on a logger every row in the file shares.
  */
 function failureLines(spy: ReturnType<typeof mock.method>, host: string): number {
 
@@ -48,10 +51,22 @@ describe("getShowName / clearShowName", () => {
 
 describe("getDvrHost / setDvrHost", () => {
 
+  let originalFetch: typeof globalThis.fetch;
+
+  /* Setting the host fires the logo population without awaiting it, and its device-mapping request would otherwise reach the sentinel host after the row has
+   * finished and log its failure during a later row. A stub answering every request with an empty listing lets that population settle, silently, inside the
+   * row that started it; the drain before the restore is what keeps a late request from reaching the real fetch.
+   */
   beforeEach(() => {
 
-    // Reset to the empty state by calling setDvrHost with an empty string is not supported (it would persist). Instead, we just observe that getDvrHost returns
-    // null in a fresh module state. Tests that mutate via setDvrHost reset their own state by setting it to a known sentinel.
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (): Promise<Response> => new Response("[]", { status: 200 }));
+  });
+
+  afterEach(async () => {
+
+    await settle(SETTLE_TURNS);
+    globalThis.fetch = originalFetch;
   });
 
   test("getDvrHost returns null in the initial module state", () => {
