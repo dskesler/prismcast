@@ -37,6 +37,7 @@ import { buildLaunchOptions, confirmSharedWindowPlacement, createDiscoveryPage, 
   registerManagedPage, resolveSharedWindowCarrier, seedProfilePreferences, setGracefulShutdown, startBrowserRestartChecking, startStalePageCleanup,
   stopBrowserRestartChecking, stopStalePageCleanup, unregisterManagedPage } from "./index.ts";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { firstOf, withTempDir } from "../testing.helpers.ts";
 import { CONFIG } from "../config/index.ts";
 import type { Clock } from "homebridge-plugin-utils";
 import { LOG } from "../utils/index.ts";
@@ -50,7 +51,6 @@ import { makePendingCaptureIdentity } from "../streaming/registry.ts";
 import os from "node:os";
 import path from "node:path";
 import { subscribeToStatus } from "../streaming/statusEmitter.ts";
-import { withTempDir } from "../testing.helpers.ts";
 
 /* The data directory must be initialized before buildLaunchOptions() can resolve the Chrome user-data-dir path (it derives from the data dir via getChromeDataDir).
  * We create a temp directory once for the whole file, point initializeDataDir at it, and clean it up after every test has run. The path is deterministic per test
@@ -663,6 +663,12 @@ interface WindowPageStub {
   // The browser the page names as its own, which is the identity the placement confirmation reads its recorded window from. Set by the browser double below.
   browser: Nullable<Browser>;
 
+  // How many times the page was closed, so a row can tell a page the creator cleaned up from one it handed back.
+  closeCalls: number;
+
+  // Every focus-emulation flag the page was handed, in order, so a row can assert what the creator did to the page it made.
+  focusEmulations: boolean[];
+
   page: Page;
 
   // How many times the page's session was asked which window it sits in, so a row can tell a fresh lookup from a cached answer.
@@ -676,19 +682,24 @@ interface WindowPageStub {
  * @param options - What the page reports about itself and what its CDP session answers with.
  * @param options.bounds - The bounds the page's session answers Browser.getWindowBounds with. Omitted means the response carries none.
  * @param options.closed - Whether the page reports itself closed.
+ * @param options.focusEmulationError - The error the page's focus emulation rejects with, for a row that wants a page refusing to be presented.
  * @param options.unreadableWindow - Whether the page's session answers Browser.getWindowForTarget with no window id at all.
  * @param options.url - The URL the page reports. Defaults to a plain-origin one.
  * @param options.windowId - The window the page's session says it sits in.
  * @returns The double plus the counts of the lookups and reads its session served.
  */
-function makeWindowPage(options: { bounds?: Record<string, number | string>; closed?: boolean; unreadableWindow?: boolean; url?: string;
-  windowId?: number; } = {}): WindowPageStub {
+function makeWindowPage(options: { bounds?: Record<string, number | string>; closed?: boolean; focusEmulationError?: Error;
+  unreadableWindow?: boolean; url?: string; windowId?: number; } = {}): WindowPageStub {
 
-  const stub: WindowPageStub = { browser: null, page: null as unknown as Page, windowLookups: 0, windowReads: 0 };
+  const stub: WindowPageStub = { browser: null, closeCalls: 0, focusEmulations: [], page: null as unknown as Page, windowLookups: 0, windowReads: 0 };
 
   stub.page = {
 
     browser: (): Nullable<Browser> => stub.browser,
+    close: async (): Promise<void> => {
+
+      stub.closeCalls++;
+    },
     createCDPSession: async (): Promise<unknown> => ({
 
       send: async (method: string): Promise<unknown> => {
@@ -710,6 +721,15 @@ function makeWindowPage(options: { bounds?: Record<string, number | string>; clo
         return undefined;
       }
     }),
+    emulateFocusedPage: async (enabled: boolean): Promise<void> => {
+
+      stub.focusEmulations.push(enabled);
+
+      if(options.focusEmulationError) {
+
+        throw options.focusEmulationError;
+      }
+    },
     isClosed: (): boolean => options.closed ?? false,
     url: (): string => options.url ?? "https://example.test/page"
   } as unknown as Page;
@@ -738,9 +758,11 @@ function makeTopologyBrowser(stubs: WindowPageStub[]): Browser {
 /**
  * Builds a browser double whose page list is fixed and whose creations are recorded.
  * @param pages - The pages browser.pages() answers with, in order.
+ * @param pageOptions - What every page this browser creates is built with, for a row that needs the created page to behave a particular way.
  * @returns The double, the doubles behind the pages it created, and the options each creation received.
  */
-function makeWindowBrowser(pages: Page[]): { browser: Browser; created: WindowPageStub[]; newPageOptions: unknown[] } {
+function makeWindowBrowser(pages: Page[], pageOptions?: Parameters<typeof makeWindowPage>[0]): { browser: Browser; created: WindowPageStub[];
+  newPageOptions: unknown[]; } {
 
   const created: WindowPageStub[] = [];
   const newPageOptions: unknown[] = [];
@@ -751,7 +773,7 @@ function makeWindowBrowser(pages: Page[]): { browser: Browser; created: WindowPa
 
       newPageOptions.push(options);
 
-      const stub = makeWindowPage();
+      const stub = makeWindowPage(pageOptions);
 
       created.push(stub);
 
@@ -1057,6 +1079,41 @@ describe("createDiscoveryPage", () => {
     assert.equal(pickCarrierPage([created]), null, "and it is never picked as one");
     assert.equal(isCarrierPage(await browser.newPage()), true, "a plain page from the same double still qualifies");
     assert.equal(isCarrierPage(null), false, "an absent page is no carrier");
+  });
+
+  test("presents the page it creates as visible and focused, and leaves the carrier alone", async () => {
+
+    /* Chrome does not paint a background window's document on its own, and every wait a walk makes - a visible selector, a condition polled from inside the
+     * page - needs a painted document to make progress. Presenting the page is what buys those waits. The mechanism is Puppeteer's own page method, so what the
+     * row observes is the flag the creator handed it and which page it handed it to, not protocol traffic.
+     */
+    const carrier = makeWindowPage({ bounds: { height: 400, left: 10, top: 20, width: 300, windowState: "normal" } });
+    const { browser, created } = makeWindowBrowser([carrier.page]);
+
+    await createDiscoveryPage(browser);
+
+    const discovery = firstOf(created, "created page");
+
+    assert.deepEqual(discovery.focusEmulations, [true], "the created page is presented once, with the emulation turned on");
+    assert.deepEqual(carrier.focusEmulations, [], "the carrier the placement was read from is left exactly as it was");
+    assert.equal(discovery.closeCalls, 0, "a page that accepted the emulation is handed back rather than closed");
+  });
+
+  test("closes the page it created when the emulation is refused, and fails with the refusal", async () => {
+
+    /* A page that will not be presented is one no walk can use, and nothing else holds it at this point: the caller never receives it and the managed-page
+     * sweep has never seen it. So the creator closes it, which closes its window, and lets the refusal through as it stands.
+     */
+    const focusEmulationError = new Error("Focus emulation refused.");
+    const { browser, created } = makeWindowBrowser([], { focusEmulationError });
+
+    await assert.rejects(createDiscoveryPage(browser), (error: unknown) => error === focusEmulationError,
+      "the creation fails with the refusal itself rather than a wrapping of it");
+
+    const discovery = firstOf(created, "created page");
+
+    assert.equal(discovery.closeCalls, 1, "the page the creator made is closed exactly once");
+    assert.equal(isCarrierPage(discovery.page), false, "and the mark set before the failure leaves the closed page no carrier");
   });
 });
 

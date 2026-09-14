@@ -1284,14 +1284,17 @@ export function mirrorPlacement(placement: WindowPlacement): { height: number; l
 /**
  * Opens a page for a channel guide discovery walk in a browser window of its own, and marks it as belonging to that window.
  *
- * A document renders only while it is the active tab of a window that is not minimized, and the shared window rests minimized whenever nothing is capturing and
- * no sign-in holds it on screen, with its selected tab belonging to the user. A guide walk needs its page to render - an observer-driven channel rail fills its
- * tiles from rendering updates, and a virtualized grid re-renders as the walk scrolls it - yet it is never captured, so it has no claim on the shared window's
- * presentation and no business moving the user's selection. Its own window resolves both: the page is the active tab there from the moment it exists.
+ * A document renders only while Chrome presents it: the active tab of a window the desktop is showing, or a page Chrome counts as captured. The shared window
+ * rests minimized whenever nothing is capturing and no sign-in holds it on screen, with its selected tab belonging to the user. A guide walk needs its page to
+ * render - an observer-driven channel rail fills its tiles from rendering updates, a virtualized grid re-renders as the walk scrolls it, and every wait the walk
+ * makes polls on the page's animation frames - yet it is never captured, so it has no claim on the shared window's presentation and no business moving the
+ * user's selection. A window of its own resolves the tab half: the page is that window's active tab from the moment it exists. The window is created in the
+ * background, so Chrome shows it inactive and moves no focus (measured 2026-08-31), and such a window's document is one Chrome does not present on its own: it
+ * reports itself hidden and unfocused and delivers no animation frame beyond a document load's first ones (measured 2026-09-13). Focus emulation resolves the
+ * presentation half, for the page's whole life - Puppeteer's own emulateFocusedPage carries the mechanism, on the page's own session.
  *
- * The window is created in the background, so Chrome shows it inactive and moves no focus (measured 2026-08-31), and at the shared window's own placement, so
- * the window placement Chrome persists for the profile never changes - readWindowPlacement carries the reasoning. The caller declares the layout surface on
- * the page and owns its registration, and closing the page closes the window with it.
+ * The window opens at the shared window's own placement, so the window placement Chrome persists for the profile never changes - readWindowPlacement carries
+ * the reasoning. The caller declares the layout surface on the page and owns its registration, and closing the page closes the window with it.
  * @param browser - The browser to open the window in.
  * @returns The page, as the active tab of its own window.
  */
@@ -1304,6 +1307,28 @@ export async function createDiscoveryPage(browser: Browser): Promise<Page> {
   const page = await browser.newPage({ background: true, type: "window", windowBounds: placement ? mirrorPlacement(placement) : undefined });
 
   ownWindowPages.add(page);
+
+  /* The page is presented from before its first load, so every wait a walk makes - a visible selector, a condition polled from inside the page - runs as it
+   * would in a window the desktop is showing. Chrome counts a focus-emulated page as captured, which is what presents its document, and Puppeteer keeps the
+   * state on the page's own session for as long as the page lives (measured 2026-09-13). The mark above stays first: nothing is awaited between the creation
+   * and it. A page that refuses the emulation is one no walk can use, and nothing else holds it yet - the caller never receives it and the managed-page sweep
+   * never sees it - so the creator closes it, which closes the window with it, before the failure propagates.
+   */
+  try {
+
+    await page.emulateFocusedPage(true);
+  } catch(error) {
+
+    try {
+
+      await page.close();
+    } catch {
+
+      // The page is already gone, which is the state the close was asking for.
+    }
+
+    throw error;
+  }
 
   LOG.debug("browser:lifecycle", "Opened the discovery page in a window of its own, %s.",
     placement ? "mirroring the shared window's placement" : "with no shared window to read a placement from");

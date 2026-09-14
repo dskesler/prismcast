@@ -5,7 +5,8 @@
 import { EvaluateAbortError, LOG, evaluateWithAbort, extractDomain, formatError, pollUntil, startTimer, waitWithTimeout } from "../utils/index.ts";
 import type { Frame, Page } from "puppeteer-core";
 import type { Nullable, ResolvedSiteProfile, TuneResult, VideoSelectorType } from "../types/index.ts";
-import { getProvidersForDomain, invalidateDirectUrl, resolveDirectUrl, selectChannel } from "./channelSelection.ts";
+import { getProvidersForDomain, getStrategyNavigator, invalidateDirectUrl, resolveDirectUrl, selectChannel } from "./channelSelection.ts";
+import { loadDocument, reloadDocument } from "./navigation.ts";
 import { CONFIG } from "../config/index.ts";
 import type { Clock } from "homebridge-plugin-utils";
 import type { EvaluateOptions } from "../utils/index.ts";
@@ -437,76 +438,47 @@ export async function startVideoPlayback(context: Frame | Page, selectorType: Vi
 }
 
 /**
- * Navigates a browser page to the specified URL with site-appropriate wait conditions. The navigation strategy depends on the site's player implementation:
- *
- * - waitForNetworkIdle=true: Wait for network activity to settle, allowing up to 2 concurrent connections for 500ms. This ensures all JavaScript has loaded
- *   and the player is fully initialized. Used for sites with complex async initialization.
- *
- * - waitForNetworkIdle=false: Return as soon as the page fires load event. Used for sites that have persistent connections or polling that would prevent
- *   networkidle from ever completing.
- *
- * Navigation timeouts are handled gracefully - we log a warning but don't throw, since the video may have loaded successfully even if networkidle never
- * completed.
+ * Puts the page on the given URL the way the profile's strategy enters its site: through the strategy's own navigator when its provider declares one, and
+ * otherwise through a plain document load under the profile's wait preference. Every navigation on the tune path, the re-establishment path, and the recovery
+ * route comes through here, which is what lets a provider that cannot always load its guide by URL take over the route without any caller knowing.
  * @param page - The Puppeteer page object.
  * @param url - The URL to navigate to.
- * @param profile - The site profile containing navigation preferences.
+ * @param profile - The site profile whose strategy and wait preference select the route.
  */
 export async function navigateToPage(page: Page, url: string, profile: ResolvedSiteProfile): Promise<void> {
 
-  if(profile.waitForNetworkIdle) {
+  const navigate = getStrategyNavigator(profile);
 
-    try {
+  if(navigate) {
 
-      // Wait for network activity to settle. This ensures complex JavaScript players have fully initialized. The networkidle2 strategy allows up to 2
-      // concurrent requests, which handles sites with persistent connections for analytics.
-      await page.goto(url, { timeout: CONFIG.streaming.navigationTimeout, waitUntil: "networkidle2" });
-    } catch(error) {
+    await navigate(page, url);
 
-      // Timeout errors during navigation are common and often non-fatal - the video may have loaded successfully even if some background requests never
-      // completed. We log a warning and continue rather than throwing.
-      if(error && ((error as Error).name === "TimeoutError")) {
-
-        LOG.warn("Page navigation timed out after %sms for %s.", CONFIG.streaming.navigationTimeout, url);
-      } else {
-
-        // Non-timeout errors (network failure, invalid URL, etc.) should be propagated for retry handling.
-        throw error;
-      }
-    }
-  } else {
-
-    // Simple navigation without waiting for network idle. Returns after the load event fires. Used for sites that would never reach networkidle due to
-    // persistent connections, streaming data, or continuous polling.
-    await page.goto(url);
+    return;
   }
+
+  await loadDocument(page, url, { waitForNetworkIdle: profile.waitForNetworkIdle });
 }
 
 /**
  * Reloads the current page, mirroring navigateToPage's wait strategy. Two callers, one mechanism. An accepted embedded-player consent gate only creates the player
  * iframe on a fresh load, so a reload re-renders the page with consent persisted and the video resolves on the second pass. A guide that never rendered is the
- * other: the reload is what gives channel selection a fresh surface to read.
+ * other: the reload is what gives channel selection a fresh surface to read. A strategy that owns its route re-enters at the page's current URL rather than
+ * reloading it, because a reload requests that URL directly - the load the strategy exists to avoid.
  * @param page - The Puppeteer page object.
- * @param profile - The site profile, whose waitForNetworkIdle flag selects the reload wait condition.
+ * @param profile - The site profile, whose strategy and waitForNetworkIdle flag select the reload route and its wait condition.
  */
 async function reloadPage(page: Page, profile: ResolvedSiteProfile): Promise<void> {
 
-  const waitUntil = profile.waitForNetworkIdle ? "networkidle2" : "load";
+  const navigate = getStrategyNavigator(profile);
 
-  try {
+  if(navigate) {
 
-    await page.reload({ timeout: CONFIG.streaming.navigationTimeout, waitUntil });
-  } catch(error) {
+    await navigate(page, page.url());
 
-    // A reload timeout is often non-fatal - the player may already be present even if some background requests never settled. Mirror navigateToPage: warn and
-    // continue on timeout, propagate other errors.
-    if(error && ((error as Error).name === "TimeoutError")) {
-
-      LOG.warn("Page reload timed out after %sms.", CONFIG.streaming.navigationTimeout);
-    } else {
-
-      throw error;
-    }
+    return;
   }
+
+  await reloadDocument(page, { waitForNetworkIdle: profile.waitForNetworkIdle });
 }
 
 /**

@@ -372,9 +372,10 @@ export function locateSelectorCoordinate(sel: string): { x: number; y: number } 
  * @param page - The Puppeteer page.
  * @param selector - The CSS selector for the element to click.
  * @param clock - The clock the settle before the dispatch sleeps on - the poll's clock, so one timeline drives the click physics and the cadence around it.
+ *   Defaults to the system clock, so a caller outside a poll, such as a provider route clicking its own guide, passes nothing.
  * @returns True if the element was found and clicked.
  */
-async function clickSelectorByCoordinate(page: Page, selector: string, clock: Clock): Promise<boolean> {
+export async function clickSelectorByCoordinate(page: Page, selector: string, clock: Clock = systemClock): Promise<boolean> {
 
   const target = await page.evaluate(locateSelectorCoordinate, selector);
 

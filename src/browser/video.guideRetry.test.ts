@@ -19,6 +19,7 @@ import type { Page } from "puppeteer-core";
 import type { VideoTuneDeps } from "./video.ts";
 import assert from "node:assert/strict";
 import { initializePlayback } from "./video.ts";
+import { makeDocumentResponse } from "../testing.helpers.ts";
 import { makeProfile } from "../config/profiles.helpers.ts";
 import { systemClock } from "homebridge-plugin-utils";
 import { useHealthStoreOnClock } from "../config/health.helpers.ts";
@@ -55,8 +56,10 @@ const deps: VideoTuneDeps = {
 };
 
 /**
- * Builds the page stub the rows run against. The mute is an evaluate, the reload is its own call, and the video wait rejects so the tune stops at a step the rows
- * can name - each recorded in order, which is what makes "reloaded once, then muted, then selected again" an observed sequence rather than three separate counts.
+ * Builds the page stub the rows run against. The mute is an evaluate, the reload and the document load are each their own call, and the video wait rejects so the
+ * tune stops at a step the rows can name - each recorded in order, which is what makes "reloaded once, then muted, then selected again" an observed sequence
+ * rather than three separate counts. The document load answers a successful document, which is what a provider that judges its own entry by the response needs to
+ * see to take the direct route.
  * @returns A stub page.
  */
 function makeStubPage(): Page {
@@ -68,6 +71,12 @@ function makeStubPage(): Page {
       pageEvents.push("mute");
 
       return undefined;
+    },
+    goto: async (): Promise<unknown> => {
+
+      pageEvents.push("goto");
+
+      return makeDocumentResponse(200);
     },
     isClosed: (): boolean => false,
     reload: async (): Promise<unknown> => {
@@ -173,6 +182,23 @@ describe("initializePlayback - the guide-unavailable retry", () => {
 
     assert.equal(selectCalls, 1, "the coordinator declined to re-run selection");
     assert.deepEqual(pageEvents, [ "mute", "select" ], "nothing was reloaded");
+  });
+
+  test("re-enters through the strategy's own route rather than reloading, for a profile whose provider owns its navigation", async () => {
+
+    /* A reload asks the browser for the page's current URL, which for a provider that cannot always be reached at that URL is the one request its route exists to
+     * avoid - and the retry would spend the tune's single second attempt on it. So the retry goes back through the same entry a fresh navigation takes. The row
+     * runs with the provider on its direct route, which the stub's successful document answer keeps it on, so what it observes is a document load filling the
+     * retry's slot and the second selection running after it.
+     */
+    selectResults = [ { guideUnavailable: true, reason: "Hulu guide grid did not load.", success: false }, { success: true } ];
+
+    await assert.rejects(initializePlayback(makeStubPage(), makeGuideProfile("guideGrid"), {}, deps),
+      (error: unknown) => (error as Error).message === VIDEO_WAIT_FAILURE, "the tune moved past selection and stopped at the video wait");
+
+    assert.equal(selectCalls, 2, "selection ran exactly twice");
+    assert.deepEqual(pageEvents, [ "mute", "select", "goto", "mute", "select" ], "the retry loaded a document where a plain profile would have reloaded");
+    assert.equal(pageEvents.filter((event) => event === "reload").length, 0, "and never asked the browser to reload the failing URL");
   });
 });
 

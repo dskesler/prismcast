@@ -2,8 +2,8 @@
  *
  * channelSelection.ts: Channel selection coordinator for multi-channel streaming sites.
  */
-import type { ChannelSelectionProfile, ChannelSelectorResult, ChannelStrategyEntry, DiscoveredChannel, Nullable, ProviderModule,
-  ResolvedSiteProfile } from "../types/index.ts";
+import type { ChannelSelectionProfile, ChannelSelectorResult, ChannelStrategyEntry, DiscoveredChannel, Nullable, ProviderModule, ResolvedSiteProfile,
+  StrategyNavigator } from "../types/index.ts";
 import { EvaluateAbortError, LOG, delay, evaluateWithAbort, extractDomain, formatError, isPageDeathError, pollUntil } from "../utils/index.ts";
 import { evictPersistedWatchUrl, getPersistedLineup, getPersistedWatchUrl } from "../config/providerLineups.ts";
 import { getDomainConfig, registerProviderModuleProfile } from "../config/sites.ts";
@@ -195,6 +195,17 @@ export function getProviderBySlug(slug: string): ProviderModule | undefined {
 export function getProviderByStrategy(strategyName: string): ProviderModule | undefined {
 
   return providerModules.find((p) => p.strategyName === strategyName);
+}
+
+/**
+ * Returns the strategy's own navigator for the given profile, when its provider declares one. The navigation and reload functions in video.ts read this ahead of
+ * every document load, so a provider that owns its route into its site is honored on every path without the callers knowing which provider it is.
+ * @param profile - The resolved site profile.
+ * @returns The navigator, or undefined when the strategy loads its pages by URL.
+ */
+export function getStrategyNavigator(profile: ResolvedSiteProfile): StrategyNavigator | undefined {
+
+  return strategies[profile.channelSelection.strategy]?.navigate;
 }
 
 /**

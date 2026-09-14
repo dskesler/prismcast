@@ -532,9 +532,10 @@ export async function withProviderGuidePage(provider: ProviderModule, options: W
   const { afterWalk, signal } = options;
   const browser = await deps.getCurrentBrowser("page");
 
-  /* The guide page is the active tab of a browser window of its own, opened in the background at the shared window's placement. A guide renders only while its
-   * document is visible, and a walk is never captured, so the page gets a window that presents it without disturbing the shared window's own state or the tab
-   * the user has selected there. The window closes with the page.
+  /* The guide page is the active tab of a browser window of its own, opened in the background at the shared window's placement and presented by the creator for
+   * the page's whole life. A guide renders only while Chrome presents its document, and a walk is never captured, so the page gets a window that never disturbs
+   * the shared window's own state or the tab the user has selected there, and a presentation that does not depend on that window being shown. The window closes
+   * with the page.
    */
   const page = await deps.createDiscoveryPage(browser);
 
