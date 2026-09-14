@@ -1151,7 +1151,8 @@ describe("makeFocusReaffirmCallback", () => {
       },
       inner,
       now: (): number => inner.now(),
-      schedule: (callback: () => void, ms: number, init?: { repeat?: boolean }): Disposable => inner.schedule(callback, ms, init)
+      schedule: (callback: () => void, ms: number, init?: { repeat?: boolean }): Disposable => inner.schedule(callback, ms, init),
+      timeout: (ms: number): AbortSignal => inner.timeout(ms)
     };
   };
 

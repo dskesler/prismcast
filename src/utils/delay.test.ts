@@ -653,7 +653,8 @@ describe("pollUntil", () => {
 
       delay: async (): Promise<void> => { throw failure; },
       now: (): number => clock.now(),
-      schedule: (callback: () => void, ms: number, init?: { repeat?: boolean }): Disposable => clock.schedule(callback, ms, init)
+      schedule: (callback: () => void, ms: number, init?: { repeat?: boolean }): Disposable => clock.schedule(callback, ms, init),
+      timeout: (ms: number): AbortSignal => clock.timeout(ms)
     };
 
     await assert.rejects(pollUntil({ cadenceMs: 25, ceilingMs: 1000, clock: broken, read: async (): Promise<string> => "minimized", signal: controller.signal,

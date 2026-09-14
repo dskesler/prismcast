@@ -126,9 +126,10 @@ describe("declareKeysOf", () => {
 
   test("supports the empty-key case for a type with no keys", () => {
 
-    // Boundary: a type with no keys (keyof resolves to never) passes an empty const array. The completeness check is trivially satisfied. Record<never, never>
-    // is the canonical "no keys" type - Record<string, never> has an index signature so keyof resolves to string, not never.
-    const keys = declareKeysOf<Record<never, never>>()([] as const);
+    // Boundary: a type with no keys (keyof resolves to never) passes an empty const array. The completeness check is trivially satisfied. The object type is the
+    // keyless type: it carries no properties and no index signature, so keyof resolves to never, where Record<string, never> has an index signature and keyof
+    // resolves to string.
+    const keys = declareKeysOf<object>()([] as const);
 
     assert.equal(keys.length, 0, "a keyless type should declare an empty array");
   });
