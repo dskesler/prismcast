@@ -306,7 +306,9 @@ export const DOMAIN_CONFIG: Record<string, DomainConfig> = {
   "c-span.org": { dismissSelector: ".videoAdUiSkipButtonExperimentalText", profile: "brightcove", service: "C-SPAN.org" },
   "cbs.com": { dismissSelector: "#mvpd__getstarted", profile: "keyboardIframe", service: "CBS.com" },
   "cnbc.com": { profile: "fullscreenApi", service: "CNBC.com" },
-  "cnn.com": { profile: "fullscreenApi", service: "CNN.com" },
+  // CNN.com renders a Piano subscription offer into a fixed bar at the bottom of the page that stacks above the fullscreened video, so hideSelector keeps it out
+  // of the capture. The bar's close control sits inside a cross-origin checkout iframe, which a synthetic dismissal click cannot reach.
+  "cnn.com": { hideSelector: "#piano-bottom-bar", profile: "fullscreenApi", service: "CNN.com" },
   "disneynow.com": { profile: "disneyNow", service: "DisneyNOW" },
   "disneyplus.com": { iconUrl: "https://static-assets.bamgrid.com/product/disneyplus/favicons/apple-touch-icon-aurora.d3af81fe0571b495a3c80ff8c3d0c8e7.png",
     profile: "disneyPlus", service: "Disney+", serviceTag: "disneyplus" },

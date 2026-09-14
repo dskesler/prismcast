@@ -125,6 +125,7 @@ function mergeDomainProperties(profile: ResolvedSiteProfile, config: DomainConfi
 
     ...profile,
     ...(config.dismissSelector !== undefined ? { dismissSelector: config.dismissSelector } : {}),
+    ...(config.hideSelector !== undefined ? { hideSelector: config.hideSelector } : {}),
     ...(config.maxContinuousPlayback !== undefined ? { maxContinuousPlayback: config.maxContinuousPlayback } : {}),
     ...(config.videoTimeout !== undefined ? { videoTimeout: config.videoTimeout } : {})
   };

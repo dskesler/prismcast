@@ -146,6 +146,15 @@ describe("getProfileForUrl", () => {
 
     assert.equal(result.profile.maxContinuousPlayback, 4);
   });
+
+  test("merges domain-level hideSelector when configured (cnn.com)", () => {
+
+    // cnn.com carries hideSelector in its DOMAIN_CONFIG entry while resolving to the shared fullscreenApi profile, so the value can only reach the resolved
+    // profile through the domain merge.
+    const result = getProfileForUrl("https://www.cnn.com/videos/cnn");
+
+    assert.equal(result.profile.hideSelector, "#piano-bottom-bar");
+  });
 });
 
 describe("getProfileForChannel", () => {

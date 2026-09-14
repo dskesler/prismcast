@@ -531,8 +531,8 @@ export function validateProfile(key: string, profile: SiteProfile): string[] {
 }
 
 /**
- * Validates a domain mapping. Checks hostname format, builtin-domain collisions, dismissSelector, profile references, service/serviceTag strings, loginUrl format,
- * and maxContinuousPlayback and videoTimeout type and range.
+ * Validates a domain mapping. Checks hostname format, builtin-domain collisions, dismissSelector and hideSelector, profile references, service/serviceTag strings,
+ * loginUrl format, and maxContinuousPlayback and videoTimeout type and range.
  * @param domain - The domain hostname.
  * @param config - The domain configuration.
  * @param isKnownProfile - Predicate answering whether a referenced profile name exists. Callers test each name against the single builtin lookup plus whatever
@@ -578,6 +578,12 @@ export function validateDomain(domain: string, config: DomainConfig, isKnownProf
   if((config.dismissSelector !== undefined) && ((typeof config.dismissSelector !== "string") || (config.dismissSelector.trim() === ""))) {
 
     errors.push("Domain '" + domain + "': dismissSelector must be a non-empty string.");
+  }
+
+  // hideSelector must be a non-empty string if specified.
+  if((config.hideSelector !== undefined) && ((typeof config.hideSelector !== "string") || (config.hideSelector.trim() === ""))) {
+
+    errors.push("Domain '" + domain + "': hideSelector must be a non-empty string.");
   }
 
   // profile must reference an existing profile if specified. Mapping a domain to a provider profile is coherent - the builtin DOMAIN_CONFIG entries do exactly

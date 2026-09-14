@@ -78,8 +78,8 @@ export function generateChannelsSubtabScript(): string {
     "        if(wf.type === 'boolean') { if(p[wf.id]) flags[wf.id] = true; }",
     "        else if(p[wf.id]) { fieldValues[wf.id] = p[wf.id]; }",
     "      }",
-    // Each domain row keeps its full raw config so unrendered domain-level fields (videoTimeout, loginUrl, maxContinuousPlayback, dismissSelector) survive a
-    // resave; service and serviceTag drive the rendered inputs.
+    // Each domain row keeps its full raw config so every domain-level field the wizard does not render survives a resave; service and serviceTag drive the
+    // rendered inputs.
     "      const domains = (match.domains && match.domains.length > 0) ?",
     "        match.domains.map((d) => ({ config: d.config || {}, domain: d.domain, service: d.service || '', serviceTag: d.serviceTag || '' })) :",
     "        [{ config: {}, domain: '', service: '', serviceTag: '' }];",

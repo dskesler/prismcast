@@ -385,8 +385,8 @@ export function setupProfileRoutes(app: Express): void {
       const profileList = Object.entries(profiles).toSorted(([a], [b]) => a.localeCompare(b)).map(([ key, profile ]) => {
 
         // Find domains that reference this profile. The `config.profile === key` join is the projection's single source of truth - the client never re-implements
-        // it. Each row carries the full raw DomainConfig so the wizard can round-trip every domain-level field it does not render (videoTimeout, loginUrl,
-        // maxContinuousPlayback, dismissSelector) rather than dropping them on an edit-resave; service and serviceTag are surfaced flat for the rendered inputs.
+        // it. Each row carries the full raw DomainConfig so every domain-level field the wizard does not render survives an edit-resave; service and serviceTag
+        // are surfaced flat for the rendered inputs.
         const profileDomains = Object.entries(domains).filter(([ , config ]) => (config.profile === key)).map(([ domain, config ]) => ({
 
           config,
