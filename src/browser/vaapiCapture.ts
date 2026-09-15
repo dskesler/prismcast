@@ -156,6 +156,26 @@ export async function presentCaptureDisplay(page: Page, clock: Clock = realClock
 }
 
 /**
+ * Wires the paths that end a capture nobody called stop() on.
+ *
+ * An owner retires a capture by destroying the stream and waiting for its stopped promise - that is the contract every caller holds, and the only one they hold.
+ * A PassThrough on its own answers neither half: destroying it severs the pipe without telling the child anything, and the child then blocks forever writing to a
+ * pipe with no reader, so the stopped promise it was supposed to settle never does. Every capture retired that way leaks an FFmpeg holding the display and the
+ * audio source, and the audio server runs out of client slots long before the machine runs out of anything else - at which point every subsequent tune fails at
+ * its audio input, on channels that have nothing to do with whatever leaked.
+ *
+ * A page that closes is the same retirement arriving from the other side: a capture whose page is gone has nothing left to grab.
+ * @param stream - The capture stream handed to the owner. Its close is the owner's retirement signal.
+ * @param page - The page being captured. Its close retires the capture too.
+ * @param stop - The capture's own stop, which is idempotent and does the actual ending.
+ */
+export function attachCaptureRetirement(stream: PassThrough, page: Pick<Page, "once">, stop: () => Promise<void>): void {
+
+  page.once("close", () => { void stop(); });
+  stream.once("close", () => { void stop(); });
+}
+
+/**
  * Acquires a hardware-encoded screen capture for a page: an FFmpeg child grabbing the X display the browser is full-screened on and encoding it on the GPU, its
  * Matroska output arriving as a readable stream, and the two controls that end it.
  *
@@ -212,7 +232,13 @@ export async function acquireVaapiCaptureStream(page: Page, options: CaptureStre
       graceTimer = null;
     }
 
-    stream.end();
+    // An owner retires a capture by destroying the stream, so the destroyed case is the ordinary one rather than the exception: ending a destroyed writable raises
+    // ERR_STREAM_DESTROYED on a stream whose consumer is by then gone, where the error has nowhere to go but an unhandled event.
+    if(!stream.destroyed) {
+
+      stream.end();
+    }
+
     stopped.resolve(undefined);
   };
 
@@ -260,11 +286,23 @@ export async function acquireVaapiCaptureStream(page: Page, options: CaptureStre
 
       // SIGINT, not SIGTERM: FFmpeg treats SIGINT as "finish the file", flushing its muxer and writing the Matroska cues, where SIGTERM ends it where it stands.
       child.kill("SIGINT");
+
+      /* A signal only reaches a process that can act on it. When the stop came from a destroyed stream the pipe lost its reader, and FFmpeg is blocked writing to
+       * a full one - it takes the signal and blocks again on the very flush the signal asked it to make. Draining what it writes lets that shutdown finish. On a
+       * stream still being consumed this changes nothing: the data goes where it was already going.
+       */
+      child.stdout?.resume();
+
       graceTimer = setTimeout(() => child.kill("SIGKILL"), VAAPI_STOP_GRACE_MS);
     }
 
     await stopped.promise;
   };
+
+  /* The owner's retirement and the page's death both have to reach the child, and neither is expressible as a call to stop(): the owner destroys the stream it was
+   * handed, and a dying page announces itself. Registered here, after stop() exists, because both paths call it.
+   */
+  attachCaptureRetirement(stream, page, stop);
 
   // The caller gave up while the child was starting. Retire it here rather than handing back a capture nobody is waiting for.
   if(signal?.aborted) {

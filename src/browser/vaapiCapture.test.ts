@@ -6,11 +6,12 @@
  * CPU-side pixel format conversion are the only combination the Gen9.5 low-power H.264 entrypoint accepts, so a change to either is a regression that would
  * otherwise surface only as a failed encoder open on real hardware.
  */
-import { VAAPI_PIXEL_FORMAT, VAAPI_RC_MODE, buildVaapiCaptureArgs, presentCaptureDisplay, toX11GrabInput } from "./vaapiCapture.ts";
+import { VAAPI_PIXEL_FORMAT, VAAPI_RC_MODE, attachCaptureRetirement, buildVaapiCaptureArgs, presentCaptureDisplay, toX11GrabInput } from "./vaapiCapture.ts";
 import { describe, test } from "node:test";
 import { CONFIG } from "../config/index.ts";
 import type { CaptureStreamOptions } from "./tabCapture.ts";
 import type { Page } from "puppeteer-core";
+import { PassThrough } from "node:stream";
 import assert from "node:assert/strict";
 import { makeFakeClock } from "../utils/clock.helpers.ts";
 
@@ -226,5 +227,70 @@ describe("presentCaptureDisplay", () => {
 
     await assert.doesNotReject(() => presentCaptureDisplay(page, clock), "the presentation absorbs an activation failure");
     assert.deepEqual(calls, [ "setWindowBounds:fullscreen", "bringToFront" ], "the activation was attempted");
+  });
+});
+
+
+describe("attachCaptureRetirement", () => {
+
+  /* A page whose close handler can be fired on demand, which is how a test stands in for a browser tab dying under a live capture. */
+  function makeClosablePage(): { close: () => void; page: Pick<Page, "once"> } {
+
+    const handlers: (() => void)[] = [];
+
+    return {
+
+      // Honors once: the handlers fire at most one time each, as they do on a real page, so a test can ask twice and see what a second close would really do.
+      close: (): void => handlers.splice(0).forEach((handler) => handler()),
+      page: { once: (_event: string, handler: () => void): unknown => (handlers.push(handler), null) } as unknown as Pick<Page, "once">
+    };
+  }
+
+  test("stops the capture when the owner destroys the stream", async () => {
+
+    /* This is the whole contract an owner has for retiring a capture: destroy the stream, then wait for stopped. Without this path the destroy severs the pipe and
+     * tells the FFmpeg child nothing, which leaves it alive holding the display and the audio source - and a leaked capture per retirement exhausts the audio
+     * server's client slots, after which every tune fails at its audio input regardless of channel.
+     */
+    const stream = new PassThrough();
+    const { page } = makeClosablePage();
+    let stops = 0;
+
+    attachCaptureRetirement(stream, page, async (): Promise<void> => { stops++; });
+
+    stream.destroy();
+    await new Promise((resolve) => stream.once("close", resolve));
+
+    assert.equal(stops, 1, "destroying the stream stopped the capture");
+  });
+
+  test("stops the capture when the page closes", async () => {
+
+    // A capture whose page is gone has nothing left to grab, and nobody is coming to retire it through the stream.
+    const stream = new PassThrough();
+    const { close, page } = makeClosablePage();
+    let stops = 0;
+
+    attachCaptureRetirement(stream, page, async (): Promise<void> => { stops++; });
+    close();
+
+    assert.equal(stops, 1, "the page's death stopped the capture");
+  });
+
+  test("stops once when both paths fire", async () => {
+
+    // The ordinary shutdown fires both: the page closes and the stream it fed ends with it. stop() is idempotent, and each path registers once.
+    const stream = new PassThrough();
+    const { close, page } = makeClosablePage();
+    let stops = 0;
+
+    attachCaptureRetirement(stream, page, async (): Promise<void> => { stops++; });
+
+    close();
+    close();
+    stream.destroy();
+    await new Promise((resolve) => stream.once("close", resolve));
+
+    assert.equal(stops, 2, "each path fires once, and neither repeats");
   });
 });
