@@ -6,14 +6,18 @@
  * CPU-side pixel format conversion are the only combination the Gen9.5 low-power H.264 entrypoint accepts, so a change to either is a regression that would
  * otherwise surface only as a failed encoder open on real hardware.
  */
-import { VAAPI_PIXEL_FORMAT, VAAPI_RC_MODE, attachCaptureRetirement, buildVaapiCaptureArgs, presentCaptureDisplay, toX11GrabInput } from "./vaapiCapture.ts";
+import { VAAPI_PIXEL_FORMAT, VAAPI_RC_MODE, attachCaptureRetirement, buildVaapiCaptureArgs, fitSurfaceToDisplay, presentCaptureDisplay,
+  toX11GrabInput } from "./vaapiCapture.ts";
 import { describe, test } from "node:test";
 import { CONFIG } from "../config/index.ts";
 import type { CaptureStreamOptions } from "./tabCapture.ts";
+import type { LogEntry } from "../utils/index.ts";
+import type { Nullable } from "../types/index.ts";
 import type { Page } from "puppeteer-core";
 import { PassThrough } from "node:stream";
 import assert from "node:assert/strict";
 import { makeFakeClock } from "../utils/clock.helpers.ts";
+import { subscribeToLogs } from "../utils/index.ts";
 
 /* Reads the value FFmpeg would take for a flag, so an assertion names the flag it cares about rather than an index into the vector. Returns null when the flag is
  * absent, which is the distinction several tests below turn on.
@@ -292,5 +296,144 @@ describe("attachCaptureRetirement", () => {
     await new Promise((resolve) => stream.once("close", resolve));
 
     assert.equal(stops, 2, "each path fires once, and neither repeats");
+  });
+});
+
+
+describe("fitSurfaceToDisplay", () => {
+
+  /* A page reporting a window frame and carrying an emulated surface, which is the whole of what the fit reads and writes. Bounds of null stand for a window whose
+   * placement will not read completely - a closed page, a target with no window, a response missing one of its numbers.
+   * @param options - The window frame to report and the surface the page starts emulated at.
+   * @returns The page, plus the viewports set on it in order.
+   */
+  function makeFittablePage(options: { bounds: Nullable<{ height: number; width: number }>; viewport: Nullable<{ deviceScaleFactor: number; height: number;
+    width: number; }>; }): { page: Page; viewports: { deviceScaleFactor?: number; height: number; width: number }[] } {
+
+    const viewports: { deviceScaleFactor?: number; height: number; width: number }[] = [];
+    let current = options.viewport;
+
+    const session = {
+
+      detach: async (): Promise<void> => undefined,
+      send: async (method: string): Promise<unknown> => {
+
+        if(method === "Browser.getWindowForTarget") {
+
+          return { windowId: 7 };
+        }
+
+        if(method === "Browser.getWindowBounds") {
+
+          // A full placement or none at all: readWindowPlacement requires all four numbers and the state, and answers null for anything less.
+          return options.bounds ? { bounds: { height: options.bounds.height, left: 0, top: 0, width: options.bounds.width, windowState: "fullscreen" } } : {};
+        }
+
+        return undefined;
+      }
+    };
+
+    const page = {
+
+      createCDPSession: async (): Promise<unknown> => session,
+      isClosed: (): boolean => false,
+      setViewport: async (viewport: { deviceScaleFactor?: number; height: number; width: number }): Promise<void> => {
+
+        viewports.push(viewport);
+        current = { deviceScaleFactor: viewport.deviceScaleFactor ?? 1, height: viewport.height, width: viewport.width };
+      },
+      viewport: (): Nullable<{ deviceScaleFactor: number; height: number; width: number }> => current
+    };
+
+    return { page: page as unknown as Page, viewports };
+  }
+
+  /* Runs a body with the emitted warnings captured.
+   * @param body - The work to run under capture.
+   * @returns The warn-level entries emitted while the body ran.
+   */
+  async function captureWarnings(body: () => Promise<void>): Promise<LogEntry[]> {
+
+    const captured: LogEntry[] = [];
+    const unsubscribe = subscribeToLogs((entry) => { captured.push(entry); });
+
+    try {
+
+      await body();
+    } finally {
+
+      unsubscribe();
+    }
+
+    return captured.filter((entry) => entry.level === "warn");
+  }
+
+  test("emulates the surface at the display's dimensions when the preset does not match it", async () => {
+
+    /* The failure this exists for. A 1280x720 surface on a 1920x1080 display paints two thirds of each axis, so the grab returns 45% picture on a field of the
+     * browser's background - a well-formed stream at the right resolution that no health check can tell from a good one.
+     */
+    const { page, viewports } = makeFittablePage({ bounds: { height: 1080, width: 1920 }, viewport: { deviceScaleFactor: 1, height: 720, width: 1280 } });
+
+    assert.equal(await fitSurfaceToDisplay(page), true, "the display was read and the surface fitted to it");
+    assert.deepEqual(viewports, [{ deviceScaleFactor: 1, height: 1080, width: 1920 }], "the surface now covers the display the grab reads");
+  });
+
+  test("carries the declared density through the resize", async () => {
+
+    // The density was read from the page and declared deliberately. This changes how much of the display the page covers, not how finely it rasters.
+    const { page, viewports } = makeFittablePage({ bounds: { height: 1080, width: 1920 }, viewport: { deviceScaleFactor: 2, height: 720, width: 1280 } });
+
+    await fitSurfaceToDisplay(page);
+
+    assert.equal(viewports[0]?.deviceScaleFactor, 2, "the page's own density survived the fit");
+  });
+
+  test("issues no command when the surface already covers the display", async () => {
+
+    // The documented deployment, and the common path: a display sized to the preset needs nothing done to it and must not pay a redundant re-layout per tune.
+    const { page, viewports } = makeFittablePage({ bounds: { height: 720, width: 1280 }, viewport: { deviceScaleFactor: 1, height: 720, width: 1280 } });
+
+    assert.equal(await fitSurfaceToDisplay(page), true, "the surface already matched");
+    assert.deepEqual(viewports, [], "nothing was re-declared");
+  });
+
+  test("warns when it has to fit, naming both dimensions", async () => {
+
+    /* A display that does not match the preset is a deployment fault with a running cost - a CPU scale on every frame for the length of the stream - and the
+     * picture being correct either way is exactly why it would otherwise go unnoticed.
+     */
+    const { page } = makeFittablePage({ bounds: { height: 1080, width: 1920 }, viewport: { deviceScaleFactor: 1, height: 720, width: 1280 } });
+
+    const warnings = await captureWarnings(async () => { await fitSurfaceToDisplay(page); });
+
+    assert.equal(warnings.length, 1, "exactly one warning");
+    assert.match(warnings[0]?.message ?? "", /1920x1080/, "the warning names the display");
+    assert.match(warnings[0]?.message ?? "", /1280x720/, "the warning names the preset it is departing from");
+  });
+
+  test("leaves the surface alone when the display cannot be read", async () => {
+
+    /* A placement that will not read completely is no measurement of the display, and a guess is worse than the preset - the preset is at least the size the page
+     * was laid out and tuned at. The presentation already warns about the window it could not confirm, so this adds no second report of the same fault.
+     */
+    const { page, viewports } = makeFittablePage({ bounds: null, viewport: { deviceScaleFactor: 1, height: 720, width: 1280 } });
+
+    const warnings = await captureWarnings(async () => {
+
+      assert.equal(await fitSurfaceToDisplay(page), false, "the fit reports that it could not measure the display");
+    });
+
+    assert.deepEqual(viewports, [], "the surface was left as it was");
+    assert.equal(warnings.length, 0, "the presentation's own warning is not duplicated here");
+  });
+
+  test("leaves a page carrying no surface alone", async () => {
+
+    // A page PrismCast has not emulated has no surface to fit, and declaring one here would invent an emulation it never asked for.
+    const { page, viewports } = makeFittablePage({ bounds: { height: 1080, width: 1920 }, viewport: null });
+
+    assert.equal(await fitSurfaceToDisplay(page), true, "the display read fine; there was simply nothing to fit");
+    assert.deepEqual(viewports, [], "no viewport was invented for it");
   });
 });

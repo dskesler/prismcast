@@ -4,6 +4,7 @@
  */
 import type { AcquireCaptureStreamContext, CaptureStream, CaptureStreamOptions } from "./tabCapture.ts";
 import { LOG, formatError, realClock, resolveFFmpegPath, startTimer } from "../utils/index.ts";
+import { fullscreenWindow, readWindowPlacement } from "./cdp.ts";
 import { CAPTURE_SOURCE_UNAVAILABLE_MESSAGE } from "../types/index.ts";
 import { CONFIG } from "../config/index.ts";
 import type { ChildProcess } from "node:child_process";
@@ -11,7 +12,6 @@ import type { Clock } from "../utils/index.ts";
 import type { Nullable } from "../types/index.ts";
 import type { Page } from "puppeteer-core";
 import { PassThrough } from "node:stream";
-import { fullscreenWindow } from "./cdp.ts";
 import { spawn } from "node:child_process";
 
 /* This module is the second implementation of the capture contract that tabCapture.ts defines, and it exists because the first one cannot reach the GPU.
@@ -30,10 +30,13 @@ import { spawn } from "node:child_process";
  * It captures a DISPLAY, not a tab. The whole screen is grabbed rather than a rectangle derived from the window, because a capture page's emulated surface and its
  * on-screen window are independent - Chrome renders the page at the emulated viewport whatever size the window happens to be - so a rectangle composed from the
  * window's origin and the surface's dimensions describes no real region and is rejected outright once it crosses a screen edge. What is on screen instead is
- * arranged to be the page and nothing else: presentCaptureDisplay puts the window full screen and brings the capture page to the front of it before the grab
- * starts, and the window-visibility policy keeps it there for the length of the stream. So the display is what gets grabbed, and the deployment requirement is
- * that the browser owns it - a display sized to the capture surface, with nothing else contending for the screen, screen blanking off, and no second window that
- * can stack above the capture.
+ * arranged to be the page and nothing else: presentCaptureDisplay puts the window full screen, sizes the page's emulated surface to it, and brings the capture
+ * page to the front before the grab starts, and the window-visibility policy keeps it there for the length of the stream. That same independence is why the
+ * surface is fitted rather than assumed: a page emulated at a preset the display does not match paints a corner of its own full-screen window and the grab
+ * scales the desktop around it into the output, which is a fault no health check here can see because every frame is on time and the file is well-formed. So the
+ * display is what gets grabbed, and the deployment requirement is that the browser owns it - nothing else contending for the screen, screen blanking off, and no
+ * second window that can stack above the capture. A display sized to the preset is no longer required for a correct picture, only for a cheap one: a mismatch
+ * costs a CPU scale per frame, and says so in the log.
  *
  * It admits one capture at a time. PrismCast shows one tab at a time in a shared window, so a second simultaneous grab would record the first one's video. Config
  * validation pins maxConcurrentStreams to 1 whenever this backend is selected rather than letting that failure happen silently at the second tune.
@@ -122,10 +125,67 @@ export function buildVaapiCaptureArgs(options: CaptureStreamOptions, display: st
 }
 
 /**
+ * Sizes a page's emulated surface to the display the grab reads, and reports what it had to do.
+ *
+ * The page's emulated surface and the window's frame are independent: Chrome renders the page at whatever viewport the device-metrics override declares, however
+ * large the window around it happens to be. Every page PrismCast captures is emulated at the configured quality preset, which is exactly right for tab capture,
+ * because there the capture IS the emulated surface. Here it is not - the capture is the screen - so a preset that does not match the display leaves the page
+ * painting the top-left corner of its own full-screen window with the browser's background filling the rest, and the grab scales that whole composition into the
+ * output. A 1280x720 preset on a 1920x1080 display puts the page in 2/3 of each axis and turns the delivered frame into 45% picture on a field of grey.
+ *
+ * Nothing in the pipeline notices. The output file is a perfectly well-formed stream at the expected resolution, the window is genuinely full screen, no frame is
+ * late and no segment is undersized - so the fault is invisible to every health check this application has and reaches the viewer as picture quality alone. It
+ * produced a 2h17m recording at 45% with not one line in the log, which is why the mismatch is corrected here and announced when it happens.
+ *
+ * The output resolution is unaffected. The encoder's scale is built from the capture options, which carry the preset, so the delivered stream stays the size every
+ * consumer downstream expects whatever the display measures; what changes is only how much of the grabbed screen is page.
+ * @param page - The capture page, already full screen on the display being grabbed.
+ * @returns True when the surface now matches the display, false when the display could not be read and the surface was left as it was.
+ */
+export async function fitSurfaceToDisplay(page: Page): Promise<boolean> {
+
+  const placement = await readWindowPlacement(page);
+
+  /* A placement that will not read completely is no measurement of the display, and a guess would be worse than the preset: the preset is at least the size the
+   * page was laid out and tuned at. The presentation warns about the window it could not confirm, so this stays silent rather than reporting the same fault twice.
+   */
+  if(!placement) {
+
+    return false;
+  }
+
+  const viewport = page.viewport();
+
+  // A full-screen window's frame is the screen, which is what makes this read the display's dimensions rather than merely the window's.
+  const { height, width } = placement;
+
+  if(!viewport || ((viewport.height === height) && (viewport.width === width))) {
+
+    return true;
+  }
+
+  /* The density travels unchanged. It was read from the page and declared deliberately, and this is a change of how much of the display the page covers, not of
+   * how finely it rasters.
+   */
+  await page.setViewport({ deviceScaleFactor: viewport.deviceScaleFactor, height, width });
+
+  /* Worth a warning rather than a debug line, because a display that does not match the preset is a deployment fault with a running cost: the grab now scales
+   * every frame from the display's dimensions down to the preset's, on the CPU, for the length of the stream. The picture is correct either way - this names the
+   * thing to fix to make it cheap again.
+   */
+  LOG.warn("VAAPI capture: the display measures %dx%d where the quality preset is %dx%d. Emulating the capture surface at the display's dimensions so the page " +
+    "fills the grab, and scaling each frame back to the preset. Size the display to the preset to avoid that scale.", width, height, viewport.width,
+  viewport.height);
+
+  return true;
+}
+
+/**
  * Presents a page as the display's whole content, which is the precondition every frame of this backend's output depends on.
  *
- * Two things have to be true, and neither is true of the window PrismCast keeps for tab capture. The window has to be full screen, or the grab returns a page
- * shrunken into the profile's persisted placement with a tab strip above it and desktop around it. And the page has to be the front tab of a raised window, which
+ * Three things have to be true, and none is true of the window PrismCast keeps for tab capture. The window has to be full screen, or the grab returns a page
+ * shrunken into the profile's persisted placement with a tab strip above it and desktop around it. The page's emulated surface has to cover that window, or the
+ * page paints a corner of it and the grab returns the browser's background around a shrunken picture. And the page has to be the front tab of a raised window, which
  * is what activation buys: a fullscreen window the desktop stacks below its other windows returns those windows in the frames, and - measured on this hardware -
  * a capture page that is not the visible tab never reaches a playable video at all, because the page is hidden and a provider's player will not start against a
  * hidden document. Both were observed as distinct failures of the same tune: black frames from a fullscreen window nothing had raised, and a video that stayed at
@@ -142,6 +202,11 @@ export function buildVaapiCaptureArgs(options: CaptureStreamOptions, display: st
 export async function presentCaptureDisplay(page: Page, clock: Clock = realClock): Promise<void> {
 
   await fullscreenWindow(page, clock);
+
+  /* Ordered after the full screen and before the activation: the window has to be at its final size for its frame to measure the display, and the surface has to
+   * be right before the page is raised into the frames the grab will read.
+   */
+  await fitSurfaceToDisplay(page);
 
   /* Raises the window and selects this tab within it. Puppeteer's activation is Page.bringToFront, which is the page-level command the tab-selection executor
    * cannot express: that executor hands the selection back when its body ends, and this selection has to outlive the acquisition and hold for the stream.
