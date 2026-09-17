@@ -259,7 +259,8 @@ export class CdpProxySession {
    * CDPSession, captures the underlying Connection, and subscribes to CDP target events. Any failure during async setup is caught by the WS close handler
    * (registered first), which fires when `closeWith()` closes the socket and routes cleanup through the same path the happy-path teardown takes. Wiring the
    * lifecycle handlers before any async operation that can fail guarantees the session is torn down (including its disconnect listener) regardless of where
-   * setup aborts. Handler bodies are null-safe so an early message arriving before browserSession is set produces a clean error frame rather than a crash.
+   * setup aborts. The socket is then held paused until setup completes, so no client command is read before the browser session and its target subscriptions
+   * exist.
    */
   async start(): Promise<void> {
 
@@ -272,8 +273,21 @@ export class CdpProxySession {
     this.ws.on("error", (err: Error) => {
 
       LOG.warn("CDP proxy WebSocket error: %s.", err.message);
+
+      /* A send-side error leaves ws half-closing without a resume of its own, so the peer's close frame would wait out ws's close timer before the socket ends.
+       * Resuming lets it end at once.
+       */
+      this.ws.resume();
       void this.cleanup();
     });
+
+    /* Hold the socket paused before the first await so no client command is read until the browser session and its target subscriptions exist. A paused ws socket
+     * emits no message events and its bytes wait in the TCP stream, so resume releases them in arrival order - nothing is lost and nothing is reordered. The
+     * resume lives at the end of setup, after the Target.* subscriptions and the discovery enable, because a client's opening commands include
+     * Target.setDiscoverTargets and depend on that wiring being in place. closeWith() resumes on every failure path, because a paused socket never reads the
+     * peer's close frame and the close event that runs cleanup() would otherwise wait out ws's close timer.
+     */
+    this.ws.pause();
 
     /* Subscribe to the browser's "disconnected" event so this session tears down cleanly when the browser PrismCast launched goes away (crash, rotation, normal
      * shutdown). The handler closes our WS with 1001 ("going away"); the WS close handler above then runs cleanup(), which unsubscribes us. Doing this per-session
@@ -328,12 +342,27 @@ export class CdpProxySession {
       LOG.warn("CDP proxy could not enable target discovery: %s.", formatError(error));
     }
 
+    /* The socket can close during any of setup's awaits - a browser disconnect or a peer close - and the close handler's cleanup has already run against a session
+     * that did not exist yet, so the session created since is detached here and the attach is never announced. cleanup() is safe to run again. One guard at the
+     * tail covers every await window, which is why it is not repeated after each of them.
+     */
+    if(this.ws.readyState !== WebSocket.OPEN) {
+
+      await this.cleanup();
+
+      return;
+    }
+
     this.attached = true;
+
+    // Setup is complete, so the buffered client commands flow.
+    this.ws.resume();
     LOG.info("CDP client attached.");
   }
 
   /**
-   * Closes the WS with a code/reason and triggers cleanup. Safe to call when the WS is already closed.
+   * Closes the WS with a code/reason and then resumes the socket so the close handshake can finish, which triggers cleanup. Safe to call when the WS is already
+   * closed.
    * @param code - WebSocket close code (1000 normal, 1001 going-away, 1011 internal-error).
    * @param reason - Human-readable reason.
    */
@@ -350,6 +379,12 @@ export class CdpProxySession {
         // handler registered synchronously at the top of start() - that handler-first ordering guarantees cleanup runs from any failure path.
       }
     }
+
+    /* A socket paused during setup never reads the peer's close frame, so ws's close handshake would wait out its close timer before firing the close event that
+     * runs cleanup(). The resume follows the close rather than preceding it: a resume on a still-open socket would flush the buffered commands into a proxy whose
+     * session may not exist yet, and each would be answered with an error frame instead of its result. Resuming is a no-op on a socket that was never paused.
+     */
+    this.ws.resume();
   }
 
   /**
@@ -358,6 +393,14 @@ export class CdpProxySession {
    * @param data - The raw WebSocket message data.
    */
   private async handleClientMessage(data: unknown): Promise<void> {
+
+    /* A command that arrives once the socket is closing has no session to reach - the commands closeWith() releases from the pause buffer land here - and the
+     * close reason the client receives is its answer, so the frame is dropped rather than refused.
+     */
+    if(this.ws.readyState !== WebSocket.OPEN) {
+
+      return;
+    }
 
     let raw: string;
 

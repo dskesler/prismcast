@@ -23,12 +23,18 @@ const WS_OPEN = 1;
 
 /**
  * A test double for the ws library's WebSocket. EventEmitter for the `message`/`close`/`error` handlers the proxy registers, plus the `send`/`close`/`readyState`
- * surface the proxy uses to write frames and probe state. Captured frames are appended to `sent` in send order.
+ * surface the proxy uses to write frames and probe state. Captured frames are appended to `sent` in send order. The double models the ws pause contract the proxy
+ * relies on: a paused socket emits no message events, and resume emits the buffered ones in arrival order.
  */
 class FakeWebSocket extends EventEmitter {
 
+  isPaused = false;
+  pauseCount = 0;
   readyState = WS_OPEN;
   readonly sent: unknown[] = [];
+
+  // Frames delivered while the socket was paused, held in arrival order until resume releases them.
+  private readonly buffered: unknown[] = [];
 
   send(data: string): void {
 
@@ -41,16 +47,45 @@ class FakeWebSocket extends EventEmitter {
     this.emit("close");
   }
 
+  pause(): void {
+
+    this.isPaused = true;
+    this.pauseCount++;
+  }
+
+  resume(): void {
+
+    this.isPaused = false;
+
+    for(const frame of this.buffered.splice(0)) {
+
+      this.emitFrame(frame);
+    }
+  }
+
   // Helper for tests to deliver a wire frame as if the remote client sent it.
   deliver(frame: unknown): void {
 
-    this.emit("message", Buffer.from(JSON.stringify(frame), "utf8"));
+    if(this.isPaused) {
+
+      this.buffered.push(frame);
+
+      return;
+    }
+
+    this.emitFrame(frame);
   }
 
   // Returns the most recent frame whose method matches the predicate.
   lastEvent(method: string): unknown {
 
     return this.sent.findLast((frame) => (frame as { method?: string }).method === method);
+  }
+
+  // Emits a frame the way the ws library hands one to the proxy, as the utf8 buffer the proxy decodes.
+  private emitFrame(frame: unknown): void {
+
+    this.emit("message", Buffer.from(JSON.stringify(frame), "utf8"));
   }
 }
 
@@ -116,27 +151,46 @@ class FakeConnection {
 }
 
 /**
- * A test double for puppeteer-core's Browser. Provides a target whose createCDPSession returns the seeded browser-level FakeCdpSession.
+ * A test double for puppeteer-core's Browser. Provides a target whose createCDPSession returns the seeded browser-level FakeCdpSession. A session gate holds
+ * creation open so a test can drive the window between start()'s handler wiring and the session it opens; a session error makes creation fail so a test can drive
+ * the failure branch. Both default to null, which is the straight-through behavior every other test wants.
  */
 class FakeBrowser extends EventEmitter {
 
   readonly browserSession: FakeCdpSession;
   readonly connection: FakeConnection;
+  readonly sessionError: Error | null;
+  readonly sessionGate: Promise<void> | null;
 
-  constructor() {
+  constructor(sessionGate: Promise<void> | null = null, sessionError: Error | null = null) {
 
     super();
 
     this.connection = new FakeConnection();
     this.browserSession = new FakeCdpSession();
     this.browserSession.connectionRef = this.connection;
+    this.sessionError = sessionError;
+    this.sessionGate = sessionGate;
   }
 
   target(): { createCDPSession: () => Promise<CDPSession> } {
 
     return {
 
-      createCDPSession: async (): Promise<CDPSession> => this.browserSession as unknown as CDPSession
+      createCDPSession: async (): Promise<CDPSession> => {
+
+        if(this.sessionGate) {
+
+          await this.sessionGate;
+        }
+
+        if(this.sessionError) {
+
+          throw this.sessionError;
+        }
+
+        return this.browserSession as unknown as CDPSession;
+      }
     };
   }
 }
@@ -388,6 +442,157 @@ describe("CdpProxySession - event forwarding", () => {
     });
 
     assert.equal(forwarded.length, 0, "lifecycle events were not forwarded as CDP events");
+  });
+});
+
+describe("CdpProxySession - commands that arrive during setup", () => {
+
+  test("a command delivered before the browser session exists is answered after setup, never refused", async () => {
+
+    const ws = new FakeWebSocket();
+    // eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- Standard pattern for signal promises.
+    const gate = Promise.withResolvers<void>();
+    const browser = new FakeBrowser(gate.promise);
+    const proxy = new CdpProxySession(ws as unknown as WebSocket, browser as unknown as Browser);
+
+    browser.browserSession.responses.set("Target.getBrowserContexts", { browserContextIds: ["ctx"] });
+
+    // start() is left un-awaited so the test can drive the window between the handler wiring and the browser session.
+    const started = proxy.start();
+
+    assert.equal(ws.isPaused, true, "the socket is paused before setup's first await");
+
+    ws.deliver({ id: 1, method: "Target.getBrowserContexts" });
+
+    assert.equal(ws.sent.length, 0, "nothing answered the command while the socket was paused");
+
+    gate.resolve();
+    await started;
+
+    // Let the released command's dispatch settle.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const response = ws.sent[0] as { error?: unknown; id?: number; result?: unknown };
+
+    assert.ok(response, "the buffered command was answered once setup completed");
+    assert.equal(response.id, 1);
+    assert.ok("result" in response, "the answer carries a result");
+    assert.deepEqual(response.result, { browserContextIds: ["ctx"] }, "the answer carries the command's real result");
+    assert.equal("error" in response, false, "the answer carries no error");
+    assert.equal(ws.isPaused, false, "the socket resumed at the end of setup");
+  });
+
+  test("commands delivered during setup are answered in delivery order", async () => {
+
+    const ws = new FakeWebSocket();
+    // eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- Standard pattern for signal promises.
+    const gate = Promise.withResolvers<void>();
+    const browser = new FakeBrowser(gate.promise);
+    const proxy = new CdpProxySession(ws as unknown as WebSocket, browser as unknown as Browser);
+
+    browser.browserSession.responses.set("Browser.getVersion", { product: "TestChrome/1.0" });
+    browser.browserSession.responses.set("Target.getBrowserContexts", { browserContextIds: [] });
+
+    const started = proxy.start();
+
+    ws.deliver({ id: 1, method: "Browser.getVersion" });
+    ws.deliver({ id: 2, method: "Target.getBrowserContexts" });
+
+    gate.resolve();
+    await started;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const responses = ws.sent.filter((frame) => typeof (frame as { id?: number }).id === "number") as { error?: unknown; id: number; result?: unknown }[];
+
+    assert.deepEqual(responses.map((frame) => frame.id), [ 1, 2 ], "the answers arrived in the order the commands were delivered");
+
+    for(const frame of responses) {
+
+      assert.ok("result" in frame, "each answer carries a result");
+      assert.equal("error" in frame, false, "no answer carries an error");
+    }
+  });
+
+  test("the socket resumes only after target discovery is enabled", async () => {
+
+    const ws = new FakeWebSocket();
+    // eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- Standard pattern for signal promises.
+    const gate = Promise.withResolvers<void>();
+    const browser = new FakeBrowser(gate.promise);
+    const proxy = new CdpProxySession(ws as unknown as WebSocket, browser as unknown as Browser);
+    const started = proxy.start();
+
+    ws.deliver({ id: 1, method: "Target.getBrowserContexts" });
+
+    gate.resolve();
+    await started;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const calls = browser.browserSession.calls;
+
+    assert.equal(calls[0]?.method, "Target.setDiscoverTargets", "the proxy's own discovery enable was the session's first command");
+
+    const early = calls.findIndex((call) => call.method === "Target.getBrowserContexts");
+
+    assert.ok(early > 0, "the client's early command reached the session after the discovery enable");
+  });
+
+  test("a failed browser session creation resumes the socket so the close can finish", async () => {
+
+    const ws = new FakeWebSocket();
+    const browser = new FakeBrowser(null, new Error("session creation refused"));
+    const proxy = new CdpProxySession(ws as unknown as WebSocket, browser as unknown as Browser);
+
+    await proxy.start();
+
+    assert.equal(ws.pauseCount, 1, "setup paused the socket exactly once, so the resume is what cleared it");
+    assert.equal(ws.isPaused, false, "the failure path resumed the socket so the close handshake can finish");
+    assert.equal(ws.readyState, 3, "the failure path closed the socket");
+  });
+
+  test("a browser disconnect during session creation answers no command and detaches the late session", async () => {
+
+    const ws = new FakeWebSocket();
+    // eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- Standard pattern for signal promises.
+    const gate = Promise.withResolvers<void>();
+    const browser = new FakeBrowser(gate.promise);
+    const proxy = new CdpProxySession(ws as unknown as WebSocket, browser as unknown as Browser);
+    const started = proxy.start();
+
+    ws.deliver({ id: 1, method: "Target.getBrowserContexts" });
+    browser.emit("disconnected");
+
+    gate.resolve();
+    await started;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(ws.sent.length, 0, "the buffered command was dropped rather than refused");
+    assert.equal(ws.readyState, 3, "the disconnect closed the socket");
+    assert.equal(ws.isPaused, false, "closing the socket resumed it so the close handshake can finish");
+    assert.equal(browser.browserSession.detached, true, "the session opened after the close was detached");
+    assert.equal(browser.listenerCount("disconnected"), 0, "the disconnect listener was unsubscribed");
+  });
+
+  test("a command arriving on a closed socket is dropped and never forwarded to the browser", async () => {
+
+    const { browser, ws } = await makeProxy();
+
+    browser.browserSession.responses.set("Browser.getVersion", { product: "TestChrome/1.0" });
+
+    ws.close();
+    ws.deliver({ id: 1, method: "Browser.getVersion" });
+
+    // Let any dispatch the drop was meant to prevent settle.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const methods = browser.browserSession.calls.map((call) => call.method);
+
+    assert.equal(methods.includes("Browser.getVersion"), false, "the command was never forwarded to the browser session");
+    assert.deepEqual(methods, ["Target.setDiscoverTargets"], "the proxy's own discovery enable stayed the session's only command");
+
+    const response = ws.sent.find((frame) => (frame as { id?: number }).id === 1);
+
+    assert.equal(response, undefined, "no frame answered the command");
   });
 });
 
