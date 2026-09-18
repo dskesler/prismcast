@@ -36,6 +36,9 @@ const deps: CreatePageWithCaptureDeps = {
 
     throw new Error("The capture acquisition must not run when the page is already closed at turn grant.");
   },
+
+  // The closed-page path never reaches a classification, so the verdict is a stub that answers with no verdict at all.
+  awaitCaptureVerdict: async (): Promise<null> => null,
   emulateCaptureSurface: async (): Promise<{ height: number; width: number }> => ({ height: 1080, width: 1920 }),
   getCurrentBrowser: async (): Promise<Browser> => ({ newPage: async (): Promise<Page> => makeClosedStubPage() } as unknown as Browser),
   installActivationHeal: async (): Promise<void> => { /* The activation heal is not what this path measures. */ },

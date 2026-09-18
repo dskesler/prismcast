@@ -80,6 +80,9 @@ const deps: CreatePageWithCaptureDeps = {
 
     return captureStream as unknown as CaptureStream;
   },
+
+  // The acquisition succeeds on every row here, so no verdict is ever asked for; the stub answers with none.
+  awaitCaptureVerdict: async (): Promise<null> => null,
   emulateCaptureSurface: async (): Promise<{ height: number; width: number }> => ({ height: 1080, width: 1920 }),
   getCurrentBrowser: async (): Promise<Browser> => ({ connected: false } as unknown as Browser),
   installActivationHeal: async (): Promise<void> => { /* Nothing to enrol on a stub page. */ },

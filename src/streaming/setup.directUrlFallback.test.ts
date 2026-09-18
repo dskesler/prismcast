@@ -73,6 +73,9 @@ const deps: CreatePageWithCaptureDeps = {
 
   acquireCaptureStream: async (): Promise<CaptureStream> => Object.assign(new Readable({ read: (): void => { /* Nothing is read from the stub capture. */ } }),
     { stop: async (): Promise<void> => undefined, stopped: Promise.resolve() }),
+
+  // Every failure these rows drive happens past acquisition, where the verdict is started and never waited on, so the stub answers with no verdict.
+  awaitCaptureVerdict: async (): Promise<null> => null,
   emulateCaptureSurface: async (): Promise<{ height: number; width: number }> => ({ height: 1080, width: 1920 }),
   getCurrentBrowser: async (): Promise<Browser> => ({ newPage: async (): Promise<Page> => makeStubPage() } as unknown as Browser),
   installActivationHeal: async (): Promise<void> => { /* The activation heal is not what this path measures. */ },

@@ -55,6 +55,9 @@ function makeDeps(failure: Error): CreatePageWithCaptureDeps {
 
     acquireCaptureStream: async (): Promise<CaptureStream> => Object.assign(new Readable({ read: (): void => { /* Nothing is read from the stub capture. */ } }),
       { stop: async (): Promise<void> => undefined, stopped: Promise.resolve() }),
+
+    // The refusal lands at the browser accessor, before any capture is attempted, so no verdict is ever asked for; the stub answers with none.
+    awaitCaptureVerdict: async (): Promise<null> => null,
     emulateCaptureSurface: async (): Promise<{ height: number; width: number }> => ({ height: 1080, width: 1920 }),
     getCurrentBrowser: async (purpose: BrowserPurpose): Promise<Browser> => {
 

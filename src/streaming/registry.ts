@@ -394,6 +394,20 @@ export function hasActiveCaptureStreams(): boolean {
   return getAllStreams().some(isCaptureIdentity);
 }
 
+/**
+ * Reports whether any registered stream has been established on the browser. A stream is established once its entry holds its page, in either mode - a capture
+ * reads that page's compositor output and a native relay keeps its page for re-establishment - and from that moment it depends on the browser the page lives in.
+ * A pending entry holds no page, so a tune that has released its page to wait on a relaunch does not count itself among the reasons that relaunch cannot run.
+ *
+ * It is deliberately narrower than hasActiveCaptureStreams beside it, which counts pending entries on purpose: the window has to be on screen for the whole tune,
+ * whereas the question here is what a browser teardown would destroy.
+ * @returns True when at least one registered stream holds a page.
+ */
+export function hasEstablishedStreams(): boolean {
+
+  return getAllStreams().some((entry) => entry.page !== null);
+}
+
 // Identity.
 
 /**

@@ -23,6 +23,7 @@
  *   - getExecutablePath (the env-var-or-search executable resolver)
  *   - emitCurrentSystemStatus (the status emitter wrapper - we drain the resulting SSE event)
  *   - seedProfilePreferences (the profile Preferences merge that enables Chrome's extension developer mode)
+ *   - isBrowserIdleForRestart (the pure cause-specific idleness decision both restart guards read)
  *
  * Importing this module pulls in puppeteer-stream which starts a WebSocketServer at evaluation time. The test runner uses --test-force-exit so that handle does
  * not prevent the file from exiting cleanly.
@@ -33,7 +34,8 @@ import { TestClock, drainClock } from "homebridge-plugin-utils/testing";
 import { afterEach, before, beforeEach, describe, test } from "node:test";
 import { buildLaunchOptions, confirmSharedWindowPlacement, createDiscoveryPage, emitCurrentSystemStatus, emulateCaptureSurface, emulateLayoutSurface,
   ensureDataDirectory, findChromeProcessesUsingProfile, getBrowserInstance, getCaptureImpairment, getChromeVersion, getExecutablePath, healActivatedCaptureTab,
-  installActivationHeal, isBrowserConnected, isCarrierPage, isGracefulShutdown, makeFocusReaffirmCallback, mirrorPlacement, noteSharedWindow, pickCarrierPage,
+  installActivationHeal, isBrowserConnected, isBrowserIdleForRestart, isCarrierPage, isGracefulShutdown, makeFocusReaffirmCallback, mirrorPlacement,
+  noteSharedWindow, pickCarrierPage,
   registerManagedPage, resolveSharedWindowCarrier, seedProfilePreferences, setGracefulShutdown, startBrowserRestartChecking, startStalePageCleanup,
   stopBrowserRestartChecking, stopStalePageCleanup, unregisterManagedPage } from "./index.ts";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -1782,6 +1784,46 @@ describe("the lifecycle timers arm on the injected clock", () => {
     stopBrowserRestartChecking();
 
     assert.equal(clock.pending, 0, "the stop drained the check off the clock");
+  });
+});
+
+describe("isBrowserIdleForRestart", () => {
+
+  /* Each cause asks a different question of the same registry, and the whole point of extracting the decision is that the difference is readable rather than
+   * spelled out at each guard. Maintenance is housekeeping, so it defers to any entry at all - replacing the browser under a tune in progress would fail that
+   * tune for nothing better than a fresher instance. Impairment is a repair the tunes are waiting on, so it asks only what a teardown would destroy: a stream
+   * that holds its page, or a page an operation still holds in flight. A single decision shared by the causes fails the deciding row below, where a pending entry
+   * is present and nothing is established.
+   */
+  test("maintenance defers to any registered entry, established or not", () => {
+
+    assert.equal(isBrowserIdleForRestart("maintenance", { establishedStreams: false, inFlightPages: 0, streamCount: 0 }), true,
+      "an empty registry is the only state a maintenance restart runs in");
+    assert.equal(isBrowserIdleForRestart("maintenance", { establishedStreams: false, inFlightPages: 0, streamCount: 1 }), false,
+      "a pending entry defers scheduled maintenance");
+    assert.equal(isBrowserIdleForRestart("maintenance", { establishedStreams: true, inFlightPages: 0, streamCount: 1 }), false,
+      "and so does an established one");
+  });
+
+  test("impairment waits for nothing established and no page held in flight", () => {
+
+    assert.equal(isBrowserIdleForRestart("impairment", { establishedStreams: false, inFlightPages: 0, streamCount: 0 }), true,
+      "an idle browser is replaced at once");
+    assert.equal(isBrowserIdleForRestart("impairment", { establishedStreams: true, inFlightPages: 0, streamCount: 1 }), false,
+      "a stream established on this browser would be destroyed by the teardown");
+    assert.equal(isBrowserIdleForRestart("impairment", { establishedStreams: false, inFlightPages: 1, streamCount: 0 }), false,
+      "and so would a page another operation still holds");
+    assert.equal(isBrowserIdleForRestart("impairment", { establishedStreams: true, inFlightPages: 2, streamCount: 3 }), false,
+      "both together defer it too");
+  });
+
+  test("the deciding row: a pending entry alone defers maintenance but not the repair", () => {
+
+    // The tune waiting on the relaunch is itself a pending entry with its page already released, so a repair that read the raw count could never run for it.
+    const waitingTune = { establishedStreams: false, inFlightPages: 0, streamCount: 1 };
+
+    assert.equal(isBrowserIdleForRestart("impairment", waitingTune), true, "the repair the waiting tune needs is not blocked by the waiting tune");
+    assert.equal(isBrowserIdleForRestart("maintenance", waitingTune), false, "while housekeeping still defers to it");
   });
 });
 

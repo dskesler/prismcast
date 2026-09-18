@@ -219,8 +219,9 @@ export function terminateStream(streamId: number, channelName: string, reason: s
 
   // With the entry gone, a browser that can no longer start captures may have nothing left to wait for, and this is the one line every termination path passes -
   // the same reason the window sync above lives here. The call reads the mark and the registry itself and returns at once when either says the moment has not
-  // arrived, so an ordinary stream end pays nothing beyond those reads.
-  restartBrowserIfImpairedAndIdle();
+  // arrived, so an ordinary stream end pays nothing beyond those reads. Fire-and-forget, because a termination has no use for the fresh browser the relaunch
+  // produces and nothing here waits on one.
+  void restartBrowserIfImpairedAndIdle();
 
   clearClients(streamId);
   clearPretuneSafetyTimer(streamId);

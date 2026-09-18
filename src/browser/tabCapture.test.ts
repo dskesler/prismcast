@@ -10,8 +10,8 @@
  * those fakes on purpose - the fingerprint and settings-shape assertions read the installed library through import.meta.resolve, because the coupling this module takes
  * on is only safe while the source it was written against is the source that is installed.
  */
-import { ACTIVE_TAB_GRANT_CEILING_MS, ACTIVE_TAB_GRANT_POLL_MS, CAPTURE_FRAME_SIZE_MS, CAPTURE_START_ATTEMPTS, CAPTURE_STREAM_HIGH_WATER_MARK,
-  EXTENSION_NOT_READY_MESSAGE, EXTENSION_READY_EXPRESSION, acquireCaptureStream } from "./tabCapture.ts";
+import { ACTIVE_TAB_GRANT_CEILING_MS, ACTIVE_TAB_GRANT_POLL_MS, CAPTURE_FRAME_SIZE_MS, CAPTURE_STREAM_HIGH_WATER_MARK, EXTENSION_NOT_READY_MESSAGE,
+  EXTENSION_READY_EXPRESSION, acquireCaptureStream } from "./tabCapture.ts";
 import type { Browser, Page } from "puppeteer-core";
 import type { CaptureStreamOptions, ExtensionRecordingSettings, TabCaptureDeps } from "./tabCapture.ts";
 import type { SelectedTab, WithTabSelectedContext } from "./tabSelection.ts";
@@ -241,8 +241,8 @@ function makeFakePage(timeline: string[]): FakePage {
 
       browser: (): Browser => ({ connected: true } as unknown as Browser),
 
-      /* The retry's diagnostic reads the window's state through this page, so the double answers the two commands that read takes. Both answers are the ordinary
-       * ones: a resolvable window that reports itself presented.
+      /* The refusal's diagnostic reads the window's state through this page, so the double answers the two commands that read takes. Both answers are the
+       * ordinary ones: a resolvable window that reports itself presented.
        */
       createCDPSession: async (): Promise<unknown> => ({
 
@@ -459,54 +459,13 @@ describe("acquireCaptureStream", () => {
     assert.equal(extension.calls.filter((call) => call.kind === "stop").length, 0, "no stop request is sent to a browser that is gone");
   });
 
-  test("retries a source-unavailable refusal once, on a fresh index, and logs the window and tab state", async () => {
+  test("a source-unavailable refusal fails after a single start and logs the window and tab state", async () => {
 
     /* The refusal arrives as a bare string, which is how puppeteer delivers a page-side rejection that is not an Error - classifying on .message would miss it
-     * entirely. The retry has to be a wholly fresh attempt: the extension opens its socket before Chrome refuses, so reusing the index would leave the second
-     * attempt sharing a socket with the first. The two state fields the warning carries are read inside the hold, while the capture's tab was still the selected
-     * one, so the tab in the log is the tab the refused start was aimed at rather than whatever was selected by the time the warning was written.
+     * entirely. One start is made and its refusal is this acquisition's verdict, carried to the caller unchanged; what the refusal means about the browser is
+     * settled a layer up, by the establishment's probe. The two state fields the warning carries are read inside the hold, while the capture's tab was still the
+     * selected one, so the tab in the log is the tab the refused start was aimed at rather than whatever was selected by the time the warning was written.
      */
-    const timeline: string[] = [];
-    const server = makeFakeServer(timeline);
-    const before = server.listeners();
-    const extension = makeFakeExtension(timeline, {
-
-      onStart: async (_settings, attempt): Promise<void> => {
-
-        if(attempt === 1) {
-
-          // eslint-disable-next-line @typescript-eslint/only-throw-error -- Chrome's rejection arrives as a bare string, which is exactly what is under test.
-          throw CAPTURE_SOURCE_UNAVAILABLE_MESSAGE;
-        }
-      }
-    });
-    const page = makeFakePage(timeline);
-    const clock = new TestClock();
-
-    let stream: Awaited<ReturnType<typeof acquireCaptureStream>> | null = null;
-
-    const warnings = await captureWarnings(async () => {
-
-      stream = await acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) });
-    });
-
-    const starts = extension.calls.filter((call) => call.kind === "start");
-
-    assert.equal(starts.length, 2, "two starts: the refusal and the retry");
-    assert.notEqual((starts[0]?.arg as ExtensionRecordingSettings).index, (starts[1]?.arg as ExtensionRecordingSettings).index,
-      "the retry publishes under a fresh index");
-    assert.ok(timeline.indexOf("handler:off") < timeline.lastIndexOf("handler:on"), "the failed attempt's handler came off before the retry registered its own");
-    assert.equal(server.listeners(), before + 1, "exactly one handler survives - the successful attempt's");
-    assert.equal(warnings.length, 1, "exactly one warning");
-    assert.match(warnings[0]?.message ?? "", /could not start the tab capture on the first attempt/, "the warning names the refusal");
-    assert.match(warnings[0]?.message ?? "", /attempt: 1/, "the warning carries which attempt refused");
-    assert.match(warnings[0]?.message ?? "", /windowState: 'normal'/, "the warning carries the window state Chrome reported at the moment of the refusal");
-    assert.match(warnings[0]?.message ?? "", /activeTab: 'https:\/\/example.test\/live'/, "and the tab the capture was aimed at");
-    assert.ok(stream, "the acquisition returned the retry's stream");
-  });
-
-  test("a second source-unavailable refusal fails the acquisition and leaves nothing behind", async () => {
-
     const timeline: string[] = [];
     const server = makeFakeServer(timeline);
     const before = server.listeners();
@@ -514,25 +473,32 @@ describe("acquireCaptureStream", () => {
 
       onStart: async (): Promise<void> => {
 
-        // eslint-disable-next-line @typescript-eslint/only-throw-error -- Chrome's rejection arrives as a bare string.
+        // eslint-disable-next-line @typescript-eslint/only-throw-error -- Chrome's rejection arrives as a bare string, which is exactly what is under test.
         throw CAPTURE_SOURCE_UNAVAILABLE_MESSAGE;
       }
     });
     const page = makeFakePage(timeline);
     const clock = new TestClock();
 
-    await assert.rejects(acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) }),
-      (error: unknown) => (error instanceof Error) && error.message.includes(CAPTURE_SOURCE_UNAVAILABLE_MESSAGE),
-      "the bare-string refusal reaches the caller as an Error carrying Chrome's text");
+    const warnings = await captureWarnings(async () => {
 
-    assert.equal(extension.calls.filter((call) => call.kind === "start").length, CAPTURE_START_ATTEMPTS, "the acquisition stops at its attempt budget");
-    assert.equal(server.listeners(), before, "every failed attempt's handler came off the server");
+      await assert.rejects(acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server) }),
+        (error: unknown) => (error instanceof Error) && error.message.includes(CAPTURE_SOURCE_UNAVAILABLE_MESSAGE),
+        "the bare-string refusal reaches the caller as an Error carrying Chrome's text");
+    });
+
+    assert.equal(extension.calls.filter((call) => call.kind === "start").length, 1, "exactly one start is made for the refusal");
+    assert.equal(warnings.length, 1, "exactly one warning");
+    assert.match(warnings[0]?.message ?? "", /Chrome refused to start the tab capture/, "the warning names the refusal");
+    assert.match(warnings[0]?.message ?? "", /windowState: 'normal'/, "the warning carries the window state Chrome reported at the moment of the refusal");
+    assert.match(warnings[0]?.message ?? "", /activeTab: 'https:\/\/example.test\/live'/, "and the tab the capture was aimed at");
+    assert.equal(server.listeners(), before, "the refused attempt left no handler on the server");
   });
 
   test("any other refusal fails after a single attempt, with no warning", async () => {
 
-    // Negative test: the retry exists for one specific answer from Chrome. Retrying on everything would double the cost of every genuine failure and paper over
-    // the collision the capture lock exists to prevent.
+    // Negative test: the refusal line exists for one specific answer from Chrome, whose diagnostics live nowhere else. Logging it for every failure would put a
+    // warning in front of the collision the capture lock exists to prevent, which is not a refusal at all.
     const timeline: string[] = [];
     const server = makeFakeServer(timeline);
     const extension = makeFakeExtension(timeline, {
@@ -555,7 +521,7 @@ describe("acquireCaptureStream", () => {
     });
 
     assert.equal(extension.calls.filter((call) => call.kind === "start").length, 1, "exactly one attempt");
-    assert.equal(warnings.length, 0, "no retry warning for a failure that is not retried");
+    assert.equal(warnings.length, 0, "no warning for a failure that carries no refusal diagnostics");
   });
 
   test("waits out a pending activeTab grant by re-attempting on the cadence, each on a fresh index", async () => {
@@ -736,37 +702,6 @@ describe("acquireCaptureStream", () => {
     assert.equal(timeline.lastIndexOf("start"), timeline.length - 2, "with the successful start immediately before it");
   });
 
-  test("never retries after the caller's signal has already aborted", async () => {
-
-    /* The caller's deadline has fired by then, so a retry would run against a turn nobody is waiting on and could hand a live capture to a page that is already
-     * closing. The refusal travels instead.
-     */
-    const timeline: string[] = [];
-    const server = makeFakeServer(timeline);
-    const controller = new AbortController();
-
-    controller.abort();
-
-    const extension = makeFakeExtension(timeline, {
-
-      onStart: async (): Promise<void> => {
-
-        // eslint-disable-next-line @typescript-eslint/only-throw-error -- Chrome's rejection arrives as a bare string.
-        throw CAPTURE_SOURCE_UNAVAILABLE_MESSAGE;
-      }
-    });
-    const page = makeFakePage(timeline);
-    const clock = new TestClock();
-
-    const warnings = await captureWarnings(async () => {
-
-      await assert.rejects(acquireCaptureStream(page.page, OPTIONS, { clock, deps: makeDeps(extension, server), signal: controller.signal }),
-        (error: unknown) => (error instanceof Error) && error.message.includes(CAPTURE_SOURCE_UNAVAILABLE_MESSAGE));
-    });
-
-    assert.equal(extension.calls.filter((call) => call.kind === "start").length, 1, "no retry runs once the caller has given up");
-    assert.equal(warnings.length, 0, "and no retry warning is logged");
-  });
 });
 
 /* The coupling assertions. This module was written against a specific version of the library and its extension, and the protocol it speaks lives in files that a

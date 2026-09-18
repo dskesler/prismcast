@@ -7,7 +7,7 @@ import type { BrowserLifecycle, BrowserPurpose, CaptureImpairment } from "./brow
 import { LOG, boundedWait, evaluateWithAbort, formatError, isProcessRunning, listProcesses, setChromeUserAgent, startTimer } from "../utils/index.ts";
 import { TimerRegistry, systemClock } from "homebridge-plugin-utils";
 import { clearLoginState, isLoginModeActive, setLoginDeps } from "./login.ts";
-import { getAllStreams, getStreamCount, hasActiveCaptureStreams, isCaptureIdentity } from "../streaming/registry.ts";
+import { getAllStreams, getStreamCount, hasActiveCaptureStreams, hasEstablishedStreams, isCaptureIdentity } from "../streaming/registry.ts";
 import { getCachedTabId, installStrayOpenTabReaper, onTabActivation } from "./tabSelection.ts";
 import { getChromeDataDir, getDataDir, getExtensionDir } from "../config/paths.ts";
 import { getExtensionPage, launch } from "puppeteer-stream";
@@ -192,9 +192,9 @@ const BROWSER_RESTART_QUIET_PERIOD = 5 * 60 * 1000;
 const BROWSER_RESTART_CHECK_INTERVAL = 30000;
 
 // Why a restart is running. The maintenance cause is the age-driven one the quiet period gates; the impairment cause is the relaunch of a browser that can no
-// longer start captures, which waits on an empty registry instead of on age. The routine's log line and its trigger differ by cause; everything else it does is
-// shared.
-type BrowserRestartCause = "impairment" | "maintenance";
+// longer start captures, which waits on nothing depending on the browser instead of on age. The routine's log line, its trigger, and the idleness it waits for
+// differ by cause; everything else it does is shared.
+export type BrowserRestartCause = "impairment" | "maintenance";
 
 // The identity of the periodic eligibility check on the restart owner's registry.
 const RESTART_CHECK_KEY = "check";
@@ -1792,18 +1792,23 @@ function handleBrowserDisconnect(): void {
 }
 
 /**
- * Records that a still-connected browser can no longer start captures - a mid-life capture death that no "disconnected" event would surface - and schedules the
+ * Records that a still-connected browser can no longer start captures - a mid-life capture death that no "disconnected" event would surface - and runs the
  * relaunch that cures it. This is the single recovery action for a browser that is alive and still serving: the mark lives on the supervisor's ready state, so its
  * running captures continue untouched, new stream requests are refused at acquire() with a 503 back-off, the recovery ladder stops offering tab replacement, and
- * the relaunch waits for the registry to empty. Exported for the streaming layer to call once its probe or its wedge has produced the verdict.
+ * the relaunch waits until nothing depends on the browser. Exported for the streaming layer to call once its probe or its wedge has produced the verdict.
+ *
+ * The returned promise settles once the relaunch this mark triggered has settled, which is what a caller that means to use the fresh browser awaits: the teardown
+ * holds the supervisor in its draining state, where acquire() rejects rather than joins, so acquiring any earlier draws that rejection instead of the new
+ * instance. A caller with nothing waiting on the outcome voids it and the relaunch proceeds on its own.
  *
  * The restart trigger uses this function's return value rather than the supervisor's transition observer, deliberately. The observer runs inside transition(), so a
  * restart begun there would call noteReadinessLost re-entrantly while the marking transition's notification is still on the stack. The observer stays a reporter -
  * the alarm and the status emit - and the caller that holds the verdict acts on it once the transition has completed.
  * @param browser - The specific browser instance the caller verified as unable to start captures.
  * @param reason - A short description of the evidence behind the verdict, carried in the alarm log and the impairment record.
+ * @returns A promise settling once the relaunch this mark triggered has settled, or at once when the verdict landed on nothing.
  */
-export function noteBrowserCaptureImpaired(browser: Browser, reason: string): void {
+export async function noteBrowserCaptureImpaired(browser: Browser, reason: string): Promise<void> {
 
   // A false answer means the verdict landed on nothing: the instance was superseded by a disconnect and relaunch while the caller was confirming it, or the browser
   // already carries a mark whose alarm and status emit have already fired. Either way there is no new state to act on.
@@ -1812,7 +1817,7 @@ export function noteBrowserCaptureImpaired(browser: Browser, reason: string): vo
     return;
   }
 
-  restartBrowserIfImpairedAndIdle();
+  await restartBrowserIfImpairedAndIdle();
 }
 
 /**
@@ -2323,17 +2328,77 @@ export function stopStalePageCleanup(): void {
  * browser is closed and immediately re-launched.
  *
  * The impairment cause is a repair rather than hygiene: a browser that can no longer start captures is unusable for new tunes no matter how young it is, so age and
- * the quiet period do not apply to it. It relaunches the moment the registry empties, which the mark itself, every stream end, and the periodic tick each check
- * for.
+ * the quiet period do not apply to it. It relaunches the moment nothing depends on the browser any more, which the mark itself, every stream end, and the periodic
+ * tick each check for.
  */
+
+/**
+ * The registry facts a restart's idleness decision is made from. One shape, read by readRestartFacts and judged by isBrowserIdleForRestart, so the decision stays
+ * a pure function of stated facts rather than of whatever each guard happened to read.
+ */
+interface RestartFacts {
+
+  // Whether any registered stream holds its page, and so would lose it to a teardown.
+  readonly establishedStreams: boolean;
+
+  // How many pages an operation currently holds for its own duration, a tune mid-setup above all.
+  readonly inFlightPages: number;
+
+  // How many entries the registry holds, pending ones included.
+  readonly streamCount: number;
+}
+
+/**
+ * Decides whether the browser may be torn down for the given cause, from facts read at the call. Each cause asks a different question of the same registry, so
+ * the decision is stated once here rather than spelled out at each guard.
+ *
+ * Maintenance is opportunistic housekeeping, so it waits for an empty registry outright: a pending entry is a tune in progress, and replacing the browser under
+ * one would fail it for nothing better than a fresher instance. Impairment is a repair the tunes themselves are waiting on, so it asks the narrower question of
+ * what a teardown would actually destroy - a stream established on this browser, whose entry holds its page, or a page an operation still holds in flight. A tune
+ * refused a capture start holds neither while it waits for the relaunch, so the very pending entry that maintenance would defer to is not a reason to leave an
+ * unusable browser in place. A tune that has acquired the browser but not yet opened its page falls outside every dependency source for the same reason and
+ * deliberately so: it holds nothing a relaunch would destroy, neither a page nor a capture, and its own capture start would meet the impaired browser in any
+ * case, so the relaunch may run under it.
+ * @param cause - Why the restart wants to run.
+ * @param facts - The registry facts read at the call.
+ * @returns True when the browser may be torn down for this cause.
+ */
+export function isBrowserIdleForRestart(cause: BrowserRestartCause, facts: RestartFacts): boolean {
+
+  switch(cause) {
+
+    case "impairment": {
+
+      return !facts.establishedStreams && (facts.inFlightPages === 0);
+    }
+
+    case "maintenance": {
+
+      return facts.streamCount === 0;
+    }
+  }
+}
+
+/**
+ * Reads the registry facts the idleness decision is made from, at the moment of the call.
+ * @returns The facts.
+ */
+function readRestartFacts(): RestartFacts {
+
+  return { establishedStreams: hasEstablishedStreams(), inFlightPages: inFlightPageIds.size, streamCount: getStreamCount() };
+}
 
 /**
  * Relaunches a browser that can no longer start captures, as soon as nothing depends on it. Every trigger routes here - the mark itself, each stream termination,
  * and the periodic restart check as the backstop for a moment when the other two could not act (login mode above all) - so the decision lives in one place rather
  * than being re-derived by each. Idleness rather than age is the condition, because the mark makes the browser useless for new tunes immediately while its running
- * captures are still worth finishing, so the earliest safe moment is exactly the moment the last of them ends.
+ * captures are still worth finishing, so the earliest safe moment is exactly the moment the last thing depending on this browser lets go of it.
+ *
+ * The returned promise settles once the relaunch has settled, for the caller that goes on to acquire the fresh browser; a trigger with nothing waiting on the
+ * outcome voids it. An early return resolves at once, because there is nothing for such a caller to wait for.
+ * @returns A promise settling once the relaunch has settled, or at once when no relaunch runs.
  */
-export function restartBrowserIfImpairedAndIdle(): void {
+export async function restartBrowserIfImpairedAndIdle(): Promise<void> {
 
   if(supervisor.captureImpairment() === null) {
 
@@ -2341,15 +2406,15 @@ export function restartBrowserIfImpairedAndIdle(): void {
   }
 
   // A marked browser's restart belongs to this path, so a maintenance quiet period pending from before the mark is retired the first time any trigger observes the
-  // mark - whether or not the registry is idle yet - rather than being left to fire against the browser the relaunch will have replaced.
+  // mark - whether or not the browser is idle yet - rather than being left to fire against the browser the relaunch will have replaced.
   cancelRestartQuietTimer();
 
-  if(getStreamCount() > 0) {
+  if(!isBrowserIdleForRestart("impairment", readRestartFacts())) {
 
     return;
   }
 
-  void executeBrowserRestart("impairment");
+  await executeBrowserRestart("impairment");
 }
 
 /**
@@ -2385,7 +2450,7 @@ function checkBrowserRestart(timers: TimerRegistry): void {
    */
   if(supervisor.captureImpairment() !== null) {
 
-    restartBrowserIfImpairedAndIdle();
+    void restartBrowserIfImpairedAndIdle();
 
     return;
   }
@@ -2444,11 +2509,13 @@ async function executeBrowserRestart(cause: BrowserRestartCause): Promise<void> 
   cancelRestartQuietTimer();
 
   // Final guard: re-check all preconditions. Conditions may have changed during the quiet period (e.g., a stream started just before the timer fired, login mode
-  // was activated, or the browser disconnected on its own). Reading current()/currentLaunchTime() together keeps the ready-state check and the age source consistent.
+  // was activated, or the browser disconnected on its own). Reading current()/currentLaunchTime() together keeps the ready-state check and the age source
+  // consistent. The idleness question is asked for this restart's own cause, because what a maintenance sweep must defer to and what a repair must defer to are
+  // not the same set of streams.
   const browser = supervisor.current();
   const launchTime = supervisor.currentLaunchTime();
 
-  if(gracefulShutdownInProgress || isLoginModeActive() || (getStreamCount() > 0) || !browser?.connected || (launchTime === null)) {
+  if(gracefulShutdownInProgress || isLoginModeActive() || !isBrowserIdleForRestart(cause, readRestartFacts()) || !browser?.connected || (launchTime === null)) {
 
     LOG.debug("browser:lifecycle", "Browser restart aborted - preconditions no longer met.");
 

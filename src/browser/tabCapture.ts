@@ -12,9 +12,10 @@
  * in Node rather than in the browser. Owning the start means the only serialization is the one whose deadline, abort signal, and wedge policy the caller already
  * controls.
  *
- * A rejected start is a retry rather than an outage. Chrome answers a start it cannot serve with "Could not start video source", and that answer is worth one
- * more attempt against a fresh socket index; a second refusal is a real failure carrying the window and selected-tab state that explains it, read while that tab
- * is still selected. The activeTab grant gets the same treatment: rather than sleeping a fixed interval after the keyboard command and hoping the grant landed,
+ * A rejected start is reported rather than judged. Chrome answers a start it cannot serve with "Could not start video source", and the whole response here is one
+ * warning carrying the window and selected-tab state that explains it, read while that tab is still selected, with the rejection travelling to the caller
+ * unchanged. What such a refusal says about the browser is the establishment's question, settled by its capture probe, so this layer holds no retry policy of its
+ * own. The activeTab grant is the one wait that does belong here: rather than sleeping a fixed interval after the keyboard command and hoping the grant landed,
  * the start is attempted and Chrome's own "has not been invoked for the current page" answer drives a short poll, so a grant that lands immediately costs nothing.
  *
  * The coupling this module takes on is the extension's protocol, and it is asserted rather than trusted: tabCapture.test.ts fingerprints the three library files
@@ -56,10 +57,6 @@ export const ACTIVE_TAB_GRANT_PENDING_MESSAGE = "has not been invoked for the cu
 // The failure when a browser is serving without a loaded capture extension. The launch gate establishes readiness before a browser is published, so reaching
 // this means the extension went away underneath a published browser.
 export const EXTENSION_NOT_READY_MESSAGE = "The capture extension is not ready on this browser.";
-
-// How many times a start is attempted before the acquisition fails. Two: the first attempt, and one retry for the source-unavailable answer that a fresh attempt
-// against a fresh socket index has been observed to clear.
-export const CAPTURE_START_ATTEMPTS = 2;
 
 // The cadence between start attempts while Chrome is still reporting the activeTab grant pending, and the ceiling on that wait. A grant that lands with the
 // keyboard command costs one attempt and no wait at all; the ceiling bounds the case where it never lands, so the caller sees Chrome's own message rather than
@@ -158,7 +155,7 @@ export interface TabCaptureDeps {
 }
 
 /**
- * Per-call context for an acquisition: the clock its waits run on, the collaborators it talks through, and the caller's abort signal.
+ * Per-call context for an acquisition: the clock its waits run on and the collaborators it talks through.
  */
 export interface AcquireCaptureStreamContext {
 
@@ -167,9 +164,6 @@ export interface AcquireCaptureStreamContext {
 
   // The library collaborators. Defaults to the real ones.
   readonly deps?: TabCaptureDeps;
-
-  // The caller's own deadline signal. A retry never starts after it has fired, because by then the caller has already given up on this acquisition.
-  readonly signal?: AbortSignal;
 }
 
 /* One start attempt's resources: the socket index it published under, the server listener it registered, the socket that connected for it, the signal for its
@@ -191,8 +185,8 @@ type AttemptOutcome = { attempt: CaptureAttempt; kind: "started" } | { error: un
 
 /**
  * A start Chrome refused, carrying the state that explains the refusal. The state is read while the capture's tab is still selected, which is the only moment it
- * describes the conditions the start actually ran under. Chrome's own refusal text is the message, so the capture-infrastructure classifier and the retry's
- * substring test both keep matching on it.
+ * describes the conditions the start actually ran under. Chrome's own refusal text is the message, so the capture-infrastructure classifier and the
+ * establishment's refusal test both keep matching on it.
  *
  * Module-private on purpose: the judgment "this is a capture-infrastructure failure" belongs to one mechanism, the pattern list in streaming/recovery.ts, which
  * reads the message. This class is the internal typed carrier for the diagnostics that travel alongside it, not a second way to ask the same question.
@@ -469,19 +463,19 @@ function attachCaptureControls(attempt: CaptureAttempt, extension: Page, server:
 /**
  * Acquires a tab capture for a page: one started recording, its chunks arriving as a readable stream, and the two controls that end it.
  *
- * A start Chrome refuses with "Could not start video source" is retried once against a fresh attempt, with the window's reported state and the selected tab logged
- * so the refusal explains itself. A second refusal, any other rejection, and a refusal arriving after the caller's signal has aborted all fail the acquisition
- * unchanged - there is nothing left to retry into.
+ * Exactly one start is made. A start Chrome refuses with "Could not start video source" is logged once with the window's reported state and the selected tab, so
+ * the refusal explains itself, and then fails the acquisition unchanged; whether that refusal is the browser's fault and what should follow are the
+ * establishment's to decide from its capture probe. Every other rejection fails the acquisition the same way, with no log of its own.
  * @param page - The page to capture.
  * @param options - What the capture is asked for.
- * @param context - The clock, collaborators, and caller abort signal. Defaults to the production collaborators on the real clock, with no signal.
+ * @param context - The clock and collaborators. Defaults to the production collaborators on the real clock.
  * @returns The started capture.
- * @throws When the extension is not ready, its tab cannot be selected, or the start fails on every attempt.
+ * @throws When the extension is not ready, its tab cannot be selected, or the start fails.
  */
 export async function acquireCaptureStream(page: Page, options: CaptureStreamOptions,
   context: AcquireCaptureStreamContext = {}): Promise<CaptureStream> {
 
-  const { clock = systemClock, deps = defaultTabCaptureDeps, signal } = context;
+  const { clock = systemClock, deps = defaultTabCaptureDeps } = context;
   const acquisitionElapsed = startTimer(clock);
   const extension = await deps.getExtensionPage(page.browser());
   const server = await deps.wss;
@@ -497,45 +491,36 @@ export async function acquireCaptureStream(page: Page, options: CaptureStreamOpt
     throw new Error(EXTENSION_NOT_READY_MESSAGE);
   }
 
-  let failure: unknown;
+  try {
 
-  for(let attempt = 1; attempt <= CAPTURE_START_ATTEMPTS; attempt++) {
+    const started = await acquireOnce(page, options, { clock, deps, extension, server });
+    const stream = attachCaptureControls(started, extension, server);
 
-    try {
+    /* Both close paths end the recording. The owner's disposer destroys the stream, which emits close; a page that dies takes its capture with it and fires
+     * the page's own close. Registering here rather than inside the socket handler means a capture whose socket never connected still stops cleanly.
+     */
+    page.once("close", () => { void stream.stop(); });
+    stream.once("close", () => { void stream.stop(); });
 
-      // eslint-disable-next-line no-await-in-loop -- The attempts are a retry sequence: each has to fail before the next is worth making.
-      const started = await acquireOnce(page, options, { clock, deps, extension, server });
-      const stream = attachCaptureControls(started, extension, server);
+    LOG.debug("timing:startup", "Capture acquired in %dms.", acquisitionElapsed());
 
-      /* Both close paths end the recording. The owner's disposer destroys the stream, which emits close; a page that dies takes its capture with it and fires
-       * the page's own close. Registering here rather than inside the socket handler means a capture whose socket never connected still stops cleanly.
-       */
-      page.once("close", () => { void stream.stop(); });
-      stream.once("close", () => { void stream.stop(); });
+    return stream;
+  } catch(error) {
 
-      LOG.debug("timing:startup", "Capture acquired in %dms (attempt %d of %d).", acquisitionElapsed(), attempt, CAPTURE_START_ATTEMPTS);
+    /* Chrome's refusal earns a line of its own, because the state it was read under is recoverable nowhere else: the window's reported state and the tab the
+     * start was aimed at were gathered inside the hold, while that tab was still the selected one, and by the time this rejection reaches any other layer the
+     * selection is back where the user left it. A refusal that arrives without that state is one no selection was live for, so its fields are simply absent.
+     * The line reports and nothing more - the acquisition draws no conclusion about the browser from a single refusal.
+     */
+    if(formatError(error).includes(CAPTURE_SOURCE_UNAVAILABLE_MESSAGE)) {
 
-      return stream;
-    } catch(error) {
-
-      failure = error;
-
-      // A refusal is worth another attempt only while there is one left to make and the caller is still waiting for it. Everything else is this acquisition's
-      // verdict, and it travels unchanged.
-      if(!formatError(error).includes(CAPTURE_SOURCE_UNAVAILABLE_MESSAGE) || (attempt >= CAPTURE_START_ATTEMPTS) || signal?.aborted) {
-
-        break;
-      }
-
-      // The refusal carries the state it was read under, gathered inside the hold while the capture's tab was still the selected one. A refusal that arrives
-      // without that state is one no selection was live for, so its fields are simply absent.
       const diagnostics = (error instanceof CaptureStartRefusedError) ? error.diagnostics : { activeTab: null, windowState: null };
 
-      LOG.warn("Chrome could not start the tab capture on the first attempt; retrying once.",
-        { activeTab: diagnostics.activeTab, attempt, elapsedMs: acquisitionElapsed(), windowState: diagnostics.windowState });
+      LOG.warn("Chrome refused to start the tab capture.",
+        { activeTab: diagnostics.activeTab, elapsedMs: acquisitionElapsed(), windowState: diagnostics.windowState });
     }
-  }
 
-  // The failure is already an Error: acquireOnce normalizes every rejection at the one boundary where a page-side value enters, so it travels unchanged.
-  throw failure;
+    // The failure is already an Error: acquireOnce normalizes every rejection at the one boundary where a page-side value enters, so it travels unchanged.
+    throw error;
+  }
 }
