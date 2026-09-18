@@ -32,7 +32,6 @@ import { getPresetViewport } from "../config/presets.ts";
 import path from "node:path";
 import { launch as puppeteerLaunch } from "puppeteer-core";
 import { startPrecaching } from "./precaching.ts";
-import { terminateStream } from "../streaming/lifecycle.ts";
 
 const { promises: fsPromises } = fs;
 
@@ -167,6 +166,32 @@ let captureProbe: Nullable<CaptureProbe> = null;
 export function setCaptureProbe(probe: CaptureProbe): void {
 
   captureProbe = probe;
+}
+
+/* Stream teardown belongs to the streaming layer: terminateStream (streaming/lifecycle.ts) owns the whole cleanup sequence - segmenter, monitor, page, registry,
+ * client tracking and SSE events - and a readiness loss here runs that same sequence rather than a second one that could drift from it. It is injected via
+ * setStreamTerminator because lifecycle.ts already depends on this module for the shutdown flag, the window sync and the managed-page registry: injecting the
+ * function rather than importing it keeps that dependency one-directional, the same boundary setCaptureProbe draws with streaming/setup.ts. The terminator's
+ * optional clock parameter is left off this type because the browser layer has no clock to offer and takes the streaming layer's default.
+ */
+type StreamTerminator = (streamId: number, channelName: string, reason: string) => void;
+
+/* The authoritative stream terminator. Null until streaming/lifecycle.ts injects terminateStream at module load, which the import order places ahead of any
+ * browser launch: index.ts value-imports app.ts, app.ts value-imports streaming/lifecycle.ts, and a module body finishes before the body of anything that
+ * imports it, so the injection has run by the time index.ts's own body calls startServer - the earliest moment a launch, and so a disconnect, can happen. A
+ * still-null terminator at readiness loss is reported at ERROR and the teardown carries on (see the call site), because losing the rest of the teardown on top
+ * of the stream cleanup would make a recoverable situation worse.
+ */
+let streamTerminator: Nullable<StreamTerminator> = null;
+
+/**
+ * Injects the authoritative stream terminator used when browser readiness is lost. Called once from streaming/lifecycle.ts at module load. Separating the wiring
+ * from the call keeps browser/index.ts free of a streaming-layer import.
+ * @param terminator - The function that tears down one stream and all of the resources it owns.
+ */
+export function setStreamTerminator(terminator: StreamTerminator): void {
+
+  streamTerminator = terminator;
 }
 
 // The identity of the periodic sweep on the stale-page owner's registry.
@@ -1756,11 +1781,25 @@ function relinquishBrowserReadiness(streamTerminationReason: string): void {
     LOG.info("Login mode ended due to browser readiness loss.");
   }
 
-  // Terminate every active stream using the authoritative terminateStream for consistent cleanup. Kept even during graceful shutdown as a defensive measure -
-  // terminateStream() is safe to call more than once, so if streams were already terminated by the caller, this harmlessly iterates an empty array.
-  for(const streamInfo of getAllStreams()) {
+  /* Terminate every active stream through the streaming layer's authoritative terminator, so a readiness loss cleans up exactly the way every other termination
+   * path does. Kept even during graceful shutdown as a defensive measure - termination is safe to call more than once, so streams the caller already tore down
+   * leave this a harmless pass over an empty array.
+   */
+  const activeStreams = getAllStreams();
 
-    terminateStream(streamInfo.id, streamInfo.info.storeKey, streamTerminationReason);
+  if(streamTerminator) {
+
+    for(const streamInfo of activeStreams) {
+
+      streamTerminator(streamInfo.id, streamInfo.info.storeKey, streamTerminationReason);
+    }
+  } else {
+
+    /* An unwired terminator means the streaming layer never loaded, so nothing here can run the streams' cleanup sequence. Report it and keep going: the page
+     * tracking and status emission below are still worth doing, and abandoning them would compound a wiring failure with a half-finished teardown.
+     */
+    LOG.error("Stream cleanup was skipped on browser readiness loss because no stream terminator is wired. Active streams left untouched: %s.",
+      activeStreams.length);
   }
 
   // The session those streams captured on is over, so whatever page tracking survived their termination belongs to a browser that is gone.

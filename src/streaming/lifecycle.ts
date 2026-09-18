@@ -7,7 +7,7 @@ import { LOG, formatDuration, formatError, getAbortController, unregisterAbortCo
 import { cancelPrerollTimer, getStream, unregisterStream } from "./registry.ts";
 import { formatKeyframeStatsSummary, formatSessionStatsSummary } from "./fmp4Segmenter.ts";
 import { formatRecoveryMetricsSummary, getTotalRecoveryAttempts } from "./recovery.ts";
-import { isGracefulShutdown, restartBrowserIfImpairedAndIdle, syncWindowVisibility, unregisterManagedPage } from "../browser/index.ts";
+import { isGracefulShutdown, restartBrowserIfImpairedAndIdle, setStreamTerminator, syncWindowVisibility, unregisterManagedPage } from "../browser/index.ts";
 import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import type { RecoveryMetrics } from "./recovery.ts";
@@ -29,9 +29,20 @@ import { systemClock } from "homebridge-plugin-utils";
  * - Clearing client tracking data
  * - Emitting SSE events
  *
- * Callers are responsible for calling emitCurrentSystemStatus() after termination if they need to update the SSE system status. This is not done automatically to
- * avoid circular dependencies with the browser module.
+ * Callers own the SSE system status emission that follows a termination, calling emitCurrentSystemStatus() themselves when they need one. Leaving it to the
+ * caller is what lets a teardown that terminates a batch of streams emit once for the whole batch rather than once per stream, and what lets a caller whose
+ * clients are already gone - graceful shutdown - skip the emission entirely.
  */
+
+// Wiring.
+
+/* Inject this module's terminator into the browser module's readiness-loss path, which has to tear streams down through terminateStream so its cleanup matches
+ * every other termination path. Injecting the function rather than having browser/index.ts import it keeps the dependency one-directional: this module names
+ * browser/index.ts and browser/index.ts does not name it back, which is the same boundary setCaptureProbe draws between browser/index.ts and
+ * streaming/setup.ts. terminateStream is a hoisted function declaration, so this call reads it at module evaluation time regardless of where it sits in the
+ * file.
+ */
+setStreamTerminator(terminateStream);
 
 // State.
 
@@ -155,8 +166,8 @@ function disposeStreamResources(entry: StreamRegistryEntry): void {
  * to three readable phases: a prologue that snapshots the summary statistics while the resources are still live, disposeStreamResources() to tear down the stream's
  * owned resources, and the index/membership cleanup plus the termination log.
  *
- * Note: This function does NOT call emitCurrentSystemStatus() to avoid circular dependencies with the browser module. Callers should call emitCurrentSystemStatus()
- * after termination if they need to update the SSE system status.
+ * Note: this function does not emit SSE system status. Callers call emitCurrentSystemStatus() themselves when they need one, which lets a caller terminating a
+ * batch of streams emit once for the whole batch, and lets one whose clients are already gone, such as graceful shutdown, skip the emission.
  * @param streamId - The numeric stream ID.
  * @param channelName - The channel name for channel mapping cleanup.
  * @param reason - The reason for termination (e.g., "idle timeout", "circuit breaker").
@@ -212,8 +223,8 @@ export function terminateStream(streamId: number, channelName: string, reason: s
    * than at each caller for the same reason the rest of this cleanup does: nine paths reach termination, and a policy trigger any one of them could forget is a
    * window left on screen for the rest of the session. Fire-and-forget, because the executor serializes and no caller of terminateStream waits on presentation.
    *
-   * This differs from the SSE emission the notes above keep caller-owned: that exclusion is about emitCurrentSystemStatus's own import graph, whereas the sync
-   * travels the module edge this file already has to browser/index.ts.
+   * This differs from the SSE emission the notes above keep caller-owned: a caller batches that emission across a multi-stream teardown or suppresses it when
+   * nobody is listening, while the window policy has to settle on every termination, so it belongs here.
    */
   void syncWindowVisibility();
 
