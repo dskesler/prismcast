@@ -11,12 +11,12 @@ import type { Migration, ValidationIssue } from "./persistence.ts";
 import { PREDEFINED_CHANNELS, PREDEFINED_TAGS } from "../channels/index.ts";
 import { buildServiceGroups, getAllServiceTags, getResolvedChannel, isChannelAvailableByService, isServiceVariant,
   resolveServiceKey, setEnabledServices, setServiceSelections } from "./services.ts";
+import { pickBindingFields, pickIdentity, pickIdentityFields } from "./channelIdentity.ts";
 import { CONFIG } from "./index.ts";
 import fs from "node:fs";
 import { getChannelsFilePath } from "./paths.ts";
 import { isDeepStrictEqual } from "node:util";
 import { mutateConfig } from "./userConfig.ts";
-import { pickIdentity } from "./channelIdentity.ts";
 
 const { promises: fsPromises } = fs;
 
@@ -587,54 +587,6 @@ function buildResolvedCanonicals(stored: StoredChannelMap): ResolvedChannelMap {
 function stripNulls(stored: StoredChannel): StoredChannel {
 
   return Object.fromEntries(Object.entries(stored).filter(([ , v ]) => v !== null));
-}
-
-/* Module-private partition Sets, derived once from the type-system source of truth. The Sets back the public picker functions below; callers never reference
- * the Sets directly. Adding or renaming a field in CHANNEL_IDENTITY_KEYS / CHANNEL_BINDING_KEYS automatically updates both Sets at runtime - the partition
- * lives in types/channels.ts and these are the single derived runtime form.
- */
-const IDENTITY_FIELDS: ReadonlySet<string> = new Set(CHANNEL_IDENTITY_KEYS);
-const BINDING_FIELDS: ReadonlySet<string> = new Set(CHANNEL_BINDING_KEYS);
-
-/**
- * Internal: filters a delta to fields in the supplied allowlist. Backs pickIdentityFields and pickBindingFields. Not exported - the public surface is the
- * named pickers, which hide the partition Sets so consumers never have to know how the partition is enumerated.
- */
-function filterDeltaFields(delta: ChannelDelta, allowlist: ReadonlySet<string>): ChannelDelta {
-
-  const filtered: Record<string, unknown> = {};
-
-  for(const [ field, value ] of Object.entries(delta)) {
-
-    if(allowlist.has(field)) {
-
-      filtered[field] = value;
-    }
-  }
-
-  return filtered;
-}
-
-/**
- * Returns the identity-only subset of a ChannelDelta - the fields enumerated by CHANNEL_IDENTITY_KEYS. Used by the per-field write router (PUT handler) and
- * the storage normalizer's heal path to split a full delta into identity-only and binding-only halves so each half is routed to the correct stored entry.
- * @param delta - The delta to project.
- * @returns A new delta with only identity fields retained.
- */
-export function pickIdentityFields(delta: ChannelDelta): ChannelDelta {
-
-  return filterDeltaFields(delta, IDENTITY_FIELDS);
-}
-
-/**
- * Returns the binding-only subset of a ChannelDelta - the fields enumerated by CHANNEL_BINDING_KEYS. Peer to pickIdentityFields; together they cover the
- * delta surface and partition it cleanly.
- * @param delta - The delta to project.
- * @returns A new delta with only binding fields retained.
- */
-export function pickBindingFields(delta: ChannelDelta): ChannelDelta {
-
-  return filterDeltaFields(delta, BINDING_FIELDS);
 }
 
 /**
