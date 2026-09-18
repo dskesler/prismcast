@@ -1057,6 +1057,10 @@ export async function readConfig(): Promise<UserConfigLoadResult> {
 /**
  * Serialized read-modify-write operation on config.json. The mutation function receives the current config (already migrated to the latest schema version) and
  * modifies it in place. The store handles atomicity, serialization, corruption guard, backup, schema migration, and filterDefaults via the framework.
+ *
+ * This writes the file and nothing else. A caller whose change must be visible to the running process either mirrors the value into CONFIG itself or routes
+ * through reloadConfiguration(), which re-reads the file and dispatches the diff to the live-apply handlers. Keeping the two apart is deliberate: that reload
+ * diffs the re-read file against CONFIG, so a mutateConfig that updated CONFIG on its own would hand it an empty diff and no handler would ever fire.
  * @param fn - Mutation function. Receives current config. Modify in place; return value is ignored.
  * @throws FileStoreParseError if config.json contains invalid JSON and no usable backup exists.
  */

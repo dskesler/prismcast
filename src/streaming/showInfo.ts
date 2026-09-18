@@ -719,7 +719,7 @@ async function loadPersistedDvrHost(): Promise<void> {
 }
 
 /**
- * Persists the DVR host to the config file so it survives restarts.
+ * Persists the DVR host to the config file so it survives restarts, and mirrors it into the running configuration so both hold the discovered value.
  * @param host - The DVR server hostname or IP address.
  */
 async function persistDvrHost(host: string): Promise<void> {
@@ -731,6 +731,12 @@ async function persistDvrHost(host: string): Promise<void> {
       config.channelsDvr ??= {};
       config.channelsDvr.host = host;
     });
+
+    /* mutateConfig writes the file alone, so without this the running configuration would keep the host it started with. The cost lands on the next settings
+     * save, which diffs the re-read file against CONFIG: the host would surface as a change the operator never made, and because nothing applies channelsDvr
+     * live, that save would answer that a restart is required.
+     */
+    CONFIG.channelsDvr.host = host;
   } catch(error) {
 
     LOG.debug("streaming:showinfo", "Failed to persist DVR host: %s.", formatError(error));
