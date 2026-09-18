@@ -10,7 +10,7 @@ import { VALID_OPTIONAL_COLUMNS, buildChannelTableState } from "../table.ts";
 import { markSetupCompleted, mutateChannelDisplayPrefs } from "../../../../config/userChannels.ts";
 import { sendSuccess, sendValidationError } from "../../http/envelope.ts";
 import type { ChannelSortField } from "../../../../types/index.ts";
-import { VALID_SORT_FIELDS } from "../../../../config/services.ts";
+import { VALID_SORT_FIELDS } from "../../../../config/channelSort.ts";
 import { route } from "../http/handler.ts";
 
 /**

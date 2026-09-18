@@ -6,7 +6,7 @@
  * snapshot semantics so a bulk action targets exactly what the user sees in the table.
  */
 import type { Express, Request, Response } from "express";
-import { VALID_SORT_FIELDS, compareChannelSort } from "../../../../config/services.ts";
+import { VALID_SORT_FIELDS, compareChannelSort } from "../../../../config/channelSort.ts";
 import { applyChannelDelta, getEffectiveHdhrEnabled, getVisibleChannels, isInVocabulary, isVisibleChannel, mutateChannels, tagsMatch,
   transformChannelTags } from "../../../../config/userChannels.ts";
 import { sendError, sendSuccess, sendValidationError } from "../../http/envelope.ts";

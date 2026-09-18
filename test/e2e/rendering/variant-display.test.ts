@@ -17,10 +17,11 @@
  */
 import { createIntegrationContext, initializePersistence } from "../../helpers/integration.helpers.ts";
 import { describe, test } from "node:test";
-import { mutateEnabledServices, setServiceSelection } from "../../../src/config/services.ts";
 import assert from "node:assert/strict";
 import { generateChannelRowHtml } from "../../../src/routes/config/channels/table.ts";
 import { getProfiles } from "../../../src/config/profiles.ts";
+import { mutateEnabledServices } from "../../../src/config/services.ts";
+import { setServiceSelection } from "../../../src/config/userChannels.ts";
 
 /* Returns every <option> element from the variant dropdown rendered for the given channel key. Each entry exposes the option's value, its data-provider-tag,
  * the selected flag, and the hidden flag - the attributes the test cares about. Returns an empty array when no <select> is present (single-service channels

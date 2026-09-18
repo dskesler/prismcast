@@ -7,12 +7,12 @@
  */
 import type { Express, Request, Response } from "express";
 import { getAllServiceTags, getCanonicalKey, getChannelServiceLabel, getEnabledServices, getResolvedChannel, getServiceGroup, getServiceSelection,
-  getServiceTagForChannel, mutateEnabledServices, mutateServiceSelections, setServiceSelection } from "../../../../config/services.ts";
+  getServiceTagForChannel, mutateEnabledServices } from "../../../../config/services.ts";
+import { getChannelListing, mutateServiceSelections, setServiceSelection } from "../../../../config/userChannels.ts";
 import { sendSuccess, sendValidationError } from "../../http/envelope.ts";
 import { LOG } from "../../../../utils/index.ts";
 import type { Nullable } from "../../../../types/index.ts";
 import { buildChannelTableState } from "../table.ts";
-import { getChannelListing } from "../../../../config/userChannels.ts";
 import { route } from "../http/handler.ts";
 
 /**

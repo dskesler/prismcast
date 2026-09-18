@@ -10,9 +10,8 @@
  */
 import { createIntegrationContext, initializePersistence } from "../../helpers/integration.helpers.ts";
 import { describe, test } from "node:test";
-import { getChannelCustomizations, mutateChannels } from "../../../src/config/userChannels.ts";
+import { getChannelCustomizations, mutateChannels, setServiceSelection } from "../../../src/config/userChannels.ts";
 import assert from "node:assert/strict";
-import { setServiceSelection } from "../../../src/config/services.ts";
 
 describe("getChannelCustomizations - provenance reporting", () => {
 

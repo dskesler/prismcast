@@ -4,8 +4,9 @@
  */
 import type { ChannelSortField, SortDirection } from "../types/index.ts";
 import type { Express, Request, Response } from "express";
-import { VALID_SORT_FIELDS, compareChannelSort, getAllServiceTags, getServiceTagForChannel, resolveServiceKey } from "../config/services.ts";
+import { VALID_SORT_FIELDS, compareChannelSort } from "../config/channelSort.ts";
 import { getActiveTagVocabulary, getAllChannels, getChannelEffectiveTags, tagsMatch } from "../config/userChannels.ts";
+import { getAllServiceTags, getServiceTagForChannel, resolveServiceKey } from "../config/services.ts";
 import { CONFIG } from "../config/index.ts";
 import { escapeM3uAttribute } from "../utils/m3u.ts";
 import { getProfileForChannel } from "../config/profiles.ts";

@@ -5,9 +5,10 @@
  * functions over either their argument or the static PREDEFINED_CHANNELS map, so they are unit-testable without runtime initialization.
  */
 import type { ChannelDelta, ResolvedChannel, StoredChannel } from "../types/index.ts";
-import { applyChannelDelta, getEastWithPacificPredefinedKeys, getPacificPredefinedKeys, pickIdentity } from "./userChannels.ts";
+import { applyChannelDelta, getEastWithPacificPredefinedKeys, getPacificPredefinedKeys } from "./userChannels.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { pickIdentity } from "./channelIdentity.ts";
 
 describe("pickIdentity", () => {
 
