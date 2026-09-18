@@ -355,6 +355,7 @@ describe("createHLSState", () => {
     assert.equal(state.resumeSegmentIndex, 0);
     assert.equal(state.segmentBytes, 0);
     assert.equal(state.segments.size, 0);
+    assert.equal(state.setupFailure, null);
     assert.equal(state.videoPlaylist, "");
   });
 

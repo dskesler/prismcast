@@ -51,6 +51,15 @@ export interface SegmentEmitter extends EventEmitter {
 export type InitSegmentTrack = "audio" | "video";
 
 /**
+ * The HTTP status and user-facing message a failed stream setup answers its clients with.
+ */
+export interface SetupFailureStatus {
+
+  readonly statusCode: number;
+  readonly userMessage: string;
+}
+
+/**
  * HLS segment and playlist storage for a stream. This includes the fMP4 initialization segment (codec configuration), media segments (.m4s files), and the current
  * playlist content. The playlistReady promise allows callers to wait for the first playlist to be generated.
  *
@@ -159,6 +168,12 @@ export interface HLSState {
   // Snapshotted resume segment index from the prior session. Read once at stream registration and stored here so both the preroll timer callback and the segmenter
   // creation in completeStreamSetup() use the same value - eliminating the TTL race that would occur if each read the resume map independently.
   resumeSegmentIndex: number;
+
+  // Setup failure.
+
+  // The status a failed setup answers with, recorded just before the pending entry is terminated so a playlist request already waiting on this entry can answer
+  // with it. Null for every stream whose setup has not failed.
+  setupFailure: Nullable<SetupFailureStatus>;
 }
 
 /**
@@ -490,6 +505,7 @@ export function createHLSState(): HLSState {
     segmentBytes: 0,
     segmentEmitter,
     segments: new Map(),
+    setupFailure: null,
     signalInitSegmentReady,
     signalPlaylistReady,
     videoPlaylist: ""

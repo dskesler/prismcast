@@ -3,7 +3,7 @@
  * hls.ts: HLS streaming request handlers for PrismCast.
  */
 import type { CreatePageWithCaptureResult, StreamSetupResult, TabReplacementHandlerFactory } from "./setup.ts";
-import type { HLSState, StreamRegistryEntry } from "./registry.ts";
+import type { HLSState, SetupFailureStatus, StreamRegistryEntry } from "./registry.ts";
 import { LOG, formatError, formatResolutionLabel, runWithStreamContext, startTimer } from "../utils/index.ts";
 import type { Nullable, ResolvedChannel, ResolvedSiteProfile } from "../types/index.ts";
 import type { Request, Response } from "express";
@@ -66,6 +66,10 @@ import { triggerShowNameUpdate } from "./showInfo.ts";
 // content directly. This ensures fast-tuning services (native HLS at 2-3s, most capture services at 4-7s) never see preroll, while slow services (Xfinity/Cox at
 // 13-15s) get preroll content after the delay to prevent HTTP timeouts.
 const PREROLL_DELAY_MS = 9000;
+
+// How long a playlist request waits for a playlist to exist, in milliseconds. It bounds the window between a pending entry's registration and the first playlist
+// from either the preroll timer or the segmenter, so a setup that hangs without ever failing cannot hold a client request open indefinitely.
+const PLAYLIST_WAIT_MS = 30000;
 
 /**
  * Builds the onError/onStop callbacks for createFMP4Segmenter. Both callbacks share the same termination chain (skip-if-already-terminating guard, log error,
@@ -201,6 +205,52 @@ export function sendValidationError(validation: { body: Record<string, string> |
   }
 }
 
+/**
+ * Describes a stream setup failure as the status and message the client is answered with. A StreamSetupError carries its own status and user-facing text, which is
+ * the meaning the setup path assigned to the failure; anything else is unexpected and the client learns nothing beyond a 500.
+ * @param error - The error a setup path produced.
+ * @returns The status and message this failure answers with.
+ */
+export function describeSetupFailure(error: unknown): SetupFailureStatus {
+
+  if(error instanceof StreamSetupError) {
+
+    return { statusCode: error.statusCode, userMessage: error.userMessage };
+  }
+
+  return { statusCode: 500, userMessage: "Internal server error." };
+}
+
+/**
+ * Sends a described setup failure to the client. Every streaming route answers a setup failure through here, so one failure means one response shape no matter
+ * which route the client arrived on.
+ *
+ * A 503 carries both back-off headers on every route: Channels DVR reads Retry-After and waits instead of retrying in a tight loop, and an HDHomeRun client reads
+ * X-HDHomeRun-Error to tell a busy tuner apart from a broken one. A response whose headers are already flushed can carry no status at all, so it is ended and the
+ * client sees the connection close.
+ *
+ * Logging stays with the callers: each route describes its own failure in its own words and at its own level.
+ * @param failure - The described failure, from describeSetupFailure or from a literal the caller composed.
+ * @param res - Express response object.
+ */
+export function sendSetupFailure(failure: SetupFailureStatus, res: Response): void {
+
+  if(res.headersSent) {
+
+    res.end();
+
+    return;
+  }
+
+  if(failure.statusCode === 503) {
+
+    res.setHeader("Retry-After", "10");
+    res.setHeader("X-HDHomeRun-Error", "All Tuners In Use");
+  }
+
+  res.status(failure.statusCode).send(failure.userMessage);
+}
+
 // Capacity Reservation.
 
 /**
@@ -285,12 +335,12 @@ export async function ensureChannelStream(channelName: string, req: Request, res
     // Reserve a capacity slot before registering the pending entry. The pending entry occupies a registry slot the instant it is registered, so the capacity
     // decision must happen here - while the new stream is still excluded from the count - to avoid a later self-counting check rejecting it after the client has
     // already received a preroll playlist. reserveStreamSlot is the single source of truth for this decision and reclaims an idle stream when at the limit. On
-    // failure we send a proper 503 here, before any registration or preroll response.
+    // failure we answer here, before any registration or preroll response, through the shared responder that writes the back-off headers for every route.
     if(!reserveStreamSlot()) {
 
-      res.setHeader("Retry-After", "10");
-      res.setHeader("X-HDHomeRun-Error", "All Tuners In Use");
-      res.status(503).send("Maximum concurrent streams (" + String(CONFIG.streaming.maxConcurrentStreams) + ") reached. Try again later.");
+      const refusal = "Maximum concurrent streams (" + String(CONFIG.streaming.maxConcurrentStreams) + ") reached. Try again later.";
+
+      sendSetupFailure({ statusCode: 503, userMessage: refusal }, res);
 
       return null;
     }
@@ -562,21 +612,13 @@ export async function handlePlayStream(req: Request, res: Response): Promise<voi
     }
   } catch(error) {
 
-    if(error instanceof StreamSetupError) {
+    // A StreamSetupError is an expected refusal whose message is already meant for the client, so only an unexpected failure earns an error log here.
+    if(!(error instanceof StreamSetupError)) {
 
-      if(error.statusCode === 503) {
-
-        res.setHeader("Retry-After", "10");
-      }
-
-      res.status(error.statusCode).send(error.userMessage);
-
-      return;
+      LOG.error("Unexpected error during ad-hoc stream setup: %s.", formatError(error));
     }
 
-    LOG.error("Unexpected error during ad-hoc stream setup: %s.", formatError(error));
-
-    res.status(500).send("Internal server error.");
+    sendSetupFailure(describeSetupFailure(error), res);
 
     return;
   }
@@ -590,7 +632,8 @@ export async function handlePlayStream(req: Request, res: Response): Promise<voi
  * Sends the playlist for a stream. With the deferred preroll timer, the playlist may not be available immediately after stream registration - it arrives when either
  * the timer fires (seeding preroll) or the segmenter produces real content, whichever comes first. This function awaits the playlistReady promise to handle that
  * window. For the blocking fallback path (no FFmpeg / no preroll), the playlist is guaranteed to exist because initializeStream blocks until the segmenter produces
- * it. Returns 404 only if the stream was terminated or the playlist wait timed out.
+ * it. A stream whose setup failed answers with that failure's status, so the client learns the tune was refused; a stream terminated for any other reason, or a
+ * wait that timed out, answers 404.
  * @param streamId - The numeric stream ID.
  * @param clientAddress - Client address for tracking.
  * @param res - Express response object.
@@ -600,14 +643,28 @@ async function sendPlaylistResponse(streamId: number, clientAddress: string, res
   let playlist = getPlaylist(streamId);
 
   // The playlist may not be populated yet if the deferred preroll timer hasn't fired and the segmenter hasn't produced content. Wait for the playlistReady promise
-  // which resolves when either source provides a playlist. The 30-second timeout covers pathological cases like setup hanging.
+  // which resolves when either source provides a playlist. The bounded wait covers pathological cases like setup hanging.
   if(!playlist) {
 
-    const ready = await waitForPlaylist(streamId, 30000);
+    /* The reference a failed setup's status is read through, taken before the wait rather than after it. A setup failure records its status on this entry and then
+     * leaves the registry in the same synchronous run that wakes this wait, so a lookup on the far side would find nothing where the reference taken here still
+     * reaches the entry object.
+     */
+    const waiting = getStream(streamId);
+    const ready = await waitForPlaylist(streamId, PLAYLIST_WAIT_MS);
 
     if(ready) {
 
       playlist = getPlaylist(streamId);
+    }
+
+    // A refused tune answers with the refusal's own status, which is what tells Channels DVR to back off - a 404 carries no back-off and invites an immediate
+    // retry of a stream that is not coming.
+    if(!playlist && waiting?.hls.setupFailure) {
+
+      sendSetupFailure(waiting.hls.setupFailure, res);
+
+      return;
     }
   }
 
@@ -1217,15 +1274,29 @@ function createPendingEntry(options: CreatePendingEntryOptions): void {
 }
 
 /**
- * Handles stream setup failure by marking channel health, terminating the pending entry, and optionally logging the error. The blocking path (initializeStream) skips
- * logging because it re-throws for callers to handle. The non-blocking path (ensureChannelStream .catch) logs because there is no outer handler.
+ * Handles stream setup failure by recording the failure's status on the pending entry, marking channel health, terminating the entry, and optionally logging the
+ * error. The blocking path (initializeStream) skips logging because it re-throws for callers to handle. The non-blocking path (ensureChannelStream .catch) logs
+ * because there is no outer handler.
+ *
+ * Exported for unit-test coverage of the ordering the recorded status depends on. Production callers reach this only through the setup paths above, never directly.
  * @param numericStreamId - The pending entry's numeric stream ID.
  * @param channelName - The channel key for health tracking and termination.
  * @param channel - The channel definition, or undefined for ad-hoc streams (no health tracking).
  * @param error - The error that caused the failure.
  * @param logError - Whether to log the error. False when the caller will re-throw (blocking path), true when fire-and-forget (non-blocking path).
  */
-function handleSetupFailure(numericStreamId: number, channelName: string, channel: ResolvedChannel | undefined, error: unknown, logError = true): void {
+export function handleSetupFailure(numericStreamId: number, channelName: string, channel: ResolvedChannel | undefined, error: unknown, logError = true): void {
+
+  /* Record what this failure answers with before anything tears the entry down. terminateStream unregisters the entry in the same synchronous run in which it
+   * wakes every request waiting on this stream, so a request that resumes afterward finds nothing in the registry to read - the status has to be on the entry
+   * object by then. A waiting request holds its own reference to that object, taken before its wait, and reads the status through it.
+   */
+  const entry = getStream(numericStreamId);
+
+  if(entry) {
+
+    entry.hls.setupFailure = describeSetupFailure(error);
+  }
 
   // Mark channel health as failed. Only for predefined channels (channel is defined). Ad-hoc URL streams have no persistent channel identity.
   if(channel) {
@@ -1769,22 +1840,13 @@ async function startHLSStream(channelName: string, url: string, req: Request, re
     return await initializeStream({ channel, channelName, clientAddress, profileOverride, url });
   } catch(error) {
 
-    if(error instanceof StreamSetupError) {
+    // A StreamSetupError is an expected refusal whose message is already meant for the client, so only an unexpected failure earns an error log here.
+    if(!(error instanceof StreamSetupError)) {
 
-      if(error.statusCode === 503) {
-
-        res.setHeader("Retry-After", "10");
-        res.setHeader("X-HDHomeRun-Error", "All Tuners In Use");
-      }
-
-      res.status(error.statusCode).send(error.userMessage);
-
-      return null;
+      LOG.error("Unexpected error during HLS stream setup: %s.", formatError(error));
     }
 
-    LOG.error("Unexpected error during HLS stream setup: %s.", formatError(error));
-
-    res.status(500).send("Internal server error.");
+    sendSetupFailure(describeSetupFailure(error), res);
 
     return null;
   }

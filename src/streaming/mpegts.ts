@@ -4,9 +4,9 @@
  */
 import { LOG, formatError, resolveFFmpegPath, spawnMpegTsRemuxer } from "../utils/index.ts";
 import type { Request, Response } from "express";
+import { describeSetupFailure, initializeStream, sendSetupFailure, sendValidationError, validateChannel } from "./hls.ts";
 import { getNamedInitSegment, waitForInitSegment } from "./hlsSegments.ts";
 import { getStream, updateLastAccess } from "./registry.ts";
-import { initializeStream, sendValidationError, validateChannel } from "./hls.ts";
 import { registerClient, unregisterClient } from "./clients.ts";
 import { CONFIG } from "../config/index.ts";
 import type { Nullable } from "../types/index.ts";
@@ -91,7 +91,7 @@ export async function handleMpegTsStream(req: Request, res: Response): Promise<v
   res.flushHeaders();
 
   // Start a new stream directly. initializeStream blocks until setup completes (no preroll for MPEG-TS clients). Since headers are already flushed, errors are logged
-  // and the connection is closed.
+  // and the connection is closed - the shared responder reads headersSent and ends the response rather than sending a status this client could never see.
   let streamId: Nullable<number>;
 
   try {
@@ -115,7 +115,7 @@ export async function handleMpegTsStream(req: Request, res: Response): Promise<v
       LOG.warn("MPEG-TS stream startup failed for %s: %s.", channelName, formatError(error));
     }
 
-    res.end();
+    sendSetupFailure(describeSetupFailure(error), res);
 
     return;
   }
@@ -196,6 +196,12 @@ export function initSegmentChangesPipeline(primed: Nullable<Buffer>, incoming: B
  */
 async function serveMpegTsStream(streamId: number, channelName: string, req: Request, res: Response): Promise<void> {
 
+  /* The reference a failed setup's status is read through, taken before the wait rather than after it. A client can attach to an entry a playlist request
+   * registered, and a setup failure records its status on that entry and then leaves the registry in the same synchronous run that wakes this wait, so a lookup
+   * on the far side would find nothing where the reference taken here still reaches the entry object.
+   */
+  const waiting = getStream(streamId);
+
   // Wait for the init segment to be available. For capture-mode streams, this waits for the fMP4 init segment (ftyp+moov). A native fMP4 relay waits for its
   // video track's first upstream initialization - the same track this connection's remuxer resolves, so the guard below and this wait watch one thing. Every
   // other native stream had signalInitSegmentReady() called during setup, so this returns instantly.
@@ -204,6 +210,15 @@ async function serveMpegTsStream(streamId: number, channelName: string, req: Req
   if(!initReady) {
 
     if(!res.headersSent) {
+
+      // A refused tune answers with the refusal's own status, so a client that attached to a pending entry learns why rather than being invited to retry a stream
+      // that is not coming. A stream that is genuinely still starting keeps the retry answer below.
+      if(waiting?.hls.setupFailure) {
+
+        sendSetupFailure(waiting.hls.setupFailure, res);
+
+        return;
+      }
 
       res.setHeader("Retry-After", "5");
       res.status(503).send("Stream is starting. Please retry.");

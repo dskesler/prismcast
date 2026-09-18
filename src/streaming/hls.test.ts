@@ -10,7 +10,8 @@
  * dependency injection point - the same one browser/index.ts wires at startup - with a stub browser and page, rather than substituting the accessor.
  */
 import { afterEach, beforeEach, describe, mock, test } from "node:test";
-import { buildResumeContinuity, handleHLSSegment, hasStreamCapacity, sendValidationError, validateChannel } from "./hls.ts";
+import { buildResumeContinuity, describeSetupFailure, handleHLSPlaylist, handleHLSSegment, handleSetupFailure, hasStreamCapacity, sendSetupFailure,
+  sendValidationError, validateChannel } from "./hls.ts";
 import { registerStream, unregisterStream } from "./registry.ts";
 import { setChannelStreamId, terminateStream } from "./lifecycle.ts";
 import { storeInitSegment, storeNamedInitSegment, storeSegment } from "./hlsSegments.ts";
@@ -18,6 +19,7 @@ import { CONFIG } from "../config/index.ts";
 import { LOG } from "../utils/index.ts";
 import type { Response } from "express";
 import type { ResumeData } from "./hlsResume.ts";
+import { StreamSetupError } from "./setup.ts";
 import assert from "node:assert/strict";
 import { closePuppeteerStreamWssOnIdle } from "../testing.helpers.ts";
 import { makeRegistryEntry } from "./registry.helpers.ts";
@@ -403,5 +405,148 @@ describe("buildResumeContinuity", () => {
     const result = buildResumeContinuity({ baseSegmentIndex: 0, prerollSegmentCount: 0, resumeData: null });
 
     assert.equal(Object.keys(result).length, 0, "nothing to continue from, so nothing is carried");
+  });
+});
+
+describe("describeSetupFailure", () => {
+
+  test("a StreamSetupError answers with its own status and user-facing message, whatever the status", () => {
+
+    /* The setup paths assign a failure its meaning by choosing the status and the message a client should read, so the description must carry both through
+     * untouched. The rows walk the statuses the setup paths actually produce - a capacity or recovery refusal, an upstream failure, and a flat rejection - because
+     * a description that special-cased one status would collapse the others onto it.
+     */
+    assert.deepEqual(describeSetupFailure(new StreamSetupError("Browser temporarily unavailable.", 503, "The capture system is recovering. Please retry shortly.")),
+      { statusCode: 503, userMessage: "The capture system is recovering. Please retry shortly." });
+
+    assert.deepEqual(describeSetupFailure(new StreamSetupError("Upstream refused.", 502, "The service is not responding.")),
+      { statusCode: 502, userMessage: "The service is not responding." });
+
+    assert.deepEqual(describeSetupFailure(new StreamSetupError("Setup rejected.", 500, "This channel could not be tuned.")),
+      { statusCode: 500, userMessage: "This channel could not be tuned." });
+  });
+
+  test("anything else is a 500 that tells the client nothing about the failure", () => {
+
+    // An unexpected error's message was written for an operator reading logs, never for a client, so the description substitutes the generic text.
+    assert.deepEqual(describeSetupFailure(new Error("ECONNREFUSED 127.0.0.1:9222")), { statusCode: 500, userMessage: "Internal server error." });
+  });
+});
+
+describe("sendSetupFailure", () => {
+
+  test("a 503 carries both back-off headers along with the status and message", () => {
+
+    /* The pair of headers is what makes a 503 useful to the clients this server has: Channels DVR waits on Retry-After rather than retrying immediately, and an
+     * HDHomeRun client reads X-HDHomeRun-Error to tell a busy tuner apart from a broken one. Both are asserted here because the responder is the only place
+     * either is written.
+     */
+    const { res, send, setHeader, status } = makeReqRes();
+
+    sendSetupFailure({ statusCode: 503, userMessage: "Maximum concurrent streams (4) reached. Try again later." }, res);
+
+    assert.equal(status.mock.calls[0]?.arguments[0], 503);
+    assert.equal(send.mock.calls[0]?.arguments[0], "Maximum concurrent streams (4) reached. Try again later.");
+    assert.ok(setHeader.mock.calls.some((call) => (call.arguments[0] === "Retry-After") && (call.arguments[1] === "10")), "the back-off interval is set");
+    assert.ok(setHeader.mock.calls.some((call) => (call.arguments[0] === "X-HDHomeRun-Error") && (call.arguments[1] === "All Tuners In Use")),
+      "and the HDHomeRun tuner-busy header with it");
+  });
+
+  test("a status other than 503 carries neither header", () => {
+
+    // The headers mean "come back later", which is false of a failure that will not resolve on its own, so nothing but a 503 may carry them.
+    const { res, send, setHeader, status } = makeReqRes();
+
+    sendSetupFailure({ statusCode: 500, userMessage: "Internal server error." }, res);
+
+    assert.equal(status.mock.calls[0]?.arguments[0], 500);
+    assert.equal(send.mock.calls[0]?.arguments[0], "Internal server error.");
+    assert.equal(setHeader.mock.calls.length, 0, "a non-503 sets no back-off headers");
+  });
+
+  test("a response whose headers are already flushed is ended rather than given a status", () => {
+
+    /* The MPEG-TS route flushes a 200 before setup runs, so by the time a failure arrives there is no status left to send - writing one would throw and the
+     * client would be left holding an open socket. Ending the response is the whole answer available on that route.
+     */
+    const { res, end, send, status } = makeReqRes();
+
+    Object.assign(res, { headersSent: true });
+
+    sendSetupFailure({ statusCode: 503, userMessage: "The capture system is recovering. Please retry shortly." }, res);
+
+    assert.equal(end.mock.calls.length, 1, "the connection is closed");
+    assert.equal(status.mock.calls.length, 0, "and no status is written onto a flushed response");
+    assert.equal(send.mock.calls.length, 0);
+  });
+});
+
+describe("handleHLSPlaylist: a setup failure before the first playlist", () => {
+
+  /* The window these rows read is the one a refused tune lands in: a pending entry is registered, a client's playlist request is already parked in the wait, and
+   * setup fails before either the preroll timer or the segmenter produced anything. handleSetupFailure runs the production ordering - record the status on the
+   * entry, then terminate - and terminateStream wakes the parked request in the same synchronous run in which it unregisters the entry, which is the ordering the
+   * status has to survive. Each row leaves its request un-awaited until the failure has landed, because awaiting first would settle the response before the
+   * scenario exists.
+   */
+
+  test("the waiting request is answered with the failure's status, message, and both back-off headers", async () => {
+
+    const entry = makeRegistryEntry({ channelName: "setup-failure-channel" });
+
+    registerStream(entry);
+    setChannelStreamId("setup-failure-channel", entry.id);
+
+    try {
+
+      const { req, res, send, setHeader, status } = makeReqRes({ ip: "192.168.1.50", params: { name: "setup-failure-channel" } });
+      const pending = handleHLSPlaylist(req, res);
+
+      // One turn of the microtask queue puts the request inside the playlist wait, where a real client sits while setup runs behind it.
+      await Promise.resolve();
+
+      handleSetupFailure(entry.id, "setup-failure-channel", undefined,
+        new StreamSetupError("Browser temporarily unavailable.", 503, "The capture system is recovering. Please retry shortly."));
+
+      await pending;
+
+      assert.equal(status.mock.calls[0]?.arguments[0], 503, "the refusal's own status reaches the client, not a 404");
+      assert.equal(send.mock.calls[0]?.arguments[0], "The capture system is recovering. Please retry shortly.");
+      assert.ok(setHeader.mock.calls.some((call) => (call.arguments[0] === "Retry-After") && (call.arguments[1] === "10")), "Channels DVR is told to wait");
+      assert.ok(setHeader.mock.calls.some((call) => (call.arguments[0] === "X-HDHomeRun-Error") && (call.arguments[1] === "All Tuners In Use")),
+        "and an HDHomeRun client reads the tuner-busy header");
+    } finally {
+
+      unregisterStream(entry.id);
+    }
+  });
+
+  test("a stream terminated for any other reason still answers 404", async () => {
+
+    /* The control that gives the row above its distinguishing power. The same entry, the same parked request, the same wake - only the recorded status is absent,
+     * because nothing failed setup here. A change that answered every terminated stream with a status rather than a 404 would pass the row above and fail here.
+     */
+    const entry = makeRegistryEntry({ channelName: "plain-termination-channel" });
+
+    registerStream(entry);
+    setChannelStreamId("plain-termination-channel", entry.id);
+
+    try {
+
+      const { req, res, send, status } = makeReqRes({ ip: "192.168.1.50", params: { name: "plain-termination-channel" } });
+      const pending = handleHLSPlaylist(req, res);
+
+      await Promise.resolve();
+
+      terminateStream(entry.id, "plain-termination-channel", "test termination");
+
+      await pending;
+
+      assert.equal(status.mock.calls[0]?.arguments[0], 404, "a termination that is not a setup failure keeps the existing answer");
+      assert.equal(send.mock.calls[0]?.arguments[0], "Stream not found.");
+    } finally {
+
+      unregisterStream(entry.id);
+    }
   });
 });
