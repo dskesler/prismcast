@@ -3,8 +3,6 @@
  * sites.ts: Site profile definitions and domain-to-profile mappings for PrismCast.
  */
 import type { DomainConfig, ResolvedSiteProfile, SiteProfile } from "../types/index.ts";
-import { extractDomain } from "../utils/index.ts";
-import { getUserDomains } from "./userProfiles.ts";
 
 /* Streaming sites implement their video players in wildly different ways. Some use standard HTML5 video with keyboard shortcuts, others embed players in iframes,
  * and many have unique quirks like auto-muting or requiring specific fullscreen methods. Rather than scattering site-specific conditionals throughout the streaming
@@ -291,8 +289,8 @@ export const PROVIDER_PROFILES: Record<string, SiteProfile> = {
 
 /* This mapping associates domain keys with site profiles, service display names, and service filter tags. Most keys are concise second-level domains
  * (e.g., "nbc.com", "foodnetwork.com") matching the output of extractDomain(). Keys can also be full hostnames (e.g., "tv.youtube.com") for subdomain-specific
- * overrides - getDomainConfig() tries the full hostname first, then falls back to the concise domain, so "tv.youtube.com" takes precedence over "youtube.com"
- * when the URL matches.
+ * overrides - domain resolution in profiles.ts tries the full hostname first, then falls back to the concise domain, so "tv.youtube.com" takes precedence over
+ * "youtube.com" when the URL matches.
  *
  * Domains without a profile entry will use DEFAULT_SITE_PROFILE, which works for most standard video players. Domains with no service field configured, or with
  * no entry in this map at all, will display the concise domain string (e.g., a hypothetical "example.com") in the UI. Entries with a serviceTag participate in
@@ -357,56 +355,6 @@ export const DOMAIN_CONFIG: Record<string, DomainConfig> = {
   "xfinity.com": { profile: "xfinityStream", service: "Xfinity Stream", serviceTag: "xfinity" },
   "youtube.com": { profile: "keyboardDynamic", service: "YouTube" }
 };
-
-/**
- * Resolves a URL to its domain configuration entry by precedence: user full hostname, then builtin full hostname (for subdomain-specific overrides), then user
- * concise domain, then builtin concise domain (last two hostname parts). User mappings override builtins, and full-hostname entries like "tv.youtube.com" override
- * the base "youtube.com" entry.
- * @param url - The URL to resolve a domain configuration for.
- * @returns The matching DomainConfig entry, or undefined if no match is found.
- */
-export function getDomainConfig(url: string): DomainConfig | undefined {
-
-  // User domain mappings take precedence over builtin mappings. The lookup order is: user full hostname -> builtin full hostname -> user concise domain ->
-  // builtin concise domain. This allows users to override specific subdomain mappings or base domain mappings independently.
-  const userDomains = getUserDomains();
-
-  try {
-
-    const hostname = new URL(url).hostname;
-
-    // Try user domains for the full hostname first.
-    const userHostnameMatch = userDomains[hostname];
-
-    if(userHostnameMatch) {
-
-      return userHostnameMatch;
-    }
-
-    // Try the builtin full hostname for subdomain-specific overrides (e.g., "tv.youtube.com" before "youtube.com").
-    const hostnameMatch = DOMAIN_CONFIG[hostname];
-
-    if(hostnameMatch) {
-
-      return hostnameMatch;
-    }
-  } catch {
-
-    // Invalid URL - fall through to concise domain lookup.
-  }
-
-  const conciseDomain = extractDomain(url);
-
-  // Try user domains for the concise domain.
-  const userConciseMatch = userDomains[conciseDomain];
-
-  if(userConciseMatch) {
-
-    return userConciseMatch;
-  }
-
-  return DOMAIN_CONFIG[conciseDomain];
-}
 
 // Provider module profiles registered at import time via registerProviderModuleProfile(). Provider modules define their profiles alongside their tuning code and
 // register them here so the profile resolution system can find them without importing from browser/channelSelection.ts (which would create circular dependencies).

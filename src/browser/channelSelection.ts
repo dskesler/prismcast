@@ -6,16 +6,17 @@ import type { ChannelSelectionProfile, ChannelSelectorResult, ChannelStrategyEnt
   StrategyNavigator } from "../types/index.ts";
 import { EvaluateAbortError, LOG, delay, evaluateWithAbort, extractDomain, formatError, isPageDeathError, pollUntil } from "../utils/index.ts";
 import { evictPersistedWatchUrl, getPersistedLineup, getPersistedWatchUrl } from "../config/providerLineups.ts";
-import { getDomainConfig, registerProviderModuleProfile } from "../config/sites.ts";
 import { CONFIG } from "../config/index.ts";
 import type { Clock } from "homebridge-plugin-utils";
 import type { Page } from "puppeteer-core";
 import { coxProvider } from "./tuning/cox.ts";
 import { directvProvider } from "./tuning/directv.ts";
 import { foxProvider } from "./tuning/fox.ts";
+import { getDomainConfig } from "../config/profiles.ts";
 import { hboProvider } from "./tuning/hbo.ts";
 import { huluProvider } from "./tuning/hulu.ts";
 import { isChannelSelectionProfile } from "../types/index.ts";
+import { registerProviderModuleProfile } from "../config/sites.ts";
 import { resolveMatchSelector } from "./tuning/shared.ts";
 import { slingProvider } from "./tuning/sling.ts";
 import { spectrumProvider } from "./tuning/spectrum.ts";

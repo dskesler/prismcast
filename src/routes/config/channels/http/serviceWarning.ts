@@ -7,7 +7,7 @@
  * helper so the warning policy is defined exactly once.
  */
 import { getEnabledServices, getServiceDisplayName, isServiceTagEnabled } from "../../../../config/services.ts";
-import { getDomainConfig } from "../../../../config/sites.ts";
+import { getDomainConfig } from "../../../../config/profiles.ts";
 
 /**
  * Builds a service filter warning payload when a URL's service tag is not in the active filter. Returns undefined when no filter is active, when the resolved

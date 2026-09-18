@@ -2,15 +2,11 @@
  *
  * profiles.ts: Site profile resolution and validation for PrismCast.
  */
-import { DEFAULT_SITE_PROFILE, DOMAIN_CONFIG, PROVIDER_PROFILES, SITE_PROFILES, getBuiltinProfile, getDomainConfig,
-  getRegisteredProviderModuleProfiles } from "./sites.ts";
+import { DEFAULT_SITE_PROFILE, DOMAIN_CONFIG, PROVIDER_PROFILES, SITE_PROFILES, getBuiltinProfile, getRegisteredProviderModuleProfiles } from "./sites.ts";
 import type { DomainConfig, ProfileCategory, ProfileResolutionResult, ResolvedSiteProfile, SiteProfile } from "../types/index.ts";
 import { LOG, extractDomain } from "../utils/index.ts";
 import { getUserDomains, getUserProfiles, validateDomain, validateProfile } from "./userProfiles.ts";
 import { CHANNELS } from "../channels/index.ts";
-
-// Re-export site data so existing consumers can import from either module.
-export { DEFAULT_SITE_PROFILE, DOMAIN_CONFIG, PROVIDER_PROFILES, SITE_PROFILES, getBuiltinProfile, getDomainConfig };
 
 /* Profile resolution is the process of determining which behavior flags to use for a given stream. The resolution process handles inheritance, merging parent and
  * child profile properties, and falling back to defaults for unspecified flags.
@@ -129,6 +125,56 @@ function mergeDomainProperties(profile: ResolvedSiteProfile, config: DomainConfi
     ...(config.maxContinuousPlayback !== undefined ? { maxContinuousPlayback: config.maxContinuousPlayback } : {}),
     ...(config.videoTimeout !== undefined ? { videoTimeout: config.videoTimeout } : {})
   };
+}
+
+/**
+ * Resolves a URL to its domain configuration entry by precedence: user full hostname, then builtin full hostname (for subdomain-specific overrides), then user
+ * concise domain, then builtin concise domain (last two hostname parts). User mappings override builtins, and full-hostname entries like "tv.youtube.com" override
+ * the base "youtube.com" entry.
+ * @param url - The URL to resolve a domain configuration for.
+ * @returns The matching DomainConfig entry, or undefined if no match is found.
+ */
+export function getDomainConfig(url: string): DomainConfig | undefined {
+
+  // User domain mappings take precedence over builtin mappings. The lookup order is: user full hostname -> builtin full hostname -> user concise domain ->
+  // builtin concise domain. This allows users to override specific subdomain mappings or base domain mappings independently.
+  const userDomains = getUserDomains();
+
+  try {
+
+    const hostname = new URL(url).hostname;
+
+    // Try user domains for the full hostname first.
+    const userHostnameMatch = userDomains[hostname];
+
+    if(userHostnameMatch) {
+
+      return userHostnameMatch;
+    }
+
+    // Try the builtin full hostname for subdomain-specific overrides (e.g., "tv.youtube.com" before "youtube.com").
+    const hostnameMatch = DOMAIN_CONFIG[hostname];
+
+    if(hostnameMatch) {
+
+      return hostnameMatch;
+    }
+  } catch {
+
+    // Invalid URL - fall through to concise domain lookup.
+  }
+
+  const conciseDomain = extractDomain(url);
+
+  // Try user domains for the concise domain.
+  const userConciseMatch = userDomains[conciseDomain];
+
+  if(userConciseMatch) {
+
+    return userConciseMatch;
+  }
+
+  return DOMAIN_CONFIG[conciseDomain];
 }
 
 /**

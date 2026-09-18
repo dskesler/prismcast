@@ -10,7 +10,6 @@ import { deleteUserProfile, getUserDomains, getUserProfiles, mutateProfiles, val
   validateProfileKey } from "../../config/userProfiles.ts";
 import { endLoginMode, getLoginPage, startLoginMode } from "../../browser/index.ts";
 import { exportServicePack, importServicePack, parseServicePack } from "../../config/servicePacks.ts";
-import { getBuiltinProfile, getProfiles } from "../../config/profiles.ts";
 import { getChannelListing, validateChannelUrl } from "../../config/userChannels.ts";
 import { sendErrorResponse, sendNotFoundError, sendSuccess, sendValidationError } from "./http/envelope.ts";
 import { ACTIONS } from "../clientActions.ts";
@@ -18,6 +17,8 @@ import { PROFILE_CATEGORIES } from "../../types/index.ts";
 import type { ProfileInfo } from "../../config/profiles.ts";
 import { categorizeProfiles } from "./index.ts";
 import { generateWizardModal } from "../components.ts";
+import { getBuiltinProfile } from "../../config/sites.ts";
+import { getProfiles } from "../../config/profiles.ts";
 
 /**
  * One field the profile wizard renders and round-trips. The same descriptor shape types both the per-strategy field lists (WIZARD_STRATEGIES) and the flat

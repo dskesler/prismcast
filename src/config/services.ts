@@ -3,10 +3,11 @@
  * services.ts: Service group management for multi-service channels.
  */
 import type { Channel, ChannelMap, ResolvedChannel, ServiceGroup } from "../types/index.ts";
-import { DOMAIN_CONFIG, getDomainConfig } from "./sites.ts";
 import { LOG, extractDomain } from "../utils/index.ts";
 import { CONFIG } from "./index.ts";
+import { DOMAIN_CONFIG } from "./sites.ts";
 import { PREDEFINED_CHANNELS } from "../channels/index.ts";
+import { getDomainConfig } from "./profiles.ts";
 import { getUserDomains } from "./userProfiles.ts";
 import { mutateConfig } from "./userConfig.ts";
 import { pickIdentity } from "./channelIdentity.ts";
