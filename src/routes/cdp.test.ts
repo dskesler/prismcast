@@ -343,6 +343,30 @@ describe("CdpProxySession - Target domain synthesis", () => {
     assert.ok(typeof response.result.sessionId === "string", "response contains a sessionId");
     assert.equal(browser.connection.createdSessions.length, 1, "exactly one sub-session was created");
   });
+
+  test("a target created while auto-attach is on is attached through the connection and announced with a synthetic sessionId", async () => {
+
+    const { browser, ws } = await makeProxy();
+    const targetInfo = { attached: false, browserContextId: "ctx", canAccessOpener: false, targetId: "t9", title: "New Tab", type: "page", url: "https://new/" };
+
+    // Auto-attach with no existing targets, so the only attach this case can observe is the one the created event drives.
+    browser.browserSession.responses.set("Target.getTargets", { targetInfos: [] });
+
+    ws.deliver({ id: 1, method: "Target.setAutoAttach", params: { autoAttach: true, flatten: true } });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // The proxy subscribed to Target.targetCreated on the browser session during setup, and the handler takes its Connection from that closure.
+    browser.browserSession.emit("Target.targetCreated", { targetInfo });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(browser.connection.createdSessions.length, 1, "the created target was attached through the Connection captured at setup");
+
+    const attached = ws.lastEvent("Target.attachedToTarget") as { params: { sessionId: string; targetInfo: { targetId: string } } };
+
+    assert.ok(attached, "the attach was announced to the client");
+    assert.equal(attached.params.targetInfo.targetId, "t9", "the announcement names the created target");
+    assert.equal(typeof attached.params.sessionId, "string", "the announcement carries a synthetic sessionId");
+  });
 });
 
 describe("CdpProxySession - sub-session routing", () => {
@@ -548,6 +572,31 @@ describe("CdpProxySession - commands that arrive during setup", () => {
     assert.equal(ws.pauseCount, 1, "setup paused the socket exactly once, so the resume is what cleared it");
     assert.equal(ws.isPaused, false, "the failure path resumed the socket so the close handshake can finish");
     assert.equal(ws.readyState, 3, "the failure path closed the socket");
+  });
+
+  test("a browser session that reports no connection closes the socket and announces nothing", async () => {
+
+    const ws = new FakeWebSocket();
+    const browser = new FakeBrowser();
+    const proxy = new CdpProxySession(ws as unknown as WebSocket, browser as unknown as Browser);
+
+    /* The abstract CDPSession type admits a session that reports no connection, and no session created through the browser target reaches that state: puppeteer
+     * returns the connection captured at construction. The fake can construct it, so this case asserts the branch's one observable effect.
+     */
+    browser.browserSession.connectionRef = null;
+
+    await proxy.start();
+
+    assert.equal(ws.readyState, 3, "the branch closed the socket");
+    assert.equal(ws.pauseCount, 1, "setup paused the socket exactly once, so the resume is what cleared it");
+    assert.equal(ws.isPaused, false, "the branch resumed the socket so the close handshake can finish");
+    assert.equal(browser.browserSession.calls.length, 0, "the discovery enable was never sent");
+
+    ws.deliver({ id: 1, method: "Browser.getVersion" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(browser.browserSession.calls.length, 0, "a command delivered afterward reached nothing");
+    assert.equal(ws.sent.length, 0, "no frame answered it");
   });
 
   test("a browser disconnect during session creation answers no command and detaches the late session", async () => {
