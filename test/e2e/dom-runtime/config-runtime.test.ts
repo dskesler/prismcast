@@ -1555,6 +1555,66 @@ describe("config.ts: window.bulkAssignService", () => {
 
     assert.equal(body.service, "xfinity");
   });
+
+  test("applies the channel-table patch the assign response carries", async () => {
+
+    /* The response carries the patch the server built over every reassigned key, and the handler hands that patch to channelTable.applyPatch. The patch counts
+     * are the visible witness: they land in the channel summary cells above the table. The stubbed body mirrors the envelope the endpoint sends, with the
+     * endpoint-specific fields at the top level alongside the patch built over the affected keys. The pre-check confirms the seeded total differs from the
+     * server-rendered count, so a passing assertion cannot be a coincidental match against the page as served.
+     */
+    await using ctx = await setupConfigRuntime();
+
+    assert.notEqual(ctx.document.getElementById("total-count")?.textContent, "77", "the seeded patch total must differ from the server-rendered count");
+
+    installFetchSpy(ctx, { affected: 2, patch: { counts: { disabled: 5, enabled: 72, predefined: 60, total: 77, user: 17 }, rows: [], scopeCounts: {} },
+      previousSelections: { abc: null, nbc: "nbc-hulu" }, selections: {}, success: true, total: 90 });
+    ctx.evaluate("window.bulkAssignService('xfinity')");
+    await ctx.flushAsync();
+
+    assert.equal(ctx.document.getElementById("total-count")?.textContent, "77", "patch.counts.total must land in #total-count");
+    assert.equal(ctx.document.getElementById("enabled-count")?.textContent, "72", "patch.counts.enabled must land in #enabled-count");
+  });
+
+  test("the Undo action on the success toast POSTs /config/service-bulk-restore and applies the patch that comes back", async () => {
+
+    /* An assign that affected channels attaches an Undo action to its success toast, and that button is the only route into restoreBulkServices. Clicking it
+     * drives the restore request and applies the patch the restore response carries. The two responses carry different counts, so the summary cell reports
+     * which patch was applied last rather than letting the assign patch stand in for the restore patch. flushAsync drains the toast auto-dismiss timer, and
+     * dismissToast removes the element only on animationend, which the synthetic DOM never fires, so the Undo button is still in the document to be clicked.
+     */
+    await using ctx = await setupConfigRuntime();
+
+    ctx.evaluate(
+      "window.harnessFetchCalls = [];" +
+      "window.harnessResponses = {" +
+      "  '/config/service-bulk-assign': { affected: 2, previousSelections: { abc: null, nbc: 'nbc-hulu' }, selections: {}, success: true, total: 90," +
+      "    patch: { counts: { disabled: 5, enabled: 72, predefined: 60, total: 77, user: 17 }, rows: [], scopeCounts: {} } }," +
+      "  '/config/service-bulk-restore': { restored: 2, selections: {}, success: true," +
+      "    patch: { counts: { disabled: 8, enabled: 41, predefined: 33, total: 49, user: 16 }, rows: [], scopeCounts: {} } }" +
+      "};" +
+      "window.fetch = (url, opts) => {" +
+      "  window.harnessFetchCalls.push({ url, method: opts.method, body: opts.body, contentType: opts.headers['Content-Type'] });" +
+      "  return Promise.resolve({ ok: true, json: () => Promise.resolve(window.harnessResponses[url]) });" +
+      "};"
+    );
+    ctx.evaluate("window.bulkAssignService('xfinity')");
+    await ctx.flushAsync();
+
+    assert.equal(ctx.document.getElementById("total-count")?.textContent, "77", "the assign patch must land before the Undo action runs");
+    assert.equal(ctx.evaluate("document.querySelector('#toast-container .toast-action') !== null"), true,
+      "an assign that affected channels must render an Undo action on its toast");
+    assert.equal((ctx.evaluateJson("window.harnessFetchCalls") as CapturedFetchCall[]).length, 1, "only the assign request has fired before the Undo click");
+
+    ctx.evaluate("document.querySelector('#toast-container .toast-action').click()");
+    await ctx.flushAsync();
+
+    const calls = ctx.evaluateJson("window.harnessFetchCalls") as CapturedFetchCall[];
+
+    assert.equal(calls.length, 2, "the Undo click must fire exactly one further request");
+    assert.equal(calls[1]!.url, "/config/service-bulk-restore");
+    assert.equal(ctx.document.getElementById("total-count")?.textContent, "49", "patch.counts.total from the restore response must replace the assign patch's");
+  });
 });
 
 describe("config.ts: window.openChangelogModal and closeChangelogModal", () => {
