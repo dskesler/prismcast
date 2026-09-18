@@ -2,7 +2,7 @@
  *
  * services.serviceGroups.test.ts: Unit tests for service-group construction in services.ts - buildServiceGroups (passes 1, 2, 3 across canonical/variant/override
  * scenarios) and resolveServiceKey's filter-fallback paths. Predicates, lookups, and label dispatchers live in services.test.ts; sort-key computation lives in
- * services.sortKeys.test.ts.
+ * channelSort.test.ts.
  */
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { buildServiceGroups, getEnabledServices, getServiceGroup, getServiceSelections, resolveServiceKey, setEnabledServices,

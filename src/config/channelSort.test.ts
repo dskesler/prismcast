@@ -1,6 +1,6 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * services.sortKeys.test.ts: Unit tests for sort-key computation in channelSort.ts - getChannelSortKey across the primary fields and the profile-field switch, plus
+ * channelSort.test.ts: Unit tests for sort-key computation in channelSort.ts - getChannelSortKey across the primary fields and the profile-field switch, plus
  * compareChannelSort including the null-name tiebreaker path. Service-group construction lives in services.serviceGroups.test.ts; predicates and lookups live in
  * services.test.ts.
  */
