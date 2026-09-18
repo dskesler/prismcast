@@ -1001,21 +1001,6 @@ export function generateConfigSubtabScript(): string {
     "    }",
     "  };",
 
-    // Update a channel row's service selection in-place. Syncs the HTML selected attribute so channelTable.filter() restore logic works correctly. We iterate
-    // _allOptions (if present) rather than querySelectorAll because filtered-out options are removed from the DOM but still tracked in the array.
-    "  function updateChannelServiceUI(channelKey, variant) {",
-    "    const row = document.getElementById('display-row-' + channelKey);",
-    "    if(!row) return;",
-    "    const sel = row.querySelector('.provider-select');",
-    "    if(!sel) return;",
-    "    sel.value = variant;",
-    "    const allOpts = sel._allOptions || [...sel.querySelectorAll('option')];",
-    "    for(const opt of allOpts) {",
-    "      if(opt.value === variant) { opt.setAttribute('selected', ''); }",
-    "      else { opt.removeAttribute('selected'); }",
-    "    }",
-    "  }",
-
     // Update service selection for a multi-service channel.
     "  window.updateServiceSelection = async (selectElement) => {",
     "    const channelKey = selectElement.getAttribute('data-channel');",
@@ -1354,7 +1339,8 @@ export function generateConfigSubtabScript(): string {
     "    }",
     "  };",
 
-    // Bulk assign all channels to a specific service. Updates all dropdowns and profile cells in-place.
+    // Bulk assign all channels to a specific service. The response carries the channel-table patch that re-renders every reassigned row, along with the snapshot
+    // of prior selections that backs the undo action on the toast.
     "  window.bulkAssignService = async (serviceTag) => {",
     "    if(!serviceTag) return;",
     "    try {",
@@ -1372,11 +1358,7 @@ export function generateConfigSubtabScript(): string {
     "          undoAction = { label: 'Undo', onclick: () => { restoreBulkServices(prevSelections); } };",
     "        }",
     "        showToast(msg, 'success', undoAction ? 10000 : undefined, undoAction);",
-    "        if(result.selections) {",
-    "          for(const [ key, sel ] of Object.entries(result.selections)) {",
-    "            updateChannelServiceUI(key, sel.variant);",
-    "          }",
-    "        }",
+    "        if(result.patch) { channelTable.applyPatch(result.patch); }",
     "      } else {",
     "        showToast(extractErrorMessage(result, 'Failed to assign.'), 'error');",
     "      }",
@@ -1385,7 +1367,7 @@ export function generateConfigSubtabScript(): string {
     "    }",
     "  };",
 
-    // Restore previous service selections (undo bulk assign). Sends the previousSelections map to the server and updates the UI with the restored selections.
+    // Restore previous service selections (undo bulk assign). Sends the previousSelections map to the server and applies the channel-table patch that comes back.
     "  async function restoreBulkServices(prevSelections) {",
     "    try {",
     "      const r = await fetch('/config/service-bulk-restore', {",
@@ -1396,11 +1378,7 @@ export function generateConfigSubtabScript(): string {
     "      const result = await r.json();",
     "      if(result.success) {",
     "        showToast('Bulk assign reverted.', 'success');",
-    "        if(result.selections) {",
-    "          for(const [ key, sel ] of Object.entries(result.selections)) {",
-    "            updateChannelServiceUI(key, sel.variant);",
-    "          }",
-    "        }",
+    "        if(result.patch) { channelTable.applyPatch(result.patch); }",
     "      } else {",
     "        showToast(extractErrorMessage(result, 'Failed to revert.'), 'error');",
     "      }",

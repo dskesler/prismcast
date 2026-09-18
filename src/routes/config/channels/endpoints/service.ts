@@ -168,7 +168,9 @@ export function registerServiceRoutes(app: Express): void {
 
     LOG.info("Bulk assign to '%s': %d of %d channels affected.", serviceTag, affected, listing.length);
 
-    sendSuccess(res, { data: { affected, previousSelections, selections, total: listing.length } });
+    // The keys written above are the affected set, so the envelope builds a channel-table patch over them and every reassigned row re-renders from the server's
+    // own row builder. The selections map reports what each channel was set to for callers reading the API directly.
+    sendSuccess(res, { affectedKeys: Object.keys(updates), data: { affected, previousSelections, selections, total: listing.length } });
   }));
 
   // POST /config/service-bulk-restore - Restore previous service selections (undo bulk assign).
@@ -219,7 +221,7 @@ export function registerServiceRoutes(app: Express): void {
 
       restored++;
 
-      // Build the same selection response format as bulk assign for client-side UI updates.
+      // Report the effective selection for each channel in the same shape bulk assign returns, so a caller reading the API directly sees what each channel ended up on.
       const effectiveKey = variantKey ?? key;
       const resolvedChannel = getResolvedChannel(effectiveKey);
 
@@ -234,6 +236,7 @@ export function registerServiceRoutes(app: Express): void {
 
     LOG.info("Bulk restore: %d channel(s) reverted.", restored);
 
-    sendSuccess(res, { data: { restored, selections } });
+    // The restored keys are the affected set, so the envelope builds the channel-table patch that brings each reverted row back in line with the stored selection.
+    sendSuccess(res, { affectedKeys: Object.keys(updates), data: { restored, selections } });
   }));
 }
