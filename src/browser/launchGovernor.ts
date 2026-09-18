@@ -6,9 +6,9 @@ import type { FailureWindowResult, FailureWindowState } from "../streaming/recov
 import { recordFailure, resetFailureWindow } from "../streaming/recovery.ts";
 
 /* This module is the pure decision core that keeps browser relaunch from becoming a teardown/restart loop. The browser supervisor in browser/index.ts owns the
- * Chrome instance and the lifecycle states (absent / launching / ready / degraded / trialing); this governor owns the throttling judgment those states turn on. It
- * is the classic circuit breaker (CLOSED / OPEN / HALF-OPEN) expressed as pure functions over an explicit state, with `now` passed in by the caller - the same
- * shape as the per-stream circuit breaker (checkCircuitBreaker), so it is deterministically unit-testable with literal timestamps and no timer mocking.
+ * Chrome instance and the lifecycle states the BrowserLifecycle union in browserSupervisor.ts defines; this governor owns the throttling judgment those states
+ * turn on. It is the classic circuit breaker (CLOSED / OPEN / HALF-OPEN) expressed as pure functions over an explicit state, with `now` passed in by the caller -
+ * the same shape as the per-stream circuit breaker (checkCircuitBreaker), so it is deterministically unit-testable with literal timestamps and no timer mocking.
  *
  * The throttling judgment, in one place:
  *

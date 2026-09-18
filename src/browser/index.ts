@@ -130,9 +130,9 @@ function onSupervisorStateChange(next: BrowserLifecycle, previous: BrowserLifecy
 
     // The published browser has been marked as unable to start captures. The transition carrying the mark happens once per instance, so the alarm fires once per
     // instance too, and it says what an operator watching a stalled tune needs: the running captures are unaffected, new requests back off, and the cure arrives
-    // on its own once the registry empties.
+    // on its own as soon as nothing on this browser holds a page.
     LOG.error("The browser can no longer start captures (%s). Its running captures continue, new stream requests receive a 503 back-off, and it will relaunch as " +
-      "soon as no stream is active.", next.impairment.reason);
+      "soon as nothing holds a page on it.", next.impairment.reason);
   }
 
   // The browser's connectivity is part of the SSE system status, so emit when a ready browser is published. Readiness-loss emits are owned by handleBrowserDisconnect
@@ -153,8 +153,9 @@ function onSupervisorStateChange(next: BrowserLifecycle, previous: BrowserLifecy
 type CaptureProbe = (browser: Browser) => Promise<void>;
 
 /* The capture-readiness probe (capability tier of the launch gate). Null until streaming/setup.ts injects the real capture probe at module load, which the import
- * order guarantees runs before any launch: app.ts imports the streaming layer, whose module bodies evaluate during import resolution, before startServer's warm-up.
- * launchReadyBrowser refuses to publish a browser if it is somehow still null (see the call site), rather than serving an unverified one.
+ * order places ahead of any launch: index.ts value-imports app.ts, app.ts value-imports streaming/hls.ts, and hls.ts value-imports streaming/setup.ts, so the
+ * injection has run by the time index.ts's own body calls startServer. launchReadyBrowser refuses to publish a browser if it is somehow still null (see the call
+ * site), rather than serving an unverified one.
  */
 let captureProbe: Nullable<CaptureProbe> = null;
 

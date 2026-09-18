@@ -1444,11 +1444,11 @@ export async function setupStream(options: StreamSetupOptions, onCircuitBreak: (
 
       // The browser is alive and still serving the captures it started, but it can no longer start another, so this tune is refused before a page is even opened.
       // Quiet like its sibling above, because the alarm fired once when the mark was recorded. The message differs because the wait ends differently: the client is
-      // waiting on the browser's own streams to end rather than on a cooldown to elapse.
+      // waiting on the browser to be released by whatever still holds it rather than on a cooldown to elapse.
       if(error instanceof BrowserCaptureImpairedError) {
 
-        throw new StreamSetupError("Browser temporarily unavailable.", 503, "The browser can no longer start captures and will relaunch once its current streams " +
-          "end. Please retry shortly.", { cause: error });
+        throw new StreamSetupError("Browser temporarily unavailable.", 503, "The browser can no longer start captures and will relaunch as soon as nothing is " +
+          "using it. Please retry shortly.", { cause: error });
       }
 
       // createPageWithCapture handles its own cleanup on failure (closes page, kills FFmpeg).

@@ -220,8 +220,8 @@ export function terminateStream(streamId: number, channelName: string, reason: s
   unregisterStream(streamId);
 
   /* With the entry gone, the window-visibility policy can see whether anything is still capturing, so this is the moment the window settles. It lives here rather
-   * than at each caller for the same reason the rest of this cleanup does: nine paths reach termination, and a policy trigger any one of them could forget is a
-   * window left on screen for the rest of the session. Fire-and-forget, because the executor serializes and no caller of terminateStream waits on presentation.
+   * than at each caller for the same reason the rest of this cleanup does: every termination path arrives here, and a policy trigger any one of them could forget
+   * is a window left on screen for the rest of the session. Fire-and-forget, because the executor serializes and no caller of terminateStream waits on presentation.
    *
    * This differs from the SSE emission the notes above keep caller-owned: a caller batches that emission across a multi-stream teardown or suppresses it when
    * nobody is listening, while the window policy has to settle on every termination, so it belongs here.
