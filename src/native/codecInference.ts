@@ -2,10 +2,9 @@
  *
  * codecInference.ts: Inference of the video codec carried by an HLS media playlist by parsing the first segment.
  */
-import { LOG, chromeFetch, timeoutSignal } from "../utils/index.ts";
+import { LOG, chromeFetch, resolveUrl, timeoutSignal } from "../utils/index.ts";
 import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
-import { resolveUrl } from "./probe.ts";
 import { systemClock } from "homebridge-plugin-utils";
 
 /* Media-only HLS playlists do not declare codec information - that lives in the master playlist's #EXT-X-STREAM-INF CODECS attribute, which the master-playlist

@@ -3,7 +3,7 @@
  * probe.ts: HLS manifest probe and media-feed normalizer.
  */
 import type { DELTA_ELIGIBLE_BINDING_KEYS, MediaContainer, Nullable, ResolvedChannel } from "../types/index.ts";
-import { LOG, chromeFetch, startTimer, stringifySorted, timeoutSignal } from "../utils/index.ts";
+import { LOG, chromeFetch, resolveUrl, startTimer, stringifySorted, timeoutSignal } from "../utils/index.ts";
 import type { Clock } from "homebridge-plugin-utils";
 import { inferMediaCodec } from "./codecInference.ts";
 import { systemClock } from "homebridge-plugin-utils";
@@ -1154,23 +1154,4 @@ function resolveAudioRendition(masterBody: string, masterUrl: string, audioGroup
   }
 
   return resolveUrl(candidateUri, masterUrl);
-}
-
-/**
- * Resolves a potentially relative URL against a base URL. Handles both absolute and relative URLs. Exported for reuse by the proxy module.
- *
- * @param url - The URL to resolve (may be relative or absolute).
- * @param baseUrl - The base URL for resolving relative references.
- * @returns The resolved absolute URL.
- */
-export function resolveUrl(url: string, baseUrl: string): string {
-
-  // If the URL is already absolute, return it directly.
-  if(url.startsWith("http://") || url.startsWith("https://")) {
-
-    return url;
-  }
-
-  // Use the URL constructor to resolve relative URLs against the base.
-  return new URL(url, baseUrl).href;
 }

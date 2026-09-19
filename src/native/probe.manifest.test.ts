@@ -3,7 +3,7 @@
  * probe.manifest.test.ts: Unit tests for probeManifest, the master-manifest probe orchestrator in probe.ts. The orchestrator fetches a master manifest, ranks the
  * variants by descending bandwidth and takes the first whose manifest fetches, binds the audio rendition to that variant's audio group, and classifies the
  * encryption type by parsing #EXT-X-KEY tags. This file isolates the orchestrator
- * tests from the cache and resolveUrl tests in probe.test.ts so each file stays under the per-file line guideline. The tests substitute globalThis.fetch with
+ * tests from the cache tests in probe.test.ts so each file stays under the per-file line guideline. The tests substitute globalThis.fetch with
  * mock.method to feed synthetic master/variant/key responses without ever touching the network.
  */
 /* eslint-disable sort-keys -- fixture route maps are ordered by HLS resolution chain (master -> variant -> key), not alphabetical key strings, so the logical

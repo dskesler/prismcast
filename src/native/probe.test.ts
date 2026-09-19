@@ -1,14 +1,14 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * probe.test.ts: Unit tests for the cache helpers (getCachedEncryption, clearProbeCache), the URL resolver (resolveUrl), and the playlist classifier
- * (classifyHlsPlaylist) in probe.ts. The probeManifest orchestrator is exercised in the companion probe.manifest.test.ts file - splitting keeps each file under
- * the per-file line guideline. The cache helpers are round-tripped via real probeManifest invocations so the cache state observed in tests matches the
- * production write path; the classifier and URL resolver are pure functions and are tested directly without I/O.
+ * probe.test.ts: Unit tests for the cache helpers (getCachedEncryption, clearProbeCache) and the playlist classifier (classifyHlsPlaylist) in probe.ts. The
+ * probeManifest orchestrator is exercised in the companion probe.manifest.test.ts file - splitting keeps each file under the per-file line guideline. The
+ * cache helpers are round-tripped via real probeManifest invocations so the cache state observed in tests matches the production write path; the classifier
+ * is a pure function and is tested directly without I/O.
  */
 import type { ProbeCacheBinding, ProbeCacheIdentity } from "./probe.ts";
 import { afterEach, beforeEach, describe, mock, test } from "node:test";
-import { buildProbeCacheStamp, classifyHlsPlaylist, clearProbeCache, extractChildPlaylistUrls, getCachedEncryption, isLiveMediaPlaylist, probeManifest,
-  resolveUrl } from "./probe.ts";
+import { buildProbeCacheStamp, classifyHlsPlaylist, clearProbeCache, extractChildPlaylistUrls, getCachedEncryption, isLiveMediaPlaylist,
+  probeManifest } from "./probe.ts";
 import assert from "node:assert/strict";
 import { systemClock } from "homebridge-plugin-utils";
 
@@ -202,51 +202,6 @@ describe("clearProbeCache", () => {
 
       clearProbeCache("never-cached-channel");
     });
-  });
-});
-
-describe("resolveUrl", () => {
-
-  test("returns an http:// URL unchanged (already absolute)", () => {
-
-    // Happy path: the function must short-circuit on already-absolute URLs and return them verbatim.
-    assert.equal(resolveUrl("http://example.test/segment.ts", "https://base.test/manifest.m3u8"), "http://example.test/segment.ts");
-  });
-
-  test("returns an https:// URL unchanged (already absolute)", () => {
-
-    assert.equal(resolveUrl("https://cdn.test/seg.ts", "https://master.test/index.m3u8"), "https://cdn.test/seg.ts");
-  });
-
-  test("resolves a path-relative URL against the base URL", () => {
-
-    // Standard relative-URL resolution per WHATWG URL: the relative segment replaces the base's filename component, preserving the directory.
-    assert.equal(resolveUrl("segment0.ts", "https://cdn.test/path/manifest.m3u8"), "https://cdn.test/path/segment0.ts");
-  });
-
-  test("resolves a root-relative URL against the base host", () => {
-
-    // Boundary: a leading "/" rebases to the host root of the base URL.
-    assert.equal(resolveUrl("/abs/segment.ts", "https://cdn.test/path/manifest.m3u8"), "https://cdn.test/abs/segment.ts");
-  });
-
-  test("resolves a parent-directory traversal in the relative URL", () => {
-
-    // Boundary: ../ segments collapse the base path appropriately.
-    assert.equal(resolveUrl("../other/seg.ts", "https://cdn.test/a/b/manifest.m3u8"), "https://cdn.test/a/other/seg.ts");
-  });
-
-  test("preserves query strings on the relative URL", () => {
-
-    // Query strings carry auth tokens in many HLS providers - the resolver must preserve them through the URL constructor pipeline.
-    assert.equal(resolveUrl("seg.ts?token=abc", "https://cdn.test/path/manifest.m3u8"), "https://cdn.test/path/seg.ts?token=abc");
-  });
-
-  test("treats a protocol-relative URL (//host/path) as absolute via the base scheme", () => {
-
-    // Boundary: //host/path is technically not absolute by our string check (it doesn't start with http:// or https://), so it falls through to the URL
-    // constructor. The constructor inherits the base scheme. Lock the resulting behavior.
-    assert.equal(resolveUrl("//other.test/seg.ts", "https://cdn.test/manifest.m3u8"), "https://other.test/seg.ts");
   });
 });
 

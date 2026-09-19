@@ -2,7 +2,7 @@
  *
  * proxy.ts: Native HLS proxy - manifest polling, segment fetching, and playlist generation.
  */
-import { LOG, chromeFetch, startTimer, timeoutSignal } from "../utils/index.ts";
+import { LOG, chromeFetch, resolveUrl, startTimer, timeoutSignal } from "../utils/index.ts";
 import type { MediaContainer, Nullable } from "../types/index.ts";
 import { buildPrerollEntries, computePrerollWindow } from "../streaming/preroll.ts";
 import { decryptSegment, deriveIvFromSequence, fetchDecryptionKey, parseExplicitIv } from "./decrypt.ts";
@@ -16,7 +16,6 @@ import type { PipelineShape } from "./probe.ts";
 import type { PlaylistSegmentEntry } from "../streaming/playlistBuilder.ts";
 import { buildPlaylist } from "../streaming/playlistBuilder.ts";
 import { getStream } from "../streaming/registry.ts";
-import { resolveUrl } from "./probe.ts";
 import { systemClock } from "homebridge-plugin-utils";
 
 /* This module implements the native HLS proxy that replaces Chrome screen capture for viable streams. It polls the service's variant manifest at regular intervals,

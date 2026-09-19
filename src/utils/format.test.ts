@@ -1,11 +1,12 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * format.test.ts: Unit tests for the formatting primitives in format.ts. The module's exports are pure functions plus two clock-readers (formatTimestamp,
- * formatTimeAgo). stringifySorted is the SSOT for sorted-key JSON serialization across all persisted and exported files; an unverified change here would alter
- * on-disk file shape without warning, so it earns the heaviest boundary coverage.
+ * format.test.ts: Unit tests for the formatting primitives and the URL readers in format.ts, the latter covering domain and pathname extraction and the
+ * resolution of a relative URL against a base. The module's exports are pure functions plus two clock-readers (formatTimestamp, formatTimeAgo).
+ * stringifySorted is the SSOT for sorted-key JSON serialization across all persisted and exported files; an unverified change here would alter on-disk file
+ * shape without warning, so it earns the heaviest boundary coverage.
  */
 import { capitalize, extractDomain, extractPathname, formatDuration, formatResolution, formatResolutionLabel, formatTimeAgo, formatTimestamp,
-  stringifySorted } from "./format.ts";
+  resolveUrl, stringifySorted } from "./format.ts";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
@@ -290,6 +291,51 @@ describe("extractPathname", () => {
     assert.notEqual(extractPathname("https://cdn.test/path/"), extractPathname("https://cdn.test/path"));
     assert.equal(extractPathname("https://cdn.test/a%20b/seg.ts"), "/a%20b/seg.ts");
     assert.equal(extractPathname("https://cdn.test/Path/Seg.TS"), "/Path/Seg.TS");
+  });
+});
+
+describe("resolveUrl", () => {
+
+  test("returns an http:// URL unchanged (already absolute)", () => {
+
+    // Happy path: the function must short-circuit on already-absolute URLs and return them verbatim.
+    assert.equal(resolveUrl("http://example.test/segment.ts", "https://base.test/manifest.m3u8"), "http://example.test/segment.ts");
+  });
+
+  test("returns an https:// URL unchanged (already absolute)", () => {
+
+    assert.equal(resolveUrl("https://cdn.test/seg.ts", "https://master.test/index.m3u8"), "https://cdn.test/seg.ts");
+  });
+
+  test("resolves a path-relative URL against the base URL", () => {
+
+    // Standard relative-URL resolution per WHATWG URL: the relative segment replaces the base's filename component, preserving the directory.
+    assert.equal(resolveUrl("segment0.ts", "https://cdn.test/path/manifest.m3u8"), "https://cdn.test/path/segment0.ts");
+  });
+
+  test("resolves a root-relative URL against the base host", () => {
+
+    // Boundary: a leading "/" rebases to the host root of the base URL.
+    assert.equal(resolveUrl("/abs/segment.ts", "https://cdn.test/path/manifest.m3u8"), "https://cdn.test/abs/segment.ts");
+  });
+
+  test("resolves a parent-directory traversal in the relative URL", () => {
+
+    // Boundary: ../ segments collapse the base path appropriately.
+    assert.equal(resolveUrl("../other/seg.ts", "https://cdn.test/a/b/manifest.m3u8"), "https://cdn.test/a/other/seg.ts");
+  });
+
+  test("preserves query strings on the relative URL", () => {
+
+    // Query strings carry auth tokens in many HLS providers - the resolver must preserve them through the URL constructor pipeline.
+    assert.equal(resolveUrl("seg.ts?token=abc", "https://cdn.test/path/manifest.m3u8"), "https://cdn.test/path/seg.ts?token=abc");
+  });
+
+  test("treats a protocol-relative URL (//host/path) as absolute via the base scheme", () => {
+
+    // Boundary: //host/path is technically not absolute by our string check (it doesn't start with http:// or https://), so it falls through to the URL
+    // constructor. The constructor inherits the base scheme. Lock the resulting behavior.
+    assert.equal(resolveUrl("//other.test/seg.ts", "https://cdn.test/manifest.m3u8"), "https://other.test/seg.ts");
   });
 });
 

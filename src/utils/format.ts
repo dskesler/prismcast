@@ -190,6 +190,25 @@ export function extractPathname(url: string): Nullable<string> {
 }
 
 /**
+ * Resolves a potentially relative URL against a base URL. Handles both absolute and relative URLs.
+ *
+ * @param url - The URL to resolve (may be relative or absolute).
+ * @param baseUrl - The base URL for resolving relative references.
+ * @returns The resolved absolute URL.
+ */
+export function resolveUrl(url: string, baseUrl: string): string {
+
+  // If the URL is already absolute, return it directly.
+  if(url.startsWith("http://") || url.startsWith("https://")) {
+
+    return url;
+  }
+
+  // Use the URL constructor to resolve relative URLs against the base.
+  return new URL(url, baseUrl).href;
+}
+
+/**
  * Capitalizes the first letter of a string.
  * @param str - The string to capitalize.
  * @returns The string with the first letter capitalized.
