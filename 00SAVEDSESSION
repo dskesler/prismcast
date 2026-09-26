@@ -1,0 +1,407 @@
+❯ Going back to the issue in Channels where video is freezing occasionally...whether or not it's ultimately an issue in Channels or not, I need to       
+  solve it on my end so I can have usable video. The issue is most acute for msnow...so how can we make our stream to Channels more resilient            
+  against the issues we're seeing. What are your thoughts based on our previous discussions of the symptoms we are seeing and dealing with.              
+                                                                                                                                                         
+⏺ The context about the specific symptoms was compacted. Can you remind me of the key observations you're seeing with the MSNBC freezing issue?          
+  Specifically:                                                                                                                                          
+                                                                                                                                                         
+  1. What freezes - Does video freeze while audio continues? Both freeze? Does it eventually recover?                                                    
+  2. When it happens - Random intervals? During specific events (ad breaks, quality changes)?                                                            
+  3. What the logs show - Any errors or warnings during freezes?                                                                                         
+  4. Channels DVR behavior - Does it report stream errors, or does it just show frozen video?                                                            
+                                                                                                                                                         
+  With those details I can give you targeted recommendations. Some general directions I'm already thinking about:                                        
+                                                                                                                                                         
+  - Segment timing - If Channels is waiting for segments, shorter segment durations could reduce recovery time                                           
+  - Discontinuity handling - How we signal stream disruptions to the HLS playlist                                                                        
+  - FFmpeg pipeline buffering - Whether data is getting stuck somewhere                                                                                  
+  - MSNBC-specific player behavior - Ad insertion or quality switching that might cause capture gaps                                                     
+                                                                                                                                                         
+❯ Video is freezing occasionally in Channels. Audio generally continues, but a video image is frozen for certain blocks of time - sometimes as long      
+  as 20 minutes before recovering. You've correlated it against logs and previously determined the issue likely lies with Channels not with what we      
+  are serving. We've validated we serve keyframes regularly every 1-2.5 seconds in ffmpeg mode (our default). There may be issues in how we handle       
+  discontinuities when they occur so we should verify we are fully HLS spec compliant in our custom segmenter and handling those recovery situations     
+   correctly. In short - things should work well, they just don't always seem to. We need to make ourselves more robust. Channels DVR is using           
+  ffmpeg 6 for most of it's work. Don't write code...we're having an extended brainstorming / analysis conversation until we align on key action         
+  items and a path forward. This issue is the single biggest issue I'm still facing with PrismCast.                                                      
+                                                                                                                                                         
+⏺ This is a classic and frustrating problem. The symptom "video frozen but audio continues" is very specific and points to a few likely culprits. Let me 
+  walk through my analysis.                                                                                                                              
+                                                                                                                                                         
+  The Core Problem                                                                                                                                       
+                                                                                                                                                         
+  Video and audio are separate elementary streams in fMP4. When video freezes but audio continues, Channels' decoder is:                                 
+  - Successfully parsing and decoding audio samples                                                                                                      
+  - Stuck waiting on something in the video track                                                                                                        
+                                                                                                                                                         
+  This isn't a network/buffering issue (both tracks would stall). It's a video decoder state issue.                                                      
+                                                                                                                                                         
+  Most Likely Causes                                                                                                                                     
+                                                                                                                                                         
+  1. Keyframe Dependency After Discontinuity                                                                                                             
+                                                                                                                                                         
+  When we insert #EXT-X-DISCONTINUITY, Channels' decoder needs to resync. For video, this means finding an IDR frame (true keyframe). If:                
+  - The first video sample after discontinuity isn't a sync sample, or                                                                                   
+  - The sample flags don't correctly mark it as sync, or                                                                                                 
+  - The init segment (moov) changed but we didn't signal a new #EXT-X-MAP                                                                                
+                                                                                                                                                         
+  ...the decoder might wait indefinitely for a "real" keyframe.                                                                                          
+                                                                                                                                                         
+  Question for investigation: After a recovery/discontinuity, are we guaranteeing the first video sample is an IDR, and are we correctly marking         
+  sample_is_non_sync_sample = 0 in the trun flags?                                                                                                       
+                                                                                                                                                         
+  2. Init Segment Mismatch                                                                                                                               
+                                                                                                                                                         
+  fMP4 HLS requires the initialization segment (moov) to describe the media. After a discontinuity where FFmpeg restarts:                                
+  - New moov might have different track IDs                                                                                                              
+  - Codec parameters (SPS/PPS for H.264) might differ slightly                                                                                           
+  - If Channels continues using the old moov to parse new segments, video decoding breaks                                                                
+                                                                                                                                                         
+  Question: Do we emit a new #EXT-X-MAP after every discontinuity? The HLS spec says we should when media initialization changes.                        
+                                                                                                                                                         
+  3. Composition Time Offset (CTO) Issues                                                                                                                
+                                                                                                                                                         
+  H.264 with B-frames has decode order ≠ presentation order. The ctts box or composition_time_offset in trun handles this. If:                           
+  - FFmpeg restart produces different CTO patterns                                                                                                       
+  - Our segmenter doesn't preserve these correctly                                                                                                       
+  - Values become negative or overflow in ways FFmpeg 6 doesn't handle                                                                                   
+                                                                                                                                                         
+  ...the decoder might get confused about when to display frames.                                                                                        
+                                                                                                                                                         
+  4. Segment Boundary vs GOP Boundary                                                                                                                    
+                                                                                                                                                         
+  We segment on keyframes (good), but do we ensure the segment actually starts with that keyframe's video sample? If there's any audio lead-in before the
+   video keyframe, and the discontinuity marker is before the segment, Channels might:                                                                   
+  - Start decoding audio immediately                                                                                                                     
+  - Wait for video keyframe that's "late" in the segment                                                                                                 
+  - Get stuck if something about the video parsing fails                                                                                                 
+                                                                                                                                                         
+  Questions About Our Segmenter                                                                                                                          
+                                                                                                                                                         
+  I should read through fmp4Segmenter.ts to verify:                                                                                                      
+                                                                                                                                                         
+  1. State reset on discontinuity - Do we fully reset parser state, or could stale state affect new segments?                                            
+  2. Init segment handling - When FFmpeg restarts, do we capture the new moov and make it available?                                                     
+  3. Sample flags parsing - Are we correctly reading and preserving the sync sample flags from FFmpeg's output?                                          
+  4. Sequence number continuity - The mfhd box has a sequence number. Does it need to reset or continue across discontinuities?                          
+                                                                                                                                                         
+  Diagnostic Approaches                                                                                                                                  
+                                                                                                                                                         
+  Before proposing fixes, we should:                                                                                                                     
+                                                                                                                                                         
+  1. Capture a freeze scenario - Save the actual segments (init + media) around a discontinuity where freezing occurs                                    
+  2. Analyze with mp4dump/bento4 - Verify the segment structure is valid fMP4                                                                            
+  3. Compare against working streams - If native HLS from a site works in Channels, compare our segment structure to theirs                              
+  4. Test with other players - Does VLC or ffplay show the same freeze behavior, or is it Channels-specific?                                             
+                                                                                                                                                         
+  Initial Hypotheses to Explore                                                                                                                          
+                                                                                                                                                         
+  My top three guesses, in order of likelihood:                                                                                                          
+                                                                                                                                                         
+  1. Missing #EXT-X-MAP after discontinuity - Easy to check and fix                                                                                      
+  2. Sync sample flags not set correctly - Would explain why decoder waits for keyframe                                                                  
+  3. Init segment reuse across FFmpeg restarts - Would cause parsing failures                                                                            
+                                                                                                                                                         
+  Want me to read through fmp4Segmenter.ts and hlsSegments.ts to assess our current handling of these cases?                                             
+                                                                                                                                                         
+✻ Cooked for 54s                                                                                                                                         
+                                                                                                                                                         
+❯ Yes, let's take a look.                                                                                                                                
+                                                                                                                                                         
+⏺ Read 2 files (ctrl+o to expand)                                                                                                                        
+                                                                                                                                                         
+⏺ This is very revealing. Let me share what I'm seeing.                                                                                                  
+                                                                                                                                                         
+  Good News First                                                                                                                                        
+                                                                                                                                                         
+  Discontinuity + MAP re-emission is correct (lines 297-301):                                                                                            
+  if(state.discontinuityIndices.has(i)) {                                                                                                                
+    lines.push("#EXT-X-DISCONTINUITY");                                                                                                                  
+    lines.push("#EXT-X-MAP:URI=\"init.mp4\"");                                                                                                           
+  }                                                                                                                                                      
+                                                                                                                                                         
+  After a discontinuity, we correctly emit both #EXT-X-DISCONTINUITY and a fresh #EXT-X-MAP reference. This is HLS-compliant.                            
+                                                                                                                                                         
+  Critical Issue Found                                                                                                                                   
+                                                                                                                                                         
+  Init segment is NOT updated on in-place recovery (lines 434-453):                                                                                      
+                                                                                                                                                         
+  if(!state.hasInit) {                                                                                                                                   
+    if((box.type === "ftyp") || (box.type === "moov")) {                                                                                                 
+      state.initBoxes.push(box.data);                                                                                                                    
+      if(box.type === "moov") {                                                                                                                          
+        storeInitSegment(streamId, initData);                                                                                                            
+        state.hasInit = true;  // ← Never reset                                                                                                          
+      }                                                                                                                                                  
+    }                                                                                                                                                    
+  }                                                                                                                                                      
+                                                                                                                                                         
+  Once hasInit is true, we never capture a new init segment. But look at what happens during recovery:                                                   
+                                                                                                                                                         
+  1. Tab replacement path (new segmenter created): Works correctly. New segmenter has hasInit = false, captures fresh moov.                              
+  2. In-place recovery path (markDiscontinuity() called): Broken. The segmenter continues with hasInit = true. FFmpeg restarts and outputs a new         
+  ftyp+moov, but we ignore them. We emit #EXT-X-MAP:URI="init.mp4" pointing to the stale init segment while serving new media segments.                  
+                                                                                                                                                         
+  This is almost certainly your bug. After a source reload or page navigation recovery:                                                                  
+  - Playlist says "use init.mp4" (which is stale)                                                                                                        
+  - Media segments are from the new FFmpeg instance                                                                                                      
+  - Channels uses old moov to parse new moof/mdat                                                                                                        
+  - Video track parsing fails, decoder waits for valid data                                                                                              
+  - Audio might still decode (different track, simpler parsing)                                                                                          
+  - Video frozen, audio continues                                                                                                                        
+                                                                                                                                                         
+  Secondary Concern                                                                                                                                      
+                                                                                                                                                         
+  Segment cutting is time-based, not keyframe-aligned (lines 468-474):                                                                                   
+                                                                                                                                                         
+  const elapsedMs = Date.now() - state.segmentStartTime;                                                                                                 
+  const targetMs = CONFIG.hls.segmentDuration * 1000;                                                                                                    
+  if(elapsedMs >= targetMs) {                                                                                                                            
+    outputSegment();                                                                                                                                     
+  }                                                                                                                                                      
+                                                                                                                                                         
+  We cut when time expires, regardless of whether we're at a keyframe. The KEYFRAME_DEBUG code is purely diagnostic and doesn't influence cutting. This  
+  means segments might not start with sync samples.                                                                                                      
+                                                                                                                                                         
+  However, this is likely less critical than the init segment issue — FFmpeg's fMP4 output typically starts fragments on keyframes anyway, so we'd need  
+  to verify this is actually happening.                                                                                                                  
+                                                                                                                                                         
+  Let Me Check One More Thing                                                                                                                            
+                                                                                                                                                         
+  I want to see how markDiscontinuity() is called and whether tab replacement vs in-place recovery explains the pattern you're seeing.                   
+                                                                                                                                                         
+⏺ Searched for 1 pattern (ctrl+o to expand)                                                                                                              
+                                                                                                                                                         
+⏺ Let me see the full context of when markStreamDiscontinuity is called in the monitor:                                                                  
+                                                                                                                                                         
+⏺ Searched for 1 pattern, read 1 file (ctrl+o to expand)                                                                                                 
+                                                                                                                                                         
+⏺ Now I understand the full picture. Let me search for how tab replacement differs:                                                                      
+                                                                                                                                                         
+⏺ Searched for 1 pattern (ctrl+o to expand)                                                                                                              
+                                                                                                                                                         
+⏺ Now I have the complete picture. Let me summarize what I've found.                                                                                     
+                                                                                                                                                         
+  Two Different Recovery Paths                                                                                                                           
+                                                                                                                                                         
+  Tab Replacement (works correctly)                                                                                                                      
+                                                                                                                                                         
+  When the tab becomes unresponsive (3+ consecutive timeouts), we create a new segmenter (hls.ts:540):                                                   
+  const newSegmenter = createFMP4Segmenter({                                                                                                             
+    pendingDiscontinuity: true,                                                                                                                          
+    startingSegmentIndex: currentSegmentIndex,                                                                                                           
+    // ...                                                                                                                                               
+  });                                                                                                                                                    
+  New segmenter → hasInit = false → captures fresh init segment → correct behavior.                                                                      
+                                                                                                                                                         
+  In-Place Recovery (potential issue)                                                                                                                    
+                                                                                                                                                         
+  For source reload (L2) and page navigation (L3/L4), we call markStreamDiscontinuity() on the existing segmenter:                                       
+  markDiscontinuity: (): void => {                                                                                                                       
+    outputSegment();                                                                                                                                     
+    state.pendingDiscontinuity = true;                                                                                                                   
+    // hasInit remains true!                                                                                                                             
+  }                                                                                                                                                      
+                                                                                                                                                         
+  The critical question: Does FFmpeg restart during in-place recovery?                                                                                   
+                                                                                                                                                         
+  Looking at the architecture:                                                                                                                           
+  - spawnFFmpeg() is called once in createPageWithCapture()                                                                                              
+  - For source reload/page navigation, the same FFmpeg process continues                                                                                 
+  - The capture stream from Chrome continues (tab is the same)                                                                                           
+  - No new init segment is produced because FFmpeg doesn't restart                                                                                       
+                                                                                                                                                         
+  So my initial hypothesis about stale init segments may not apply to in-place recovery — the init segment is still valid because it's the same FFmpeg   
+  instance.                                                                                                                                              
+                                                                                                                                                         
+  Revised Analysis: What Could Cause 20-Minute Freezes?                                                                                                  
+                                                                                                                                                         
+  If FFmpeg doesn't restart and the init segment is valid, what else could cause video-frozen-but-audio-continues?                                       
+                                                                                                                                                         
+  Hypothesis 1: Chrome's H264 Parameters Change Mid-Stream                                                                                               
+                                                                                                                                                         
+  When the video element changes (source reload, page navigation):                                                                                       
+  1. Chrome's MediaRecorder might produce H264 with different parameters (resolution, profile, etc.)                                                     
+  2. FFmpeg is doing -c:v copy, so it passes these through unchanged                                                                                     
+  3. The moov box describes the original stream parameters                                                                                               
+  4. New H264 NAL units don't match what the moov declares                                                                                               
+  5. Channels' decoder gets confused on video track, audio continues                                                                                     
+                                                                                                                                                         
+  This would be a latent bug that only manifests when the captured content changes significantly.                                                        
+                                                                                                                                                         
+  Hypothesis 2: Keyframe Alignment After Recovery                                                                                                        
+                                                                                                                                                         
+  After recovery events, the video stream resumes at an arbitrary point:                                                                                 
+  1. First samples after recovery might not include a keyframe                                                                                           
+  2. We cut segments based on time, not keyframes                                                                                                        
+  3. Decoder waits for sync point that's delayed                                                                                                         
+  4. Eventually gets one and recovers                                                                                                                    
+                                                                                                                                                         
+  This could explain the "eventually recovers" behavior, but 20 minutes seems extreme.                                                                   
+                                                                                                                                                         
+  Hypothesis 3: Channels-Specific Parsing Issue                                                                                                          
+                                                                                                                                                         
+  Something about our fMP4 structure (valid but unusual) triggers a bug in Channels' FFmpeg 6:                                                           
+  - Our movflags combo                                                                                                                                   
+  - Segment timing patterns                                                                                                                              
+  - Something in how we handle discontinuities                                                                                                           
+                                                                                                                                                         
+  Diagnostic Steps I'd Recommend                                                                                                                         
+                                                                                                                                                         
+  1. Enable KEYFRAME_DEBUG temporarily                                                                                                                   
+    - Set KEYFRAME_DEBUG = true in fmp4Segmenter.ts                                                                                                      
+    - Watch for "Segment X does not start with a keyframe" warnings                                                                                      
+    - Get statistics on keyframe intervals                                                                                                               
+  2. Capture segments around a freeze                                                                                                                    
+    - When you notice a freeze, grab the init.mp4 and recent segment files                                                                               
+    - Analyze with mp4dump or Bento4's mp4info                                                                                                           
+    - Compare moov track descriptions to actual moof/trun content                                                                                        
+  3. Test with a different player                                                                                                                        
+    - Does VLC or ffplay show the same freeze behavior on the same stream?                                                                               
+    - If not, it's Channels-specific                                                                                                                     
+  4. Correlate with recovery events                                                                                                                      
+    - Check PrismCast logs for discontinuity markers around freeze times                                                                                 
+    - Does every freeze correlate with a prior recovery event?                                                                                           
+                                                                                                                                                         
+  What would you like to explore first?                                                                                                                  
+                                                                                                                                                         
+✻ Cogitated for 2m 42s                                                                                                                                   
+                                                                                                                                                         
+❯ 1. We already did this, and know that we are fine. No warnings occur. 2. I'm not sure how that's practical...I'm open to suggestions. 3. Other         
+  clients don't really show the behavior in some quick testing, but haven't tested extensively - Channels is the primary target for this debugging       
+  effort. 4. You already correlated around freeze times, such as at 8:40PM or so to 8:45PM yesterday. You looked through the PrismCast logs and the      
+  Channels DVR logs, both on this machine and noted some trends and insights. You can do so again to glean more insights.                                
+                                                                                                                                                         
+⏺ You're right, let me look at the logs again. Since that analysis was compacted, I need to review them fresh. Let me find and examine the relevant log  
+  files.                                                                                                                                                 
+                                                                                                                                                         
+⏺ Searched for 1 pattern, read 1 file (ctrl+o to expand)                                                                                                 
+                                                                                                                                                         
+❯ the PrismCast logs are always in ~/.prismcast/logs and the Channels logs are always in "~/Library/Application Support/ChannelsDVR/data"                
+                                                                                                                                                         
+⏺ Searched for 15 patterns, read 9 files (ctrl+o to expand)                                                                                              
+                                                                                                                                                         
+⏺ Now I have context. Let me look at what Channels DVR saw during those specific recovery events. The log file that covers 8:30-8:45 PM would be         
+  hls-2026-02-02T20-18-11.884.log, but we saw msnow ended at 20:18. Let me check the next log file:                                                      
+                                                                                                                                                         
+⏺ Searched for 3 patterns, read 1 file (ctrl+o to expand)                                                                                                
+                                                                                                                                                         
+⏺ This is very insightful. I can see Channels DVR is correctly detecting our discontinuities:                                                            
+                                                                                                                                                         
+  1. 20:31:02 - discontinuity=true, segment 547 (343KB - short flush segment), continuity_counter=1                                                      
+  2. 20:37:48 - discontinuity=true, segment 670 (238KB - short flush segment), continuity_counter=2                                                      
+  3. 20:38:01 - discontinuity=true, segment 674 (21MB - large segment), continuity_counter=3                                                             
+                                                                                                                                                         
+  The mpegts_remuxer is adjusting PTS offsets on each discontinuity. Let me look at what happens immediately after these discontinuities:                
+                                                                                                                                                         
+⏺ Searched for 2 patterns (ctrl+o to expand)                                                                                                             
+                                                                                                                                                         
+⏺ The Channels DVR logs look normal - it's correctly detecting discontinuities and adjusting PTS. Let me check the main channels-dvr.log for any         
+  video-related issues during this time:                                                                                                                 
+                                                                                                                                                         
+⏺ Searched for 2 patterns (ctrl+o to expand)                                                                                                             
+                                                                                                                                                         
+⏺ Let me look for any recording or playback issues:                                                                                                      
+                                                                                                                                                         
+⏺ Searched for 2 patterns (ctrl+o to expand)                                                                                                             
+                                                                                                                                                         
+⏺ Major finding! Look at these errors:                                                                                                                   
+                                                                                                                                                         
+  21:58:28 Error: Transcoder Reset: Playlist reset to a lower sequence (1540 -> 0)                                                                       
+  22:22:04 Error: Transcoder Reset: Playlist reset to a lower sequence (418 -> 0)                                                                        
+  22:35:00 Error: Transcoder Reset: Playlist reset to a lower sequence (210 -> 0)                                                                        
+  22:37:49 Error: Transcoder Reset: Playlist reset to a lower sequence (48 -> 0)                                                                         
+  22:42:13 Error: Transcoder Reset: Playlist reset to a lower sequence (76 -> 0)                                                                         
+  22:45:15 Error: Transcoder Reset: Playlist reset to a lower sequence (52 -> 0)                                                                         
+                                                                                                                                                         
+  Channels DVR is detecting that our playlist sequence numbers are resetting to 0! This happens when PrismCast restarts the stream (server               
+  shutdown/restart). Let me correlate with the PrismCast logs:                                                                                           
+                                                                                                                                                         
+⏺ Searched for 1 pattern (ctrl+o to expand)                                                                                                              
+                                                                                                                                                         
+⏺ This is very revealing. The "Transcoder Reset" errors all correlate with server shutdowns - each time you restarted PrismCast, the segment sequence    
+  reset to 0, which Channels DVR detected as an error.                                                                                                   
+                                                                                                                                                         
+  Critical observation: During the 20:30-20:45 recovery events (source reload, page navigation), there were NO "Transcoder Reset" errors. The in-place   
+  recovery with discontinuity markers worked correctly from Channels DVR's perspective.                                                                  
+                                                                                                                                                         
+  Let me look at what's happening with those 2-minute connection cycling patterns:                                                                       
+                                                                                                                                                         
+⏺ Searched for 1 pattern (ctrl+o to expand)                                                                                                              
+                                                                                                                                                         
+⏺ This is the smoking gun!                                                                                                                               
+                                                                                                                                                         
+  21:26:24 Closing connection M3U-Prism ch7054 after no data was received for 2m0s                                                                       
+  21:28:25 Closing connection M3U-Prism ch7054 after no data was received for 2m0s                                                                       
+  ... (repeating every 2 minutes)                                                                                                                        
+                                                                                                                                                         
+  Channels DVR is reporting "no data was received for 2m0s" - even while PrismCast thinks it's serving the stream! This explains the freeze: the client  
+  shows a frozen frame because no new data is being decoded.                                                                                             
+                                                                                                                                                         
+  Let me check what PrismCast was doing during this 21:26-21:56 period:                                                                                  
+                                                                                                                                                         
+⏺ Searched for 2 patterns (ctrl+o to expand)                                                                                                             
+                                                                                                                                                         
+⏺ CRITICAL FINDING! Look at these entries after the 21:24 recovery:                                                                                      
+                                                                                                                                                         
+  segment_average_bitrate=848.1Kbit/sec   (was ~24Mbit/sec before)                                                                                       
+  number_of_new_segments=0                 (playlist not advancing!)                                                                                     
+  first_sequence=1498 last_sequence=1507   (stuck on same segments!)                                                                                     
+  cache_size=3.6M                          (was ~97M before)                                                                                             
+                                                                                                                                                         
+  The playlist is stuck - it's returning the same 10 segments (1498-1507) repeatedly with no new segments. Let me look at what caused this:              
+                                                                                                                                                         
+⏺ Searched for 3 patterns (ctrl+o to expand)                                                                                                             
+                                                                                                                                                         
+⏺ The playlist got stuck at segment 1507 right when PrismCast was doing the source reload recovery. Let me see if it ever recovered:                     
+                                                                                                                                                         
+⏺ Searched for 2 patterns (ctrl+o to expand)                                                                                                             
+                                                                                                                                                         
+⏺ Key Finding: The Stream Was Dead for 30+ Minutes                                                                                                       
+                                                                                                                                                         
+  Looking at the timeline:                                                                                                                               
+  ┌──────────────────┬────────────────────────────────────────────────────────┐                                                                          
+  │       Time       │                         Event                          │                                                                          
+  ├──────────────────┼────────────────────────────────────────────────────────┤                                                                          
+  │ 21:24:21         │ PrismCast: Source reload started                       │                                                                          
+  ├──────────────────┼────────────────────────────────────────────────────────┤                                                                          
+  │ 21:24:24         │ Last segment 1507 produced (low bitrate ~800Kbit/sec)  │                                                                          
+  ├──────────────────┼────────────────────────────────────────────────────────┤                                                                          
+  │ 21:24:25         │ PrismCast: "Recovered in 4.5s via source reload"       │                                                                          
+  ├──────────────────┼────────────────────────────────────────────────────────┤                                                                          
+  │ 21:24:26 onwards │ Playlist stuck at segments 1498-1507 - NO NEW SEGMENTS │                                                                          
+  ├──────────────────┼────────────────────────────────────────────────────────┤                                                                          
+  │ 21:26:24         │ Channels DVR: "no data received for 2m0s"              │                                                                          
+  ├──────────────────┼────────────────────────────────────────────────────────┤                                                                          
+  │ 21:26-21:56      │ Channels DVR reconnecting every 2 minutes              │                                                                          
+  ├──────────────────┼────────────────────────────────────────────────────────┤                                                                          
+  │ 21:56:22         │ PrismCast: Tab timeout detected, tab replacement       │                                                                          
+  ├──────────────────┼────────────────────────────────────────────────────────┤                                                                          
+  │ 21:56:37         │ Segments 1510+ start flowing again with discontinuity  │                                                                          
+  └──────────────────┴────────────────────────────────────────────────────────┘                                                                          
+  The critical bug: PrismCast reported "Recovered via source reload" but the capture pipeline was actually dead. No new segments were produced for ~30   
+  minutes. PrismCast only detected the problem when the tab became fully unresponsive.                                                                   
+                                                                                                                                                         
+  This explains your 20-minute freezes. The recovery "succeeds" from PrismCast's perspective (playback monitor sees the video element is "playing") but  
+  the actual data pipeline (MediaRecorder → FFmpeg → segmenter) has stalled.                                                                             
+                                                                                                                                                         
+  Why This Happens                                                                                                                                       
+                                                                                                                                                         
+  After source reload:                                                                                                                                   
+  1. The video element starts playing (PrismCast sees healthy state)                                                                                     
+  2. But the MediaRecorder/capture stream may not be properly reconnected to the new video                                                               
+  3. FFmpeg receives no input, produces no output                                                                                                        
+  4. Segmenter has nothing to segment                                                                                                                    
+  5. Playlist stays frozen                                                                                                                               
+                                                                                                                                                         
+  Potential Solutions                                                                                                                                    
+                                                                                                                                                         
+  1. Add segment production health check - If no new segments are produced for X seconds after "recovery", escalate                                      
+  2. Monitor FFmpeg stdout - If FFmpeg stops producing output, that's a clear signal                                                                     
+  3. Track playlist advancement - If segment index doesn't advance after recovery, the recovery failed                                                   
+                                                                                                                                                         
+  Would you like me to investigate how the capture stream is handled during source reload recovery?                                                      
+
+❯ Yes. Another example from today is around 8:11AM there was a freeze while recording "Today"...and it looks like the nbc channel never recovered.       
+  Before you do anything else - let's document the current state of this analysis, in detail, so we can continue it after we compact our context.        
+

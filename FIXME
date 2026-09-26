@@ -1,0 +1,15 @@
+  What Could Be Improved                                                                                                                  
+  ┌──────────────────────────────────────────┬──────────┬────────────────────────────────────────────────────┐                            
+  │                  Issue                   │ Severity │                       Impact                       │                            
+  ├──────────────────────────────────────────┼──────────┼────────────────────────────────────────────────────┤                            
+  │ #EXTINF uses config duration, not actual │ Low      │ Causes ffmpeg warnings (cosmetic)                  │                            
+  ├──────────────────────────────────────────┼──────────┼────────────────────────────────────────────────────┤                            
+  │ No maximum parser buffer size            │ Low      │ Theoretical memory leak on malformed streams       │                            
+  ├──────────────────────────────────────────┼──────────┼────────────────────────────────────────────────────┤                            
+  │ Wall-clock timing vs media timing        │ Low      │ Uneven segment durations under load                │                            
+  ├──────────────────────────────────────────┼──────────┼────────────────────────────────────────────────────┤                            
+  │ Race condition in placeholder pattern    │ Low      │ Rare, requires exact timing of concurrent requests │                            
+  ├──────────────────────────────────────────┼──────────┼────────────────────────────────────────────────────┤                            
+  │ Commented-out debug logging              │ Low      │ Harder to diagnose issues in production            │                            
+  └──────────────────────────────────────────┴──────────┴────────────────────────────────────────────────────┘                            
+

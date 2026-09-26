@@ -1,0 +1,222 @@
+# Video Freeze Analysis - February 2026
+
+## Problem Statement
+
+Video freezes occur in Channels DVR playback where:
+- Video freezes for extended periods (up to 20+ minutes)
+- Audio generally continues playing
+- Eventually recovers (not permanent)
+- Most acute with MSNOW channel but affects others
+- Other players (VLC, ffplay) don't show the same behavior in quick testing
+
+## Key Findings
+
+### 1. The Core Bug: "Successful" Recovery That Isn't
+
+**Discovered Pattern:**
+After source reload or page navigation recovery, PrismCast reports success ("Recovered in X seconds") but the actual capture pipeline is dead:
+
+1. Video element shows "playing" state (PrismCast monitor sees healthy)
+2. MediaRecorder/capture stream is disconnected from the video
+3. FFmpeg receives no input, produces no output
+4. Segmenter receives nothing, playlist freezes
+5. No new HLS segments are produced
+
+**Evidence from Feb 2nd logs:**
+
+| Time | Event |
+|------|-------|
+| 21:24:21 | PrismCast: Source reload started |
+| 21:24:24 | Last segment 1507 produced (low bitrate ~800Kbit/sec) |
+| 21:24:25 | PrismCast: "Recovered in 4.5s via source reload" |
+| 21:24:26+ | **Playlist stuck at segments 1498-1507 - NO NEW SEGMENTS** |
+| 21:26:24 | Channels DVR: "no data received for 2m0s" |
+| 21:26-21:56 | Channels DVR reconnects every 2 minutes, no data |
+| 21:56:22 | PrismCast: Tab timeout detected after 30+ minutes |
+| 21:56:25 | Tab replacement finally fixes it |
+| 21:56:37 | Segments 1510+ start flowing with discontinuity |
+
+**The stream was dead for 30+ minutes** while PrismCast thought it was healthy.
+
+### 2. Channels DVR Detection
+
+Channels DVR logs show clear evidence:
+
+```
+21:26:24 Closing connection M3U-Prism ch7054 after no data was received for 2m0s
+21:28:25 Closing connection M3U-Prism ch7054 after no data was received for 2m0s
+... (repeating every 2 minutes)
+```
+
+HLS logs show playlist fetches returning same segments:
+```
+number_of_new_segments=0
+first_sequence=1498 last_sequence=1507  (stuck!)
+segment_average_bitrate=848.1Kbit/sec   (was ~24Mbit/sec before)
+cache_size=3.6M                          (was ~97M before)
+```
+
+### 3. What Works Correctly
+
+**Tab replacement recovery works:**
+- Creates new segmenter with fresh init segment
+- Captures new moov from FFmpeg restart
+- Properly signals discontinuity
+- Segments flow again
+
+**Discontinuity handling is HLS-compliant:**
+- `#EXT-X-DISCONTINUITY` is emitted correctly
+- `#EXT-X-MAP` is re-emitted after discontinuity
+- Channels DVR correctly detects and adjusts PTS offsets
+
+### 4. What Doesn't Work
+
+**In-place recovery (source reload, page navigation):**
+- Video element restarts but capture may not reconnect
+- No detection that segment production has stopped
+- Monitor only checks video element state, not actual data flow
+- Can remain "healthy" for 30+ minutes with zero output
+
+### 5. Server Restart Issue (Separate)
+
+When PrismCast server restarts, segment sequence resets to 0:
+```
+Error: Transcoder Reset: Playlist reset to a lower sequence (1540 -> 0)
+```
+
+This is a known limitation but separate from the freeze bug.
+
+## Files Reviewed
+
+| File | Purpose | Findings |
+|------|---------|----------|
+| `src/streaming/fmp4Segmenter.ts` | HLS segmentation | Discontinuity handling is correct; no data flow monitoring |
+| `src/streaming/hlsSegments.ts` | Segment storage | Works correctly |
+| `src/streaming/monitor.ts` | Playback health | Only monitors video element state, not segment production |
+| `src/streaming/setup.ts` | Stream setup | Recovery logic relies on video element state |
+| `src/utils/ffmpeg.ts` | FFmpeg spawning | No output monitoring |
+
+## Log Locations
+
+- **PrismCast logs:** `~/.prismcast/prismcast.log`
+- **Channels DVR HLS logs:** `~/Library/Application Support/ChannelsDVR/data/hls-*.log`
+- **Channels DVR main logs:** `~/Library/Application Support/ChannelsDVR/data/channels-dvr.log`
+
+## Log Analysis Commands
+
+```bash
+# Find msnow recovery events
+grep "msnow" ~/.prismcast/prismcast.log | grep -i "recover\|buffer\|reload\|navigation"
+
+# Find Channels DVR "no data" events
+grep "no data was received" "/Users/hjd/Library/Application Support/ChannelsDVR/data/channels-dvr.log"
+
+# Find playlist stuck patterns (number_of_new_segments=0 repeatedly)
+grep "msnow" "/Users/hjd/Library/Application Support/ChannelsDVR/data/hls-*.log" | grep "number_of_new_segments=0"
+
+# Find discontinuity events
+grep "discontinuity=true" "/Users/hjd/Library/Application Support/ChannelsDVR/data/hls-*.log" | grep msnow
+
+# Find Transcoder Reset errors
+grep "Transcoder Reset" "/Users/hjd/Library/Application Support/ChannelsDVR/data/channels-dvr.log"
+```
+
+## Proposed Solutions
+
+### Solution 1: Segment Production Health Check
+
+Add monitoring to detect when segments stop being produced:
+
+```typescript
+// In monitor.ts or new dedicated module
+let lastSegmentTime = Date.now();
+let lastSegmentIndex = 0;
+
+// On each segment produced (in fmp4Segmenter.ts)
+function onSegmentProduced(index: number): void {
+  lastSegmentTime = Date.now();
+  lastSegmentIndex = index;
+}
+
+// In monitor interval
+const segmentAge = Date.now() - lastSegmentTime;
+if (segmentAge > 10000) { // No segment for 10 seconds
+  // Recovery reported success but segments stopped
+  // Escalate to higher recovery level
+}
+```
+
+### Solution 2: FFmpeg Output Monitoring
+
+Track FFmpeg stdout activity:
+
+```typescript
+let lastFFmpegOutput = Date.now();
+
+ffmpeg.stdout.on("data", () => {
+  lastFFmpegOutput = Date.now();
+});
+
+// Check periodically
+if (Date.now() - lastFFmpegOutput > 5000) {
+  // FFmpeg pipeline stalled
+}
+```
+
+### Solution 3: Recovery Validation
+
+After recovery completes, verify segments are actually flowing before declaring success:
+
+```typescript
+async function validateRecovery(segmenterBefore: number): Promise<boolean> {
+  await delay(3000); // Wait for pipeline to produce
+  const segmenterAfter = getSegmentIndex();
+  return segmenterAfter > segmenterBefore;
+}
+```
+
+## Next Steps
+
+1. **Investigate Feb 3rd 8:11 AM freeze** - NBC "Today" recording that never recovered
+
+2. **Trace capture pipeline during source reload:**
+   - How is MediaRecorder/puppeteer-stream capture handled?
+   - Does source reload disconnect the capture?
+   - What happens to FFmpeg's stdin during recovery?
+
+3. **Add segment production monitoring** - Detect stalled pipelines quickly
+
+4. **Consider recovery validation** - Don't declare success until segments flow
+
+## Technical Context
+
+### Recovery Levels (monitor.ts)
+
+1. **Level 0**: Play/unmute (in-page)
+2. **Level 1**: Seek (in-page)
+3. **Level 2**: Source reload (reloads video src) - **PROBLEMATIC**
+4. **Level 3**: Page navigation (page.goto) - **PROBLEMATIC**
+5. **Tab replacement**: Creates new tab and capture - **WORKS**
+
+### Capture Pipeline
+
+```
+Chrome Tab → puppeteer-stream extension → MediaRecorder → Chrome Extension
+    ↓
+FFmpeg (stdin) → FFmpeg process → FFmpeg (stdout)
+    ↓
+fMP4 Segmenter → HLS Segments → HTTP responses
+```
+
+During source reload, the video element changes but:
+- The capture (MediaRecorder) may lose connection to the video
+- FFmpeg continues running but receives no input
+- Segmenter waits for data that never comes
+
+## Open Questions
+
+1. Does puppeteer-stream's capture survive video source changes?
+2. Is the MediaRecorder still connected after source reload?
+3. Can we detect MediaRecorder disconnection?
+4. Should source reload trigger capture restart?
+5. Why does tab replacement work but source reload doesn't?
