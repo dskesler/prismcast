@@ -9,10 +9,11 @@
  * contracts are locked without spinning up Chrome.
  */
 import type { Frame, Page } from "puppeteer-core";
-import { applyVideoStyles, buildVideoSelectorType, checkVideoPresence, enforceVideoVolume, getVideoState, injectVideoSelector, lockVolumeProperties,
-  reloadVideoSource, startVideoPlayback, suppressPageAudio, validateVideoElement, verifyFullscreen } from "./video.ts";
+import { applyVideoStyles, buildVideoSelectorType, checkVideoPresence, choosePinnedQuality, enforceVideoVolume, getVideoState, injectVideoSelector,
+  lockVolumeProperties, pinPlaybackQuality, reloadVideoSource, startVideoPlayback, suppressPageAudio, validateVideoElement, verifyFullscreen } from "./video.ts";
 import { describe, test } from "node:test";
 import { seedVideoSelector, withDocument } from "../testing.helpers.ts";
+import type { Nullable } from "../types/index.ts";
 import type { Window } from "happy-dom";
 import assert from "node:assert/strict";
 import { makeProfile } from "../config/profiles.helpers.ts";
@@ -723,5 +724,84 @@ describe("suppressPageAudio", () => {
 
     await assert.doesNotReject(() => suppressPageAudio(page), "injection errors must not escape");
     assert.equal(stub.evaluateCalls, 1, "the immediate mute still runs after a failed registration");
+  });
+});
+
+describe("choosePinnedQuality", () => {
+
+  test("picks the best level the player offers, which it lists first", () => {
+
+    assert.equal(choosePinnedQuality([ "hd720", "large", "medium", "small", "auto" ]), "hd720");
+    assert.equal(choosePinnedQuality([ "hd1080", "hd720", "large", "auto" ]), "hd1080");
+  });
+
+  test("has nothing to pin when the player offers only auto, or nothing", () => {
+
+    assert.equal(choosePinnedQuality(["auto"]), null);
+    assert.equal(choosePinnedQuality([]), null);
+  });
+});
+
+describe("pinPlaybackQuality", () => {
+
+  /* A YouTube player as the page exposes it: an element carrying the player API. Each evaluate gets a fresh document, as each round trip to a real page reads the
+   * DOM afresh, so the player's state lives out here and every rendering of the element delegates to it.
+   */
+  interface PlayerState {
+
+    current: string;
+    levels: string[];
+    ranges: [string, string][];
+  }
+
+  function makePlayerContext(state: Nullable<PlayerState>): Frame | Page {
+
+    return makeContextStub((fn, ...args) => withDocument(state ? "<div class=\"html5-video-player\"></div>" : "<video></video>", (window) => {
+
+      const element = window.document.querySelector(".html5-video-player");
+
+      if(element && state) {
+
+        Object.assign(element, {
+
+          getAvailableQualityLevels: (): string[] => state.levels,
+          getPlaybackQuality: (): string => state.current,
+          setPlaybackQuality: (level: string): void => { state.current = level; },
+          setPlaybackQualityRange: (min: string, max: string): void => { state.ranges.push([ min, max ]); }
+        });
+      }
+
+      return (fn as (...a: unknown[]) => unknown)(...args);
+    })).context;
+  }
+
+  test("locks a player that settled low to the best level it offers", async () => {
+
+    // The observed case: YouTube TV holding 480p ("large") with 720p available.
+    const state: PlayerState = { current: "large", levels: [ "hd720", "large", "medium", "small", "auto" ], ranges: [] };
+
+    assert.deepEqual(await pinPlaybackQuality(makePlayerContext(state)), { from: "large", to: "hd720" });
+    assert.deepEqual(state.ranges, [[ "hd720", "hd720" ]], "the range is locked at the top, so the player cannot slide back down");
+    assert.equal(state.current, "hd720");
+  });
+
+  test("reports an already-best player as unchanged", async () => {
+
+    const state: PlayerState = { current: "hd720", levels: [ "hd720", "large", "auto" ], ranges: [] };
+
+    assert.deepEqual(await pinPlaybackQuality(makePlayerContext(state)), { from: "hd720", to: "hd720" });
+  });
+
+  test("leaves a page with no YouTube player alone", async () => {
+
+    assert.equal(await pinPlaybackQuality(makePlayerContext(null)), null);
+  });
+
+  test("leaves a player that offers nothing but auto alone", async () => {
+
+    const state: PlayerState = { current: "auto", levels: ["auto"], ranges: [] };
+
+    assert.equal(await pinPlaybackQuality(makePlayerContext(state)), null);
+    assert.deepEqual(state.ranges, [], "nothing was pinned");
   });
 });

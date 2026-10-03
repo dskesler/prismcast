@@ -15,8 +15,8 @@ import { RECOVERY_METHODS, checkCircuitBreaker, classifyNativeSegmentHealth, com
 import type { StreamHealthStatus, StreamStatus } from "./statusEmitter.ts";
 import { applyNativeQualityRefresh, getLastSegmentHasVideo, getLastSegmentSize, getStream, getStreamMemoryUsage, getStreamSegmenter, isCaptureIdentity,
   isHardwareAccelerated, makePendingCaptureIdentity } from "./registry.ts";
-import { applyVideoStyles, buildVideoSelectorType, checkVideoPresence, enforceVideoVolume, ensurePlayback, findVideoContext, getVideoState, tuneToChannel,
-  validateVideoElement, verifyFullscreen } from "../browser/video.ts";
+import { applyVideoStyles, buildVideoSelectorType, checkVideoPresence, enforceVideoVolume, ensurePlayback, findVideoContext, getVideoState, pinPlaybackQuality,
+  tuneToChannel, validateVideoElement, verifyFullscreen } from "../browser/video.ts";
 import { getCaptureImpairment, syncWindowVisibility } from "../browser/index.ts";
 import { getEffectiveCaptureCodec, isCaptureHardwareAccelerated } from "./codec.ts";
 import { CONFIG } from "../config/index.ts";
@@ -176,10 +176,12 @@ export interface MonitorDeps {
   readonly getCaptureImpairment: typeof getCaptureImpairment;
   readonly getEffectiveCaptureCodec: typeof getEffectiveCaptureCodec;
   readonly isCaptureHardwareAccelerated: typeof isCaptureHardwareAccelerated;
+  readonly pinPlaybackQuality: typeof pinPlaybackQuality;
   readonly syncWindowVisibility: typeof syncWindowVisibility;
 }
 
-const defaultMonitorDeps: MonitorDeps = { clock: systemClock, getCaptureImpairment, getEffectiveCaptureCodec, isCaptureHardwareAccelerated, syncWindowVisibility };
+const defaultMonitorDeps: MonitorDeps = { clock: systemClock, getCaptureImpairment, getEffectiveCaptureCodec, isCaptureHardwareAccelerated, pinPlaybackQuality,
+  syncWindowVisibility };
 
 /**
  * Monitors video playback health and attempts escalating recovery when issues are detected. This function runs on an interval, checking video state and triggering
@@ -1797,6 +1799,27 @@ export function monitorPlaybackHealth(
     if(now >= resolutionState.graceEnd) {
 
       resolutionState.consecutiveDegradedReadings++;
+
+      /* The first degraded reading of an episode re-pins the player before anything heavier runs. A YouTube player whose adaptive bitrate slid down climbs back on
+       * a pin within seconds, which clears the episode on its own; the reload and the tab replacement below only ever see the drops a pin could not fix. On a page
+       * with no YouTube player the pin is a no-op and the ladder runs exactly as before.
+       */
+      if(resolutionState.consecutiveDegradedReadings === 1) {
+
+        try {
+
+          const pin = await deps.pinPlaybackQuality(currentContext);
+
+          if(pin) {
+
+            LOG.info("Video resolution dropped to %s\u00d7%s; re-pinned the player to %s (it was playing %s).", String(state.videoWidth), String(state.videoHeight),
+              pin.to, pin.from || "an unreported quality");
+          }
+        } catch(error) {
+
+          LOG.debug("recovery:resolution", "Could not re-pin the player's quality: %s.", formatError(error));
+        }
+      }
 
       LOG.debug("recovery:resolution", "Video resolution: %s\u00d7%s (peak: %s\u00d7%s, area: %s%%, consecutive: %s/%s).",
         String(state.videoWidth), String(state.videoHeight), String(peak.width), String(peak.height),

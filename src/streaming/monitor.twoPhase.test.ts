@@ -124,6 +124,7 @@ function makeDivergentDeps(clock: TestClock): MonitorDeps {
     getCaptureImpairment: (): null => null,
     getEffectiveCaptureCodec: (): CaptureCodec => "hevc",
     isCaptureHardwareAccelerated: (): boolean => true,
+    pinPlaybackQuality: async (): Promise<null> => null,
     syncWindowVisibility: async (): Promise<void> => { syncs++; }
   };
 }
@@ -146,6 +147,7 @@ function makeMarkedDeps(clock: TestClock): MonitorDeps {
     getCaptureImpairment: (): Nullable<CaptureImpairment> => MARK,
     getEffectiveCaptureCodec: (): CaptureCodec => "hevc",
     isCaptureHardwareAccelerated: (): boolean => true,
+    pinPlaybackQuality: async (): Promise<null> => null,
     syncWindowVisibility: async (): Promise<void> => { syncs++; }
   };
 }
@@ -436,6 +438,7 @@ describe("monitorPlaybackHealth: a failed replacement throttles the next attempt
       getCaptureImpairment: (): Nullable<CaptureImpairment> => impairment,
       getEffectiveCaptureCodec: (): CaptureCodec => "hevc",
       isCaptureHardwareAccelerated: (): boolean => true,
+      pinPlaybackQuality: async (): Promise<null> => null,
       syncWindowVisibility: async (): Promise<void> => { syncs++; }
     };
 

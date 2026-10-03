@@ -128,6 +128,7 @@ function makeImpairedDeps(clock: TestClock): MonitorDeps {
     getCaptureImpairment: (): Nullable<CaptureImpairment> => IMPAIRED,
     getEffectiveCaptureCodec: (): CaptureCodec => "h264",
     isCaptureHardwareAccelerated: (): boolean => false,
+    pinPlaybackQuality: async (): Promise<null> => null,
     syncWindowVisibility: async (): Promise<void> => undefined
   };
 }
@@ -145,6 +146,7 @@ function makeHealthyDeps(clock: TestClock): MonitorDeps {
     getCaptureImpairment: (): Nullable<CaptureImpairment> => null,
     getEffectiveCaptureCodec: (): CaptureCodec => "h264",
     isCaptureHardwareAccelerated: (): boolean => false,
+    pinPlaybackQuality: async (): Promise<null> => null,
     syncWindowVisibility: async (): Promise<void> => undefined
   };
 }
@@ -468,6 +470,89 @@ describe("monitorPlaybackHealth", () => {
     fake.navigations[0]?.reject(new Error("net::ERR_ABORTED"));
 
     await flushMicrotasks();
+
+    handle.dispose();
+  });
+
+  test("re-pins the player once on the first degraded reading, before the reload ladder", async (t) => {
+
+    // The same drop as the row above, against a player whose re-pin does not help: the pin is tried exactly once, and the ladder still reaches its first step.
+    const clock = new TestClock();
+
+    const messages = captureLogs(t);
+    const fake = makeFakePage({ clock });
+    let pins = 0;
+    const handle = startMonitor(fake.page, "resolution-pin-1", 9017, clock, { deps: { ...makeHealthyDeps(clock),
+
+      pinPlaybackQuality: async (): Promise<{ from: string; to: string }> => {
+
+        pins++;
+
+        await Promise.resolve();
+
+        return { from: "large", to: "hd720" };
+      } } });
+
+    for(let tick = 0; tick < 40; tick++) {
+
+      // eslint-disable-next-line no-await-in-loop
+      await advance(clock, MONITOR_INTERVAL);
+      fake.evaluations[tick]?.resolve((tick < 16) ? resolutionReadableState(tick + 1) : { ...readableState(tick + 1), videoHeight: 270, videoWidth: 480 });
+
+      // eslint-disable-next-line no-await-in-loop
+      await flushMicrotasks();
+
+      if(countMessages(messages, "Video resolution has been degraded for") > 0) {
+
+        break;
+      }
+    }
+
+    assert.equal(pins, 1, "the player was re-pinned once for the episode, not once per degraded reading");
+    assert.equal(countMessages(messages, "Video resolution has been degraded for"), 1, "a pin that did not help still lets the ladder run");
+
+    await flushMicrotasks();
+
+    fake.navigations[0]?.reject(new Error("net::ERR_ABORTED"));
+
+    await flushMicrotasks();
+
+    handle.dispose();
+  });
+
+  test("a re-pin that restores the picture ends the episode with no reload", async (t) => {
+
+    const clock = new TestClock();
+
+    const messages = captureLogs(t);
+    const fake = makeFakePage({ clock });
+    const pin = { applied: false };
+    const handle = startMonitor(fake.page, "resolution-pin-2", 9018, clock, { deps: { ...makeHealthyDeps(clock),
+
+      pinPlaybackQuality: async (): Promise<{ from: string; to: string }> => {
+
+        pin.applied = true;
+
+        await Promise.resolve();
+
+        return { from: "large", to: "hd720" };
+      } } });
+
+    for(let tick = 0; tick < 40; tick++) {
+
+      // eslint-disable-next-line no-await-in-loop
+      await advance(clock, MONITOR_INTERVAL);
+      const healthy = (tick < 16) || pin.applied;
+
+      fake.evaluations[tick]?.resolve(healthy ? resolutionReadableState(tick + 1) : { ...readableState(tick + 1), videoHeight: 270, videoWidth: 480 });
+
+      // eslint-disable-next-line no-await-in-loop
+      await flushMicrotasks();
+    }
+
+    assert.ok(pin.applied, "the drop was answered with a pin");
+    assert.equal(countMessages(messages, "Video resolution has been degraded for"), 0, "the ladder never fired");
+    assert.equal(fake.navigations.length, 0, "and no page was reloaded");
 
     handle.dispose();
   });

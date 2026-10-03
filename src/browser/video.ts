@@ -438,6 +438,78 @@ export async function startVideoPlayback(context: Frame | Page, selectorType: Vi
 }
 
 /**
+ * What a quality pin found and did: the level the player was playing before, and the level it was pinned to.
+ */
+export interface PlaybackQualityPin {
+
+  readonly from: string;
+  readonly to: string;
+}
+
+/**
+ * Picks the level to pin from a YouTube player's available quality levels: the best one it offers. The player lists its levels best first and appends "auto", and
+ * it only offers the levels its own size can show - a 1280x720 player tops out at hd720 - so the first concrete level is already sized to the capture surface.
+ * Pure, so the choice is testable without a player.
+ * @param levels - The player's getAvailableQualityLevels() result.
+ * @returns The level to pin, or null when the player offers nothing but "auto".
+ */
+export function choosePinnedQuality(levels: readonly string[]): Nullable<string> {
+
+  return levels.find((level) => level !== "auto") ?? null;
+}
+
+/**
+ * Pins a YouTube player to the best quality it offers. YouTube's adaptive bitrate logic settles on a rendition and does not climb back, and it settles low readily:
+ * a YouTube TV capture was observed holding 854x480 at 30fps on a 43 Mbps link while 1280x720 at 60fps sat available, and neither a page reload nor a tab
+ * replacement moved it. Nothing downstream can restore detail that never arrived, so the pin is the only cure. Locking the range at the top level also keeps the
+ * player from sliding back down mid-stream.
+ *
+ * Applies to any page carrying a YouTube player (YouTube TV, and sites that embed one) and is a no-op everywhere else. It must run after fullscreen styling: the
+ * player offers levels by its own size, so a pin taken while it is small would lock in a small level.
+ * @param context - The frame or page containing the video element.
+ * @returns What the pin did, or null when there is no YouTube player or it offers nothing to pin.
+ */
+export async function pinPlaybackQuality(context: Frame | Page): Promise<Nullable<PlaybackQualityPin>> {
+
+  const reading = await evaluateWithAbort(context, (): Nullable<{ current: string; levels: string[] }> => {
+
+    interface YouTubePlayer extends Element {
+
+      getAvailableQualityLevels?: () => string[];
+      getPlaybackQuality?: () => string;
+    }
+
+    const player = Array.from(document.querySelectorAll<YouTubePlayer>(".html5-video-player")).find((element) => typeof element.getAvailableQualityLevels === "function");
+
+    return player ? { current: player.getPlaybackQuality?.() ?? "", levels: player.getAvailableQualityLevels?.() ?? [] } : null;
+  }, []);
+
+  const target = reading ? choosePinnedQuality(reading.levels) : null;
+
+  if(!reading || !target) {
+
+    return null;
+  }
+
+  await evaluateWithAbort(context, (level: string): void => {
+
+    interface YouTubePlayer extends Element {
+
+      getAvailableQualityLevels?: () => string[];
+      setPlaybackQuality?: (level: string) => void;
+      setPlaybackQualityRange?: (min: string, max: string) => void;
+    }
+
+    const player = Array.from(document.querySelectorAll<YouTubePlayer>(".html5-video-player")).find((element) => typeof element.getAvailableQualityLevels === "function");
+
+    player?.setPlaybackQualityRange?.(level, level);
+    player?.setPlaybackQuality?.(level);
+  }, [target]);
+
+  return { from: reading.current, to: target };
+}
+
+/**
  * Puts the page on the given URL the way the profile's strategy enters its site: through the strategy's own navigator when its provider declares one, and
  * otherwise through a plain document load under the profile's wait preference. Every navigation on the tune path, the re-establishment path, and the recovery
  * route comes through here, which is what lets a provider that cannot always load its guide by URL take over the route without any caller knowing.
@@ -1451,6 +1523,20 @@ export async function ensurePlayback(
   if(profile.lockVolumeProperties) {
 
     await lockVolumeProperties(context, selectorType);
+  }
+
+  // Pin a YouTube player to its best quality, now that fullscreen has sized it. A pin failure costs quality, never the stream.
+  try {
+
+    const pin = await pinPlaybackQuality(context);
+
+    if(pin && (pin.from !== pin.to)) {
+
+      LOG.info("Pinned the player to %s (it was playing %s).", pin.to, pin.from || "an unreported quality");
+    }
+  } catch(error) {
+
+    LOG.debug("browser:video", "Could not pin the player's quality: %s.", formatError(error));
   }
 }
 
