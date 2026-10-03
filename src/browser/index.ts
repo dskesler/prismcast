@@ -4,20 +4,22 @@
  */
 import type { Browser, LaunchOptions, Page } from "puppeteer-core";
 import type { BrowserLifecycle, BrowserPurpose, CaptureImpairment } from "./browserSupervisor.ts";
-import type { Clock, ProcessInfo } from "../utils/index.ts";
-import { LOG, boundedWait, evaluateWithAbort, formatError, isProcessRunning, listProcesses, realClock, setChromeUserAgent, startTimer } from "../utils/index.ts";
-import { clearLoginState, isLoginModeActive, setBrowserAccessors } from "./login.ts";
+import { LOG, boundedWait, evaluateWithAbort, formatError, isProcessRunning, listProcesses, setChromeUserAgent, startTimer } from "../utils/index.ts";
+import { TimerRegistry, systemClock } from "homebridge-plugin-utils";
+import { clearLoginState, isLoginModeActive, setLoginDeps } from "./login.ts";
 import { fullscreenWindow, minimizeWindow, readWindowPlacement, reaffirmCaptureSurface, unminimizeWindow, withCDPSession } from "./cdp.ts";
-import { getAllStreams, getStreamCount, hasActiveCaptureStreams, isCaptureIdentity } from "../streaming/registry.ts";
+import { getAllStreams, getStreamCount, hasActiveCaptureStreams, hasEstablishedStreams, isCaptureIdentity } from "../streaming/registry.ts";
 import { getCachedTabId, installStrayOpenTabReaper, onTabActivation } from "./tabSelection.ts";
 import { getChromeDataDir, getDataDir, getExtensionDir } from "../config/paths.ts";
 import { getExtensionPage, launch } from "puppeteer-stream";
 import { getGpuCapabilities, setGpuCapabilities } from "./display.ts";
 import { CONFIG } from "../config/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import { EXTENSION_READY_EXPRESSION } from "./tabCapture.ts";
 import type { GpuCapabilities } from "./display.ts";
 import type { LaunchGovernorPolicy } from "./launchGovernor.ts";
 import type { Nullable } from "../types/index.ts";
+import type { ProcessInfo } from "../utils/index.ts";
 import type { SystemStatus } from "../streaming/statusEmitter.ts";
 import type { WindowPlacement } from "./cdp.ts";
 import { clearChannelSelectionCaches } from "./channelSelection.ts";
@@ -30,7 +32,6 @@ import { getPresetViewport } from "../config/presets.ts";
 import path from "node:path";
 import { launch as puppeteerLaunch } from "puppeteer-core";
 import { startPrecaching } from "./precaching.ts";
-import { terminateStream } from "../streaming/lifecycle.ts";
 
 const { promises: fsPromises } = fs;
 
@@ -93,13 +94,13 @@ function buildRelaunchPolicy(): LaunchGovernorPolicy {
 
 /* The one browser capture-readiness supervisor for the process lifetime. It owns the lifecycle state (absent/launching/ready/degraded/trialing) that unifies the
  * browser reference, launch promise, and launch timestamp, and routes every relaunch through one loop-safe governor. The adapter injects the impure
- * ports: launchReadyBrowser (spawn Chrome and run the readiness gate), closeBrowserInstance (teardown), realClock.now (time), buildRelaunchPolicy (live config
+ * ports: launchReadyBrowser (spawn Chrome and run the readiness gate), closeBrowserInstance (teardown), systemClock.now (time), buildRelaunchPolicy (live config
  * bounds), and onSupervisorStateChange (the loud degraded alarm and the recovery notice). All browser access flows through it: getCurrentBrowser is acquire(); the
  * non-launching reads derive from current() and currentLaunchTime(). The injected ports are hoisted function declarations, so referencing them here is safe even
  * though they are defined further down the module.
  */
-const supervisor = createBrowserSupervisor({ close: closeBrowserInstance, launch: launchReadyBrowser, now: realClock.now, onStateChange: onSupervisorStateChange,
-  policy: buildRelaunchPolicy });
+const supervisor = createBrowserSupervisor({ close: closeBrowserInstance, launch: launchReadyBrowser, now: (): number => systemClock.now(),
+  onStateChange: onSupervisorStateChange, policy: buildRelaunchPolicy });
 
 /**
  * Observes supervisor lifecycle transitions purely for operator-visible signals; it never affects the transition (the supervisor treats it as best-effort, so a
@@ -116,7 +117,7 @@ function onSupervisorStateChange(next: BrowserLifecycle, previous: BrowserLifecy
   // condition is never invisible - the enforceable form of "it is impossible to be silently un-tunable."
   if((next.kind === "degraded") && (previous.kind !== "degraded")) {
 
-    const cooldownMinutes = Math.max(1, Math.round((next.until - realClock.now()) / 60000));
+    const cooldownMinutes = Math.max(1, Math.round((next.until - systemClock.now()) / 60000));
 
     LOG.error("The browser capture system has degraded and the relaunch governor has tripped: %s Relaunches are paused for approximately %d minute(s) while it " +
       "cools down; new stream requests will receive a 503 back-off until it recovers.", next.reason, cooldownMinutes);
@@ -129,9 +130,9 @@ function onSupervisorStateChange(next: BrowserLifecycle, previous: BrowserLifecy
 
     // The published browser has been marked as unable to start captures. The transition carrying the mark happens once per instance, so the alarm fires once per
     // instance too, and it says what an operator watching a stalled tune needs: the running captures are unaffected, new requests back off, and the cure arrives
-    // on its own once the registry empties.
+    // on its own as soon as nothing on this browser holds a page.
     LOG.error("The browser can no longer start captures (%s). Its running captures continue, new stream requests receive a 503 back-off, and it will relaunch as " +
-      "soon as no stream is active.", next.impairment.reason);
+      "soon as nothing holds a page on it.", next.impairment.reason);
   }
 
   // The browser's connectivity is part of the SSE system status, so emit when a ready browser is published. Readiness-loss emits are owned by handleBrowserDisconnect
@@ -145,15 +146,16 @@ function onSupervisorStateChange(next: BrowserLifecycle, previous: BrowserLifecy
 /* The capture-readiness probe is the capability tier of the launch gate: a real capture acquisition against a throwaway page on the instance being launched - the
  * authoritative "can this browser actually capture?" predicate that must run at every (re)launch, not only boot. It lives in streaming/setup.ts (which owns the
  * capture lock and the probe policy) and is injected here via setCaptureProbe, because setup.ts already depends on this module:
- * injecting the function rather than importing it keeps the dependency one-directional and breaks the cycle, mirroring the browserAccessors setter/getter
+ * injecting the function rather than importing it keeps the dependency one-directional and breaks the cycle, mirroring the loginDeps setter/getter
  * injection pattern between login.ts and index.ts. The probe must also take the local instance as a parameter rather than re-entering getCurrentBrowser, since
  * launchReadyBrowser IS the in-flight launch - re-entering acquire() would join its own pending promise and deadlock.
  */
 type CaptureProbe = (browser: Browser) => Promise<void>;
 
 /* The capture-readiness probe (capability tier of the launch gate). Null until streaming/setup.ts injects the real capture probe at module load, which the import
- * order guarantees runs before any launch: app.ts imports the streaming layer, whose module bodies evaluate during import resolution, before startServer's warm-up.
- * launchReadyBrowser refuses to publish a browser if it is somehow still null (see the call site), rather than serving an unverified one.
+ * order places ahead of any launch: index.ts value-imports app.ts, app.ts value-imports streaming/hls.ts, and hls.ts value-imports streaming/setup.ts, so the
+ * injection has run by the time index.ts's own body calls startServer. launchReadyBrowser refuses to publish a browser if it is somehow still null (see the call
+ * site), rather than serving an unverified one.
  */
 let captureProbe: Nullable<CaptureProbe> = null;
 
@@ -167,9 +169,39 @@ export function setCaptureProbe(probe: CaptureProbe): void {
   captureProbe = probe;
 }
 
-// The stale page cleanup interval handle, stored so we can clear it during graceful shutdown. The interval periodically checks for browser pages that are not
-// associated with active streams and closes them to prevent resource exhaustion.
-let stalePageCleanupInterval: Nullable<ReturnType<typeof setInterval>> = null;
+/* Stream teardown belongs to the streaming layer: terminateStream (streaming/lifecycle.ts) owns the whole cleanup sequence - segmenter, monitor, page, registry,
+ * client tracking and SSE events - and a readiness loss here runs that same sequence rather than a second one that could drift from it. It is injected via
+ * setStreamTerminator because lifecycle.ts already depends on this module for the shutdown flag, the window sync and the managed-page registry: injecting the
+ * function rather than importing it keeps that dependency one-directional, the same boundary setCaptureProbe draws with streaming/setup.ts. The terminator's
+ * optional clock parameter is left off this type because the browser layer has no clock to offer and takes the streaming layer's default.
+ */
+type StreamTerminator = (streamId: number, channelName: string, reason: string) => void;
+
+/* The authoritative stream terminator. Null until streaming/lifecycle.ts injects terminateStream at module load, which the import order places ahead of any
+ * browser launch: index.ts value-imports app.ts, app.ts value-imports streaming/lifecycle.ts, and a module body finishes before the body of anything that
+ * imports it, so the injection has run by the time index.ts's own body calls startServer - the earliest moment a launch, and so a disconnect, can happen. A
+ * still-null terminator at readiness loss is reported at ERROR and the teardown carries on (see the call site), because losing the rest of the teardown on top
+ * of the stream cleanup would make a recoverable situation worse.
+ */
+let streamTerminator: Nullable<StreamTerminator> = null;
+
+/**
+ * Injects the authoritative stream terminator used when browser readiness is lost. Called once from streaming/lifecycle.ts at module load. Separating the wiring
+ * from the call keeps browser/index.ts free of a streaming-layer import.
+ * @param terminator - The function that tears down one stream and all of the resources it owns.
+ */
+export function setStreamTerminator(terminator: StreamTerminator): void {
+
+  streamTerminator = terminator;
+}
+
+// The identity of the periodic sweep on the stale-page owner's registry.
+const STALE_PAGE_SWEEP_KEY = "sweep";
+
+/* The stale-page owner's timers: the periodic sweep that closes browser pages no active stream is using, so a long session cannot exhaust resources. The registry
+ * is built on the clock the start receives and disposed by the stop, so the sweep can never outlive the owner. Null until started, and again once stopped.
+ */
+let stalePageTimers: Nullable<TimerRegistry> = null;
 
 /* Opportunistic browser restart state. Chrome accumulates memory pressure, GPU process issues, and general flakiness over multi-hour sessions with continuous
  * media playback. We proactively restart Chrome after it has been running for BROWSER_MAX_AGE, waiting for a quiet period with zero active streams before
@@ -186,28 +218,31 @@ const BROWSER_RESTART_QUIET_PERIOD = 5 * 60 * 1000;
 const BROWSER_RESTART_CHECK_INTERVAL = 30000;
 
 // Why a restart is running. The maintenance cause is the age-driven one the quiet period gates; the impairment cause is the relaunch of a browser that can no
-// longer start captures, which waits on an empty registry instead of on age. The routine's log line and its trigger differ by cause; everything else it does is
-// shared.
-type BrowserRestartCause = "impairment" | "maintenance";
+// longer start captures, which waits on nothing depending on the browser instead of on age. The routine's log line, its trigger, and the idleness it waits for
+// differ by cause; everything else it does is shared.
+export type BrowserRestartCause = "impairment" | "maintenance";
 
-// Timer handle for the quiet period countdown. When set, the browser has exceeded BROWSER_MAX_AGE and we are waiting for BROWSER_RESTART_QUIET_PERIOD to
-// elapse with zero active streams. Cancelled if a stream starts during the quiet period.
-let restartQuietTimer: Nullable<ReturnType<typeof setTimeout>> = null;
+// The identity of the periodic eligibility check on the restart owner's registry.
+const RESTART_CHECK_KEY = "check";
+
+// The identity of the quiet-period countdown on the restart owner's registry.
+const RESTART_QUIET_KEY = "quiet";
+
+/* The restart owner's timers, keyed on one registry built on the clock its start receives: the periodic eligibility check, and - while the browser has exceeded
+ * BROWSER_MAX_AGE and we are waiting for BROWSER_RESTART_QUIET_PERIOD to elapse with zero active streams - the quiet-period countdown, which a stream starting
+ * during the wait cancels. Holding both on one registry is what makes the stop drain the countdown along with the check. Null until the check is started, and
+ * again once it is stopped.
+ */
+let restartTimers: Nullable<TimerRegistry> = null;
 
 /**
- * Cancels the scheduled-restart quiet period if one is pending, so the countdown it was running cannot fire against a browser it no longer describes.
+ * Cancels the scheduled-restart quiet period if one is pending, so the countdown it was running cannot fire against a browser it no longer describes. Reads the
+ * module binding rather than a handed-in registry because executeBrowserRestart calls it as well, which also makes it a no-op once the owner has been stopped.
  */
 function cancelRestartQuietTimer(): void {
 
-  if(restartQuietTimer) {
-
-    clearTimeout(restartQuietTimer);
-    restartQuietTimer = null;
-  }
+  restartTimers?.clear(RESTART_QUIET_KEY);
 }
-
-// Interval handle for the periodic restart eligibility check.
-let restartCheckInterval: Nullable<ReturnType<typeof setInterval>> = null;
 
 // Flag indicating that the browser is being closed intentionally via closeBrowser(). When true, the disconnect handler skips error logging and stream termination
 // since these are handled by the shutdown code path. This prevents false "unexpected disconnect" errors during graceful shutdown.
@@ -412,7 +447,7 @@ export async function confirmSharedWindowPlacement(page: Page): Promise<boolean>
 }
 
 // Login mode management. State and functions live in login.ts; re-exported here so existing consumers don't need import path changes. clearLoginState,
-// isLoginModeActive, and setBrowserAccessors are imported above; the first two for internal use, setBrowserAccessors for one-time initialization below.
+// isLoginModeActive, and setLoginDeps are imported above; the first two for internal use, setLoginDeps for one-time initialization below.
 export { clearLoginState, isLoginModeActive };
 export type { LoginStatus } from "./login.ts";
 export { endLoginMode, getLoginPage, getLoginStatus, setLoginModeEndObserver, startLoginMode } from "./login.ts";
@@ -435,7 +470,7 @@ export type { BrowserPurpose, CaptureImpairment } from "./browserSupervisor.ts";
  * preference or as the first page the browser happened to report.
  *
  * The instance stays private to this module and every caller reaches it through the exported function just below. That split is what makes the symbol safe to
- * reference at module-evaluation time: a function declaration is hoisted, so the setBrowserAccessors call further down - and any sibling module whose own body
+ * reference at module-evaluation time: a function declaration is hoisted, so the setLoginDeps call further down - and any sibling module whose own body
  * evaluates while this module is still evaluating, precaching.ts among them - resolves it whatever the declaration order turns out to be. A bare exported const
  * would leave those readers in the temporal dead zone, which no placement inside this file can fix for a reader in another file.
  */
@@ -518,10 +553,10 @@ export async function syncWindowVisibility(page?: Page): Promise<void> {
   return windowVisibilitySync(page);
 }
 
-// Inject browser accessors into the login module. This breaks the circular dependency (login needs getBrowserInstance and the window sync, index needs login
-// functions) using the same setter/getter pattern as setChromeUserAgent in chromeFetch.ts. Both accessors are hoisted function declarations, so this call reads
-// them at module evaluation time regardless of where they sit in the file.
-setBrowserAccessors({ getBrowserInstance, syncWindowVisibility });
+// Inject login's dependency set. This breaks the circular dependency (login needs getBrowserInstance and the window sync, index needs login functions) using the
+// same setter/getter pattern as setChromeUserAgent in chromeFetch.ts. Both accessors are hoisted function declarations, so this call reads them at module
+// evaluation time regardless of where they sit in the file. No clock is supplied, so login runs on the system clock the port defaults to.
+setLoginDeps({ getBrowserInstance, syncWindowVisibility });
 
 /**
  * Computes the current system status and emits it to SSE subscribers. Called when browser state changes significantly or when streams are added/removed.
@@ -873,7 +908,8 @@ export function killStaleChrome(): void {
 
 /**
  * Polls until the Chrome process with the given PID has exited, or the timeout expires. Uses process.kill(pid, 0) to check process existence - throws ESRCH
- * when the process is gone. Between polls, sleeps synchronously using Atomics.wait() for cross-platform compatibility.
+ * when the process is gone. The wait runs inside the synchronous exit handler, so it reads the port for its instants and sleeps synchronously between them
+ * using Atomics.wait() for cross-platform compatibility.
  * @param pid - The Chrome process ID to wait for.
  * @param timeoutMs - Maximum time to wait in milliseconds.
  * @param pollIntervalMs - Time between existence checks in milliseconds.
@@ -881,9 +917,9 @@ export function killStaleChrome(): void {
  */
 function waitForChromeExit(pid: number, timeoutMs: number, pollIntervalMs: number): boolean {
 
-  const deadline = Date.now() + timeoutMs;
+  const deadline = systemClock.now() + timeoutMs;
 
-  while(Date.now() < deadline) {
+  while(systemClock.now() < deadline) {
 
     if(!isProcessRunning(pid)) {
 
@@ -1295,14 +1331,17 @@ export function mirrorPlacement(placement: WindowPlacement): { height: number; l
 /**
  * Opens a page for a channel guide discovery walk in a browser window of its own, and marks it as belonging to that window.
  *
- * A document renders only while it is the active tab of a window that is not minimized, and the shared window rests minimized whenever nothing is capturing and
- * no sign-in holds it on screen, with its selected tab belonging to the user. A guide walk needs its page to render - an observer-driven channel rail fills its
- * tiles from rendering updates, and a virtualized grid re-renders as the walk scrolls it - yet it is never captured, so it has no claim on the shared window's
- * presentation and no business moving the user's selection. Its own window resolves both: the page is the active tab there from the moment it exists.
+ * A document renders only while Chrome presents it: the active tab of a window the desktop is showing, or a page Chrome counts as captured. The shared window
+ * rests minimized whenever nothing is capturing and no sign-in holds it on screen, with its selected tab belonging to the user. A guide walk needs its page to
+ * render - an observer-driven channel rail fills its tiles from rendering updates, a virtualized grid re-renders as the walk scrolls it, and every wait the walk
+ * makes polls on the page's animation frames - yet it is never captured, so it has no claim on the shared window's presentation and no business moving the
+ * user's selection. A window of its own resolves the tab half: the page is that window's active tab from the moment it exists. The window is created in the
+ * background, so Chrome shows it inactive and moves no focus (measured 2026-08-31), and such a window's document is one Chrome does not present on its own: it
+ * reports itself hidden and unfocused and delivers no animation frame beyond a document load's first ones (measured 2026-09-13). Focus emulation resolves the
+ * presentation half, for the page's whole life - Puppeteer's own emulateFocusedPage carries the mechanism, on the page's own session.
  *
- * The window is created in the background, so Chrome shows it inactive and moves no focus (measured 2026-08-31), and at the shared window's own placement, so
- * the window placement Chrome persists for the profile never changes - readWindowPlacement carries the reasoning. The caller declares the layout surface on
- * the page and owns its registration, and closing the page closes the window with it.
+ * The window opens at the shared window's own placement, so the window placement Chrome persists for the profile never changes - readWindowPlacement carries
+ * the reasoning. The caller declares the layout surface on the page and owns its registration, and closing the page closes the window with it.
  * @param browser - The browser to open the window in.
  * @returns The page, as the active tab of its own window.
  */
@@ -1315,6 +1354,28 @@ export async function createDiscoveryPage(browser: Browser): Promise<Page> {
   const page = await browser.newPage({ background: true, type: "window", windowBounds: placement ? mirrorPlacement(placement) : undefined });
 
   ownWindowPages.add(page);
+
+  /* The page is presented from before its first load, so every wait a walk makes - a visible selector, a condition polled from inside the page - runs as it
+   * would in a window the desktop is showing. Chrome counts a focus-emulated page as captured, which is what presents its document, and Puppeteer keeps the
+   * state on the page's own session for as long as the page lives (measured 2026-09-13). The mark above stays first: nothing is awaited between the creation
+   * and it. A page that refuses the emulation is one no walk can use, and nothing else holds it yet - the caller never receives it and the managed-page sweep
+   * never sees it - so the creator closes it, which closes the window with it, before the failure propagates.
+   */
+  try {
+
+    await page.emulateFocusedPage(true);
+  } catch(error) {
+
+    try {
+
+      await page.close();
+    } catch {
+
+      // The page is already gone, which is the state the close was asking for.
+    }
+
+    throw error;
+  }
 
   LOG.debug("browser:lifecycle", "Opened the discovery page in a window of its own, %s.",
     placement ? "mirroring the shared window's placement" : "with no shared window to read a placement from");
@@ -1357,10 +1418,10 @@ const activationHeals = new WeakMap<Page, () => Promise<void>>();
  * @param page - The capture page this callback re-affirms.
  * @param reaffirm - The re-issue to invoke. A parameter rather than a direct call so the callback's behavior can be driven on its own: what it does with the page
  *                   it was built for, what schedule it keeps, and what it does with a rejection, is the whole of its contract.
- * @param clock - The time source the ladder's waits run on. Defaults to realClock.
+ * @param clock - The time source the ladder's waits run on. Defaults to the system clock.
  * @returns The callback, which never rejects. Its promise settles once the ladder is spent, which the page-side listener does not wait on.
  */
-export function makeFocusReaffirmCallback(page: Page, reaffirm: (page: Page) => Promise<void>, clock: Clock = realClock): () => Promise<void> {
+export function makeFocusReaffirmCallback(page: Page, reaffirm: (page: Page) => Promise<void>, clock: Clock = systemClock): () => Promise<void> {
 
   // The generation this closure hands out. It only ever increments: an invocation claims the next one and owns the rung schedule until a later invocation claims
   // a higher one.
@@ -1389,7 +1450,7 @@ export function makeFocusReaffirmCallback(page: Page, reaffirm: (page: Page) => 
     for(const offsetMs of ACTIVATION_REAFFIRM_LADDER_MS) {
 
       // eslint-disable-next-line no-await-in-loop -- The pacing is the point: each rung waits out the distance left to its own offset before anything else runs.
-      await clock.sleep(offsetMs - previousOffsetMs);
+      await clock.delay(offsetMs - previousOffsetMs);
 
       // A newer activation owns the schedule, and it carries its own rungs timed from its own moment, so this ladder has nothing left to contribute.
       if(generation !== mine) {
@@ -1417,7 +1478,7 @@ export interface ActivationHealDeps {
 }
 
 // The production collaborators.
-const defaultActivationHealDeps: ActivationHealDeps = { clock: realClock, reaffirm: reaffirmCaptureSurface };
+const defaultActivationHealDeps: ActivationHealDeps = { clock: systemClock, reaffirm: reaffirmCaptureSurface };
 
 /**
  * Installs the tab-activation heal on a capture page. Chrome composes the capture of a selected tab from the window's fitted presentation, so the instant a
@@ -1742,11 +1803,25 @@ function relinquishBrowserReadiness(streamTerminationReason: string): void {
     LOG.info("Login mode ended due to browser readiness loss.");
   }
 
-  // Terminate every active stream using the authoritative terminateStream for consistent cleanup. Kept even during graceful shutdown as a defensive measure -
-  // terminateStream() is safe to call more than once, so if streams were already terminated by the caller, this harmlessly iterates an empty array.
-  for(const streamInfo of getAllStreams()) {
+  /* Terminate every active stream through the streaming layer's authoritative terminator, so a readiness loss cleans up exactly the way every other termination
+   * path does. Kept even during graceful shutdown as a defensive measure - termination is safe to call more than once, so streams the caller already tore down
+   * leave this a harmless pass over an empty array.
+   */
+  const activeStreams = getAllStreams();
 
-    terminateStream(streamInfo.id, streamInfo.info.storeKey, streamTerminationReason);
+  if(streamTerminator) {
+
+    for(const streamInfo of activeStreams) {
+
+      streamTerminator(streamInfo.id, streamInfo.info.storeKey, streamTerminationReason);
+    }
+  } else {
+
+    /* An unwired terminator means the streaming layer never loaded, so nothing here can run the streams' cleanup sequence. Report it and keep going: the page
+     * tracking and status emission below are still worth doing, and abandoning them would compound a wiring failure with a half-finished teardown.
+     */
+    LOG.error("Stream cleanup was skipped on browser readiness loss because no stream terminator is wired. Active streams left untouched: %s.",
+      activeStreams.length);
   }
 
   // The session those streams captured on is over, so whatever page tracking survived their termination belongs to a browser that is gone.
@@ -1778,18 +1853,23 @@ function handleBrowserDisconnect(): void {
 }
 
 /**
- * Records that a still-connected browser can no longer start captures - a mid-life capture death that no "disconnected" event would surface - and schedules the
+ * Records that a still-connected browser can no longer start captures - a mid-life capture death that no "disconnected" event would surface - and runs the
  * relaunch that cures it. This is the single recovery action for a browser that is alive and still serving: the mark lives on the supervisor's ready state, so its
  * running captures continue untouched, new stream requests are refused at acquire() with a 503 back-off, the recovery ladder stops offering tab replacement, and
- * the relaunch waits for the registry to empty. Exported for the streaming layer to call once its probe or its wedge has produced the verdict.
+ * the relaunch waits until nothing depends on the browser. Exported for the streaming layer to call once its probe or its wedge has produced the verdict.
+ *
+ * The returned promise settles once the relaunch this mark triggered has settled, which is what a caller that means to use the fresh browser awaits: the teardown
+ * holds the supervisor in its draining state, where acquire() rejects rather than joins, so acquiring any earlier draws that rejection instead of the new
+ * instance. A caller with nothing waiting on the outcome voids it and the relaunch proceeds on its own.
  *
  * The restart trigger uses this function's return value rather than the supervisor's transition observer, deliberately. The observer runs inside transition(), so a
  * restart begun there would call noteReadinessLost re-entrantly while the marking transition's notification is still on the stack. The observer stays a reporter -
  * the alarm and the status emit - and the caller that holds the verdict acts on it once the transition has completed.
  * @param browser - The specific browser instance the caller verified as unable to start captures.
  * @param reason - A short description of the evidence behind the verdict, carried in the alarm log and the impairment record.
+ * @returns A promise settling once the relaunch this mark triggered has settled, or at once when the verdict landed on nothing.
  */
-export function noteBrowserCaptureImpaired(browser: Browser, reason: string): void {
+export async function noteBrowserCaptureImpaired(browser: Browser, reason: string): Promise<void> {
 
   // A false answer means the verdict landed on nothing: the instance was superseded by a disconnect and relaunch while the caller was confirming it, or the browser
   // already carries a mark whose alarm and status emit have already fired. Either way there is no new state to act on.
@@ -1798,7 +1878,7 @@ export function noteBrowserCaptureImpaired(browser: Browser, reason: string): vo
     return;
   }
 
-  restartBrowserIfImpairedAndIdle();
+  await restartBrowserIfImpairedAndIdle();
 }
 
 /**
@@ -1912,8 +1992,9 @@ async function launchReadyBrowser(): Promise<Browser> {
 
     LOG.debug("timing:browser", "Browser ready. Total: %sms.", browserElapsed());
 
-    // Start background precaching of selected service channel lineups. Fire-and-forget - the setTimeout inside startPrecaching() defers the work until after this
-    // launch settles and the supervisor has published the ready browser, so its getCurrentBrowser() resolves immediately rather than re-entering this launch.
+    // Start background precaching of selected service channel lineups. Fire-and-forget - the delay startPrecaching() arms on its own clock defers the work until
+    // after this launch settles and the supervisor has published the ready browser, so its getCurrentBrowser() resolves immediately rather than re-entering this
+    // launch.
     startPrecaching();
 
     /* The reaper belongs to the browser instance the supervisor is about to publish: puppeteer drops a closed browser's listeners along with the instance, and
@@ -2154,8 +2235,10 @@ export async function closeBrowser(): Promise<void> {
  * 2. Exclude pages associated with active streams, and pages an operation still holds in flight
  * 3. Apply a grace period before closing (to handle race conditions)
  * 4. Preserve at least one page to keep the browser alive
+ * @param now - The instant the sweep judges staleness against, read from the interval's own clock so the staleness clocks this sweep starts and the ones it
+ * later reads are stamped on one time source.
  */
-export async function cleanupStalePages(): Promise<void> {
+export async function cleanupStalePages(now: number): Promise<void> {
 
   // Guard against calling this when no ready browser is running.
   const browser = supervisor.current();
@@ -2190,8 +2273,6 @@ export async function cleanupStalePages(): Promise<void> {
         }
       }
     }
-
-    const now = Date.now();
 
     // Project the browser's pages into the shape the decision core reads: the managed ids in the browser's own order, with undefined standing in for pages we
     // did not create, plus a lookup back to the Page objects so the ids it returns can be resolved to something closable.
@@ -2272,26 +2353,33 @@ export async function cleanupStalePages(): Promise<void> {
 }
 
 /**
- * Starts the periodic stale page cleanup interval. This should be called once during server startup, after the browser is initialized. The interval runs
- * indefinitely until stopStalePageCleanup() is called (typically during graceful shutdown).
+ * Starts the periodic stale page cleanup. This should be called once during server startup, after the browser is initialized. The sweep runs indefinitely until
+ * stopStalePageCleanup() is called (typically during graceful shutdown). A second start while one is running changes nothing.
+ * @param clock - The clock the sweep's interval arms on and whose reading each sweep judges staleness against, so the cadence and the judgment share one time
+ * source. Defaults to the system clock.
  */
-export function startStalePageCleanup(): void {
+export function startStalePageCleanup(clock: Clock = systemClock): void {
 
-  stalePageCleanupInterval = setInterval(() => { void cleanupStalePages(); }, CONFIG.recovery.stalePageCleanupInterval);
+  if(stalePageTimers) {
+
+    return;
+  }
+
+  const timers = new TimerRegistry({ clock });
+
+  timers.setInterval(STALE_PAGE_SWEEP_KEY, () => { void cleanupStalePages(clock.now()); }, CONFIG.recovery.stalePageCleanupInterval);
+
+  stalePageTimers = timers;
 }
 
 /**
- * Stops the stale page cleanup interval. This should be called during graceful shutdown to prevent the cleanup from running after we've started shutting down
- * the browser and streams.
+ * Stops the periodic stale page cleanup. This should be called during graceful shutdown to prevent the sweep from running after we've started shutting down the
+ * browser and streams. Disposing the registry drains the interval, and a stop with nothing running is a no-op.
  */
 export function stopStalePageCleanup(): void {
 
-  if(stalePageCleanupInterval) {
-
-    clearInterval(stalePageCleanupInterval);
-
-    stalePageCleanupInterval = null;
-  }
+  stalePageTimers?.dispose();
+  stalePageTimers = null;
 }
 
 /* Browser restart functions. One routine performs the restart; what differs is the cause that reaches it.
@@ -2301,17 +2389,77 @@ export function stopStalePageCleanup(): void {
  * browser is closed and immediately re-launched.
  *
  * The impairment cause is a repair rather than hygiene: a browser that can no longer start captures is unusable for new tunes no matter how young it is, so age and
- * the quiet period do not apply to it. It relaunches the moment the registry empties, which the mark itself, every stream end, and the periodic tick each check
- * for.
+ * the quiet period do not apply to it. It relaunches the moment nothing depends on the browser any more, which the mark itself, every stream end, and the periodic
+ * tick each check for.
  */
+
+/**
+ * The registry facts a restart's idleness decision is made from. One shape, read by readRestartFacts and judged by isBrowserIdleForRestart, so the decision stays
+ * a pure function of stated facts rather than of whatever each guard happened to read.
+ */
+interface RestartFacts {
+
+  // Whether any registered stream holds its page, and so would lose it to a teardown.
+  readonly establishedStreams: boolean;
+
+  // How many pages an operation currently holds for its own duration, a tune mid-setup above all.
+  readonly inFlightPages: number;
+
+  // How many entries the registry holds, pending ones included.
+  readonly streamCount: number;
+}
+
+/**
+ * Decides whether the browser may be torn down for the given cause, from facts read at the call. Each cause asks a different question of the same registry, so
+ * the decision is stated once here rather than spelled out at each guard.
+ *
+ * Maintenance is opportunistic housekeeping, so it waits for an empty registry outright: a pending entry is a tune in progress, and replacing the browser under
+ * one would fail it for nothing better than a fresher instance. Impairment is a repair the tunes themselves are waiting on, so it asks the narrower question of
+ * what a teardown would actually destroy - a stream established on this browser, whose entry holds its page, or a page an operation still holds in flight. A tune
+ * refused a capture start holds neither while it waits for the relaunch, so the very pending entry that maintenance would defer to is not a reason to leave an
+ * unusable browser in place. A tune that has acquired the browser but not yet opened its page falls outside every dependency source for the same reason and
+ * deliberately so: it holds nothing a relaunch would destroy, neither a page nor a capture, and its own capture start would meet the impaired browser in any
+ * case, so the relaunch may run under it.
+ * @param cause - Why the restart wants to run.
+ * @param facts - The registry facts read at the call.
+ * @returns True when the browser may be torn down for this cause.
+ */
+export function isBrowserIdleForRestart(cause: BrowserRestartCause, facts: RestartFacts): boolean {
+
+  switch(cause) {
+
+    case "impairment": {
+
+      return !facts.establishedStreams && (facts.inFlightPages === 0);
+    }
+
+    case "maintenance": {
+
+      return facts.streamCount === 0;
+    }
+  }
+}
+
+/**
+ * Reads the registry facts the idleness decision is made from, at the moment of the call.
+ * @returns The facts.
+ */
+function readRestartFacts(): RestartFacts {
+
+  return { establishedStreams: hasEstablishedStreams(), inFlightPages: inFlightPageIds.size, streamCount: getStreamCount() };
+}
 
 /**
  * Relaunches a browser that can no longer start captures, as soon as nothing depends on it. Every trigger routes here - the mark itself, each stream termination,
  * and the periodic restart check as the backstop for a moment when the other two could not act (login mode above all) - so the decision lives in one place rather
  * than being re-derived by each. Idleness rather than age is the condition, because the mark makes the browser useless for new tunes immediately while its running
- * captures are still worth finishing, so the earliest safe moment is exactly the moment the last of them ends.
+ * captures are still worth finishing, so the earliest safe moment is exactly the moment the last thing depending on this browser lets go of it.
+ *
+ * The returned promise settles once the relaunch has settled, for the caller that goes on to acquire the fresh browser; a trigger with nothing waiting on the
+ * outcome voids it. An early return resolves at once, because there is nothing for such a caller to wait for.
+ * @returns A promise settling once the relaunch has settled, or at once when no relaunch runs.
  */
-export function restartBrowserIfImpairedAndIdle(): void {
+export async function restartBrowserIfImpairedAndIdle(): Promise<void> {
 
   if(supervisor.captureImpairment() === null) {
 
@@ -2319,15 +2467,15 @@ export function restartBrowserIfImpairedAndIdle(): void {
   }
 
   // A marked browser's restart belongs to this path, so a maintenance quiet period pending from before the mark is retired the first time any trigger observes the
-  // mark - whether or not the registry is idle yet - rather than being left to fire against the browser the relaunch will have replaced.
+  // mark - whether or not the browser is idle yet - rather than being left to fire against the browser the relaunch will have replaced.
   cancelRestartQuietTimer();
 
-  if(getStreamCount() > 0) {
+  if(!isBrowserIdleForRestart("impairment", readRestartFacts())) {
 
     return;
   }
 
-  void executeBrowserRestart("impairment");
+  await executeBrowserRestart("impairment");
 }
 
 /**
@@ -2335,8 +2483,10 @@ export function restartBrowserIfImpairedAndIdle(): void {
  * graceful shutdown in progress, login mode active, browser not ready. A marked browser is handed to the impairment path and the tick ends there. Otherwise the
  * tick drives the supervisor's health-gated governor reset and applies the maintenance rules: skip below the age threshold, cancel any pending quiet timer while
  * active streams exist (streams started during the quiet period reset the countdown), and otherwise start a quiet timer if one is not already running.
+ * @param timers - The restart owner's registry, whose quiet period this check arms and reads. Handed in by the interval closure, so the check never reads the
+ * nullable module binding and needs no null branch of its own.
  */
-function checkBrowserRestart(): void {
+function checkBrowserRestart(timers: TimerRegistry): void {
 
   // Skip if the server is shutting down or login mode is active.
   if(gracefulShutdownInProgress || isLoginModeActive()) {
@@ -2345,7 +2495,7 @@ function checkBrowserRestart(): void {
   }
 
   // Read the ready browser and its launch time from the supervisor. Both are non-null only in the ready state, so a single guard covers "no ready browser." The
-  // launch time is on the supervisor's clock (realClock.now), so age must be measured against the same clock - not Date.now() - or the units would not match.
+  // launch time is read from the supervisor's clock (systemClock.now), so age is measured against that same clock rather than against any other time source.
   const browser = supervisor.current();
   const launchTime = supervisor.currentLaunchTime();
 
@@ -2361,7 +2511,7 @@ function checkBrowserRestart(): void {
    */
   if(supervisor.captureImpairment() !== null) {
 
-    restartBrowserIfImpairedAndIdle();
+    void restartBrowserIfImpairedAndIdle();
 
     return;
   }
@@ -2374,7 +2524,7 @@ function checkBrowserRestart(): void {
   }
 
   // Skip if the browser has not exceeded the maximum age.
-  const age = realClock.now() - launchTime;
+  const age = systemClock.now() - launchTime;
 
   if(age < BROWSER_MAX_AGE) {
 
@@ -2384,7 +2534,7 @@ function checkBrowserRestart(): void {
   // If there are active streams, cancel any pending quiet timer and return. Streams that start during the quiet period reset the countdown.
   if(getStreamCount() > 0) {
 
-    if(restartQuietTimer) {
+    if(timers.has(RESTART_QUIET_KEY)) {
 
       LOG.debug("browser:lifecycle", "Browser restart quiet period cancelled - streams are active.");
     }
@@ -2395,12 +2545,12 @@ function checkBrowserRestart(): void {
   }
 
   // No active streams and the browser is old enough. Start the quiet timer if one is not already running.
-  if(!restartQuietTimer) {
+  if(!timers.has(RESTART_QUIET_KEY)) {
 
     LOG.debug("browser:lifecycle", "Browser uptime exceeds threshold. Quiet period started - restart will proceed if no streams start within %s minutes.",
       Math.round(BROWSER_RESTART_QUIET_PERIOD / 60000));
 
-    restartQuietTimer = setTimeout(() => {
+    timers.setTimeout(RESTART_QUIET_KEY, () => {
 
       void executeBrowserRestart("maintenance");
     }, BROWSER_RESTART_QUIET_PERIOD);
@@ -2420,18 +2570,20 @@ async function executeBrowserRestart(cause: BrowserRestartCause): Promise<void> 
   cancelRestartQuietTimer();
 
   // Final guard: re-check all preconditions. Conditions may have changed during the quiet period (e.g., a stream started just before the timer fired, login mode
-  // was activated, or the browser disconnected on its own). Reading current()/currentLaunchTime() together keeps the ready-state check and the age source consistent.
+  // was activated, or the browser disconnected on its own). Reading current()/currentLaunchTime() together keeps the ready-state check and the age source
+  // consistent. The idleness question is asked for this restart's own cause, because what a maintenance sweep must defer to and what a repair must defer to are
+  // not the same set of streams.
   const browser = supervisor.current();
   const launchTime = supervisor.currentLaunchTime();
 
-  if(gracefulShutdownInProgress || isLoginModeActive() || (getStreamCount() > 0) || !browser?.connected || (launchTime === null)) {
+  if(gracefulShutdownInProgress || isLoginModeActive() || !isBrowserIdleForRestart(cause, readRestartFacts()) || !browser?.connected || (launchTime === null)) {
 
     LOG.debug("browser:lifecycle", "Browser restart aborted - preconditions no longer met.");
 
     return;
   }
 
-  const age = realClock.now() - launchTime;
+  const age = systemClock.now() - launchTime;
   const hours = Math.floor(age / 3600000);
   const minutes = Math.floor((age % 3600000) / 60000);
 
@@ -2494,27 +2646,32 @@ async function executeBrowserRestart(cause: BrowserRestartCause): Promise<void> 
 }
 
 /**
- * Starts the periodic browser restart eligibility check. This should be called once during server startup, after the browser is initialized. The interval runs
- * indefinitely until stopBrowserRestartChecking() is called (typically during graceful shutdown).
+ * Starts the periodic browser restart eligibility check. This should be called once during server startup, after the browser is initialized. The check runs
+ * indefinitely until stopBrowserRestartChecking() is called (typically during graceful shutdown). A second start while one is running changes nothing.
+ * @param clock - The clock the check's interval and the quiet period it arms both run on. Defaults to the system clock.
  */
-export function startBrowserRestartChecking(): void {
+export function startBrowserRestartChecking(clock: Clock = systemClock): void {
 
-  restartCheckInterval = setInterval(checkBrowserRestart, BROWSER_RESTART_CHECK_INTERVAL);
+  if(restartTimers) {
+
+    return;
+  }
+
+  const timers = new TimerRegistry({ clock });
+
+  timers.setInterval(RESTART_CHECK_KEY, () => { checkBrowserRestart(timers); }, BROWSER_RESTART_CHECK_INTERVAL);
+
+  restartTimers = timers;
 }
 
 /**
- * Stops the browser restart checking interval and cancels any pending quiet timer. This should be called during graceful shutdown to prevent a restart from
- * racing with server shutdown.
+ * Stops the periodic browser restart eligibility check. This should be called during graceful shutdown to prevent a restart from racing with server shutdown.
+ * Disposing the registry drains the check and any pending quiet period together, and a stop with nothing running is a no-op.
  */
 export function stopBrowserRestartChecking(): void {
 
-  if(restartCheckInterval) {
-
-    clearInterval(restartCheckInterval);
-    restartCheckInterval = null;
-  }
-
-  cancelRestartQuietTimer();
+  restartTimers?.dispose();
+  restartTimers = null;
 }
 
 /* When running as a packaged executable (created by the `pkg` tool), the application is bundled into a single binary. Node modules like puppeteer-stream are

@@ -7,11 +7,12 @@
  */
 import { OPTIONAL_COLUMNS, VALID_OPTIONAL_COLUMNS, buildChannelTablePatch, buildChannelTableState, generateServiceFilterToolbar, generateTagFilterContent,
   generateTagManagerBody } from "./table.ts";
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
+import { afterEach, beforeEach, describe, test } from "node:test";
 import { getActiveTagVocabulary, getChannelEffectiveTags, getChannelListing, initializeUserChannels } from "../../../config/userChannels.ts";
 import { loadHealthState, markDomainAuth, markDomainAuthRequired } from "../../../config/health.ts";
 import { mkdtemp, rm } from "node:fs/promises";
 import { CONFIG } from "../../../config/index.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { firstOf } from "../../../testing.helpers.ts";
 import { initializeDataDir } from "../../../config/paths.ts";
@@ -187,6 +188,7 @@ describe("login icon tri-state rendering", () => {
    * or unknown (no color class). We render through buildChannelTablePatch - the same primitive the health bridge uses for reactive row patches - and assert on
    * the login button's class and title. The predefined "abc" channel resolves to the abc.com auth domain, which is what the marks below key on.
    */
+  let clock: TestClock;
   let dir: string;
 
   beforeEach(async () => {
@@ -195,16 +197,16 @@ describe("login icon tri-state rendering", () => {
     initializeDataDir(dir);
     await initializeUserChannels();
 
-    // Reload health state from the fresh (empty) data dir so domain auth residue from other test files cannot color the rows rendered here.
-    await loadHealthState();
+    /* Reload health state from the fresh (empty) data dir so domain auth residue from other test files cannot color the rows rendered here. The load takes the
+     * row's clock, which stamps the marks below at a fixed instant and puts their debounced flush on virtual time rather than a two-second platform timer.
+     */
+    clock = new TestClock(1700000000000);
 
-    // We mock Date for deterministic timestamps and setTimeout to suppress the 2-second debounced flush timer the mark calls below schedule.
-    mock.timers.enable({ apis: [ "Date", "setTimeout" ], now: 1700000000000 });
+    await loadHealthState(clock);
   });
 
   afterEach(async () => {
 
-    mock.timers.reset();
     await rm(dir, { force: true, recursive: true });
   });
 
@@ -262,9 +264,7 @@ describe("login icon tri-state rendering", () => {
     markDomainAuthRequired("abc.com");
     assert.match(renderAbcRow(), /btn-icon-login health-failed/, "precondition: flagged renders red");
 
-    mock.timers.reset();
-    await loadHealthState();
-    mock.timers.enable({ apis: [ "Date", "setTimeout" ], now: 1700000000000 });
+    await loadHealthState(clock);
 
     assert.match(renderAbcRow(), /class="btn-icon btn-icon-login"/, "reloaded state renders neutral again");
   });

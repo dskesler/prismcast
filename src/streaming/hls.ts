@@ -3,7 +3,7 @@
  * hls.ts: HLS streaming request handlers for PrismCast.
  */
 import type { CreatePageWithCaptureResult, StreamSetupResult, TabReplacementHandlerFactory } from "./setup.ts";
-import type { HLSState, StreamRegistryEntry } from "./registry.ts";
+import type { HLSState, SetupFailureStatus, StreamRegistryEntry } from "./registry.ts";
 import { LOG, formatError, formatResolutionLabel, runWithStreamContext, startTimer } from "../utils/index.ts";
 import type { Nullable, ResolvedChannel, ResolvedSiteProfile } from "../types/index.ts";
 import type { Request, Response } from "express";
@@ -36,6 +36,7 @@ import { createHash } from "node:crypto";
 import { getProviderBySlug } from "../browser/channelSelection.ts";
 import { registerClient } from "./clients.ts";
 import { suppressPageAudio } from "../browser/video.ts";
+import { systemClock } from "homebridge-plugin-utils";
 import { triggerShowNameUpdate } from "./showInfo.ts";
 
 /* This module handles HLS (HTTP Live Streaming) output using fMP4 (fragmented MP4) segments. HLS mode uses MP4/AAC capture from puppeteer-stream, which is then
@@ -65,6 +66,10 @@ import { triggerShowNameUpdate } from "./showInfo.ts";
 // content directly. This ensures fast-tuning services (native HLS at 2-3s, most capture services at 4-7s) never see preroll, while slow services (Xfinity/Cox at
 // 13-15s) get preroll content after the delay to prevent HTTP timeouts.
 const PREROLL_DELAY_MS = 9000;
+
+// How long a playlist request waits for a playlist to exist, in milliseconds. It bounds the window between a pending entry's registration and the first playlist
+// from either the preroll timer or the segmenter, so a setup that hangs without ever failing cannot hold a client request open indefinitely.
+const PLAYLIST_WAIT_MS = 30000;
 
 /**
  * Builds the onError/onStop callbacks for createFMP4Segmenter. Both callbacks share the same termination chain (skip-if-already-terminating guard, log error,
@@ -200,6 +205,52 @@ export function sendValidationError(validation: { body: Record<string, string> |
   }
 }
 
+/**
+ * Describes a stream setup failure as the status and message the client is answered with. A StreamSetupError carries its own status and user-facing text, which is
+ * the meaning the setup path assigned to the failure; anything else is unexpected and the client learns nothing beyond a 500.
+ * @param error - The error a setup path produced.
+ * @returns The status and message this failure answers with.
+ */
+export function describeSetupFailure(error: unknown): SetupFailureStatus {
+
+  if(error instanceof StreamSetupError) {
+
+    return { statusCode: error.statusCode, userMessage: error.userMessage };
+  }
+
+  return { statusCode: 500, userMessage: "Internal server error." };
+}
+
+/**
+ * Sends a described setup failure to the client. Every streaming route answers a setup failure through here, so one failure means one response shape no matter
+ * which route the client arrived on.
+ *
+ * A 503 carries both back-off headers on every route: Channels DVR reads Retry-After and waits instead of retrying in a tight loop, and an HDHomeRun client reads
+ * X-HDHomeRun-Error to tell a busy tuner apart from a broken one. A response whose headers are already flushed can carry no status at all, so it is ended and the
+ * client sees the connection close.
+ *
+ * Logging stays with the callers: each route describes its own failure in its own words and at its own level.
+ * @param failure - The described failure, from describeSetupFailure or from a literal the caller composed.
+ * @param res - Express response object.
+ */
+export function sendSetupFailure(failure: SetupFailureStatus, res: Response): void {
+
+  if(res.headersSent) {
+
+    res.end();
+
+    return;
+  }
+
+  if(failure.statusCode === 503) {
+
+    res.setHeader("Retry-After", "10");
+    res.setHeader("X-HDHomeRun-Error", "All Tuners In Use");
+  }
+
+  res.status(failure.statusCode).send(failure.userMessage);
+}
+
 // Capacity Reservation.
 
 /**
@@ -284,12 +335,12 @@ export async function ensureChannelStream(channelName: string, req: Request, res
     // Reserve a capacity slot before registering the pending entry. The pending entry occupies a registry slot the instant it is registered, so the capacity
     // decision must happen here - while the new stream is still excluded from the count - to avoid a later self-counting check rejecting it after the client has
     // already received a preroll playlist. reserveStreamSlot is the single source of truth for this decision and reclaims an idle stream when at the limit. On
-    // failure we send a proper 503 here, before any registration or preroll response.
+    // failure we answer here, before any registration or preroll response, through the shared responder that writes the back-off headers for every route.
     if(!reserveStreamSlot()) {
 
-      res.setHeader("Retry-After", "10");
-      res.setHeader("X-HDHomeRun-Error", "All Tuners In Use");
-      res.status(503).send("Maximum concurrent streams (" + String(CONFIG.streaming.maxConcurrentStreams) + ") reached. Try again later.");
+      const refusal = "Maximum concurrent streams (" + String(CONFIG.streaming.maxConcurrentStreams) + ") reached. Try again later.";
+
+      sendSetupFailure({ statusCode: 503, userMessage: refusal }, res);
 
       return null;
     }
@@ -363,6 +414,8 @@ export async function handleHLSPlaylist(req: Request, res: Response): Promise<vo
  */
 export function handleHLSSegment(req: Request, res: Response): void {
 
+  // The serve instant, read once at this request boundary and used for whichever access stamp the branch below writes.
+  const now = systemClock.now();
   const channelName = (req.params as { name?: string }).name;
   const segmentName = (req.params as { segment?: string }).segment;
 
@@ -394,7 +447,7 @@ export function handleHLSSegment(req: Request, res: Response): void {
       return;
     }
 
-    updateLastAccess(streamId);
+    updateLastAccess(streamId, now);
     sendSegment(initSegment, "init.mp4", res);
 
     return;
@@ -412,7 +465,7 @@ export function handleHLSSegment(req: Request, res: Response): void {
     return;
   }
 
-  updateLastAccess(streamId);
+  updateLastAccess(streamId, now);
   sendSegment(segment, segmentName, res);
 }
 
@@ -427,6 +480,8 @@ export function handleHLSSegment(req: Request, res: Response): void {
  */
 export function handleHLSVariantPlaylist(req: Request, res: Response): void {
 
+  // The serve instant, read once at this request boundary.
+  const now = systemClock.now();
   const channelName = (req.params as { name?: string }).name;
 
   // Extract the playlist filename from the URL path. The route is registered as two explicit paths (/video.m3u8 and /audio.m3u8) rather than a parameterized route,
@@ -467,7 +522,7 @@ export function handleHLSVariantPlaylist(req: Request, res: Response): void {
     return;
   }
 
-  updateLastAccess(streamId);
+  updateLastAccess(streamId, now);
   sendPlaylist(playlist, res);
 }
 
@@ -557,21 +612,13 @@ export async function handlePlayStream(req: Request, res: Response): Promise<voi
     }
   } catch(error) {
 
-    if(error instanceof StreamSetupError) {
+    // A StreamSetupError is an expected refusal whose message is already meant for the client, so only an unexpected failure earns an error log here.
+    if(!(error instanceof StreamSetupError)) {
 
-      if(error.statusCode === 503) {
-
-        res.setHeader("Retry-After", "10");
-      }
-
-      res.status(error.statusCode).send(error.userMessage);
-
-      return;
+      LOG.error("Unexpected error during ad-hoc stream setup: %s.", formatError(error));
     }
 
-    LOG.error("Unexpected error during ad-hoc stream setup: %s.", formatError(error));
-
-    res.status(500).send("Internal server error.");
+    sendSetupFailure(describeSetupFailure(error), res);
 
     return;
   }
@@ -585,7 +632,8 @@ export async function handlePlayStream(req: Request, res: Response): Promise<voi
  * Sends the playlist for a stream. With the deferred preroll timer, the playlist may not be available immediately after stream registration - it arrives when either
  * the timer fires (seeding preroll) or the segmenter produces real content, whichever comes first. This function awaits the playlistReady promise to handle that
  * window. For the blocking fallback path (no FFmpeg / no preroll), the playlist is guaranteed to exist because initializeStream blocks until the segmenter produces
- * it. Returns 404 only if the stream was terminated or the playlist wait timed out.
+ * it. A stream whose setup failed answers with that failure's status, so the client learns the tune was refused; a stream terminated for any other reason, or a
+ * wait that timed out, answers 404.
  * @param streamId - The numeric stream ID.
  * @param clientAddress - Client address for tracking.
  * @param res - Express response object.
@@ -595,14 +643,28 @@ async function sendPlaylistResponse(streamId: number, clientAddress: string, res
   let playlist = getPlaylist(streamId);
 
   // The playlist may not be populated yet if the deferred preroll timer hasn't fired and the segmenter hasn't produced content. Wait for the playlistReady promise
-  // which resolves when either source provides a playlist. The 30-second timeout covers pathological cases like setup hanging.
+  // which resolves when either source provides a playlist. The bounded wait covers pathological cases like setup hanging.
   if(!playlist) {
 
-    const ready = await waitForPlaylist(streamId, 30000);
+    /* The reference a failed setup's status is read through, taken before the wait rather than after it. A setup failure records its status on this entry and then
+     * leaves the registry in the same synchronous run that wakes this wait, so a lookup on the far side would find nothing where the reference taken here still
+     * reaches the entry object.
+     */
+    const waiting = getStream(streamId);
+    const ready = await waitForPlaylist(streamId, PLAYLIST_WAIT_MS);
 
     if(ready) {
 
       playlist = getPlaylist(streamId);
+    }
+
+    // A refused tune answers with the refusal's own status, which is what tells Channels DVR to back off - a 404 carries no back-off and invites an immediate
+    // retry of a stream that is not coming.
+    if(!playlist && waiting?.hls.setupFailure) {
+
+      sendSetupFailure(waiting.hls.setupFailure, res);
+
+      return;
     }
   }
 
@@ -613,8 +675,11 @@ async function sendPlaylistResponse(streamId: number, clientAddress: string, res
     return;
   }
 
-  updateLastAccess(streamId);
-  registerClient(streamId, clientAddress, "hls");
+  // The serve instant, so the stream's access stamp and the client's last-seen both carry the moment the response is served.
+  const now = systemClock.now();
+
+  updateLastAccess(streamId, now);
+  registerClient(streamId, clientAddress, "hls", now);
 
   // When still serving preroll, regenerate the progressive playlist on each poll so the sliding window advances based on elapsed wall-clock time. This simulates a
   // live stream - the client sees new segments appear on each poll and keeps playing without stalling. Once real content arrives, hasRealPlaylist becomes true and
@@ -623,9 +688,10 @@ async function sendPlaylistResponse(streamId: number, clientAddress: string, res
 
   if(stream && !stream.hls.hasRealPlaylist) {
 
-    if(stream.hls.prerollBaseUrl && stream.hls.prerollCodec && stream.hls.prerollStartTime) {
+    if(stream.hls.prerollBaseUrl && stream.hls.prerollCodec && (stream.hls.prerollStartTime !== null)) {
 
-      playlist = generatePrerollPlaylist(stream.hls.prerollBaseUrl, stream.hls.prerollCodec, stream.hls.resumeSegmentIndex, stream.hls.prerollStartTime);
+      playlist = generatePrerollPlaylist({ baseUrl: stream.hls.prerollBaseUrl, codec: stream.hls.prerollCodec, now,
+        prerollStartTime: stream.hls.prerollStartTime, startingSequence: stream.hls.resumeSegmentIndex });
     }
 
     LOG.debug("streaming:preroll", "Serving preroll playlist for stream %d.", streamId);
@@ -1080,6 +1146,8 @@ interface PendingStreamResult {
  */
 function registerPendingStream(channelName: string, channel: ResolvedChannel, clientAddress: Nullable<string>, req: Request, codec: CaptureCodec): PendingStreamResult {
 
+  // The registration instant, read once at this composition point and used for the resume-index read, the entry's start time, and the preroll timer's arming.
+  const now = systemClock.now();
   const numericStreamId = getNextStreamId();
   const streamIdStr = generateStreamId(channelName, channel.url);
 
@@ -1090,18 +1158,18 @@ function registerPendingStream(channelName: string, channel: ResolvedChannel, cl
   const fallbackHost = CONFIG.server.host + ":" + String(CONFIG.server.port);
   const baseUrl = protocol + "://" + (host ?? fallbackHost);
 
-  // Create HLS state with a deferred preroll timer. The timer fires after PREROLL_DELAY_MS - if stream setup hasn't completed by then, preroll is seeded and the
-  // playlist response is unblocked. For resume streams, the preroll's MEDIA-SEQUENCE is offset by the saved segment index so it continues from the prior session's
-  // sequence range. The timer is disarmed through cancelPrerollTimer() once real content arrives or preroll state is otherwise invalidated, so it cannot fire against
-  // state that has moved on.
+  // Create HLS state with a deferred preroll timer - a one-shot on the system clock whose handle the single disarm point disposes. The timer fires after
+  // PREROLL_DELAY_MS - if stream setup hasn't completed by then, preroll is seeded and the playlist response is unblocked. For resume streams, the preroll's
+  // MEDIA-SEQUENCE is offset by the saved segment index so it continues from the prior session's sequence range. The timer is disarmed through
+  // cancelPrerollTimer() once real content arrives or preroll state is otherwise invalidated, so it cannot fire against state that has moved on.
   const hls = createHLSState();
 
   // Snapshot the resume segment index once at registration. Both the preroll timer callback and completeStreamSetup() use this single snapshot, eliminating the TTL
   // race that would occur if each read the resume map independently at different times.
-  hls.resumeSegmentIndex = getResumeSegmentIndex(channelName) ?? 0;
+  hls.resumeSegmentIndex = getResumeSegmentIndex(channelName, now) ?? 0;
 
   // Capture the stream start time at registration. This timestamp is used for the registry's startTime field (stream age display, etc.).
-  const streamStartTime = new Date();
+  const streamStartTime = now;
 
   if(isPrerollReady(codec)) {
 
@@ -1113,12 +1181,14 @@ function registerPendingStream(channelName: string, channel: ResolvedChannel, cl
     hls.prerollCodec = codec;
     hls.prerollSegmentCount = getPrerollSegmentCount(codec);
 
-    hls.prerollTimer = setTimeout(() => {
+    hls.prerollTimer = systemClock.schedule((): void => {
 
       // Record the preroll start time and seed the initial progressive playlist. On subsequent polls, sendPlaylistResponse() regenerates the playlist with an
-      // advancing window based on elapsed time from this start time, simulating a live stream.
-      hls.prerollStartTime = new Date();
-      hls.playlist = generatePrerollPlaylist(baseUrl, codec, hls.resumeSegmentIndex, hls.prerollStartTime);
+      // advancing window based on elapsed time from this start time, simulating a live stream. The reveal at the fire instant is the initial window.
+      const firedAt = systemClock.now();
+
+      hls.prerollStartTime = firedAt;
+      hls.playlist = generatePrerollPlaylist({ baseUrl, codec, now: firedAt, prerollStartTime: firedAt, startingSequence: hls.resumeSegmentIndex });
       hls.signalPlaylistReady();
     }, PREROLL_DELAY_MS);
   }
@@ -1157,8 +1227,8 @@ interface CreatePendingEntryOptions {
   // Pre-allocated string stream ID for logging.
   streamIdStr: string;
 
-  // Wall-clock time when the stream was created, for PROGRAM-DATE-TIME anchoring. Defaults to now if not provided.
-  streamStartTime?: Date;
+  // The epoch millisecond instant the stream was created, for PROGRAM-DATE-TIME anchoring. Defaults to the system clock's reading if not provided.
+  streamStartTime?: number;
 
   // The URL to stream.
   url: string;
@@ -1174,6 +1244,9 @@ function createPendingEntry(options: CreatePendingEntryOptions): void {
 
   const { channel, channelName, hls, numericStreamId, streamIdStr, url } = options;
 
+  // The registration instant, read once so the access stamp and the entry's start time agree when the caller supplied no start of its own.
+  const now = systemClock.now();
+
   registerStream({
 
     channelName: channel?.name ?? null,
@@ -1183,7 +1256,7 @@ function createPendingEntry(options: CreatePendingEntryOptions): void {
     identity: makePendingCaptureIdentity(),
     info: {
 
-      lastPlaylistRequest: Date.now(),
+      lastPlaylistRequest: now,
       storeKey: channelName
     },
     monitor: null,
@@ -1192,7 +1265,7 @@ function createPendingEntry(options: CreatePendingEntryOptions): void {
     preTuned: options.preTuned ?? false,
     probeIdentity: null,
     profile: null,
-    startTime: options.streamStartTime ?? new Date(),
+    startTime: options.streamStartTime ?? now,
     streamIdStr,
     url
   });
@@ -1201,15 +1274,29 @@ function createPendingEntry(options: CreatePendingEntryOptions): void {
 }
 
 /**
- * Handles stream setup failure by marking channel health, terminating the pending entry, and optionally logging the error. The blocking path (initializeStream) skips
- * logging because it re-throws for callers to handle. The non-blocking path (ensureChannelStream .catch) logs because there is no outer handler.
+ * Handles stream setup failure by recording the failure's status on the pending entry, marking channel health, terminating the entry, and optionally logging the
+ * error. The blocking path (initializeStream) skips logging because it re-throws for callers to handle. The non-blocking path (ensureChannelStream .catch) logs
+ * because there is no outer handler.
+ *
+ * Exported for unit-test coverage of the ordering the recorded status depends on. Production callers reach this only through the setup paths above, never directly.
  * @param numericStreamId - The pending entry's numeric stream ID.
  * @param channelName - The channel key for health tracking and termination.
  * @param channel - The channel definition, or undefined for ad-hoc streams (no health tracking).
  * @param error - The error that caused the failure.
  * @param logError - Whether to log the error. False when the caller will re-throw (blocking path), true when fire-and-forget (non-blocking path).
  */
-function handleSetupFailure(numericStreamId: number, channelName: string, channel: ResolvedChannel | undefined, error: unknown, logError = true): void {
+export function handleSetupFailure(numericStreamId: number, channelName: string, channel: ResolvedChannel | undefined, error: unknown, logError = true): void {
+
+  /* Record what this failure answers with before anything tears the entry down. terminateStream unregisters the entry in the same synchronous run in which it
+   * wakes every request waiting on this stream, so a request that resumes afterward finds nothing in the registry to read - the status has to be on the entry
+   * object by then. A waiting request holds its own reference to that object, taken before its wait, and reads the status through it.
+   */
+  const entry = getStream(numericStreamId);
+
+  if(entry) {
+
+    entry.hls.setupFailure = describeSetupFailure(error);
+  }
 
   // Mark channel health as failed. Only for predefined channels (channel is defined). Ad-hoc URL streams have no persistent channel identity.
   if(channel) {
@@ -1456,14 +1543,15 @@ export function buildResumeContinuity(options: BuildResumeContinuityOptions): Se
  * @param setup - The stream setup result from setupStream().
  * @param numericStreamId - The stream's numeric ID.
  * @param channelName - The channel key for resume data and logging.
+ * @param now - The instant the resume data's TTL is measured against.
  * @returns True if the segmenter was attached, false if the stream was terminated during setup (the session was already disposed).
  */
-function createCaptureSegmenter(setup: StreamSetupResult, numericStreamId: number, channelName: string): boolean {
+function createCaptureSegmenter(setup: StreamSetupResult, numericStreamId: number, channelName: string, now: number): boolean {
 
   // Peek at resume data from a previous shutdown without consuming it. The data is consumed (deleted) only after the segmenter is successfully created and
   // stored in the registry. This ensures resume data survives if segmenter creation fails - the next stream start retries with the same resume state instead
   // of losing it and causing an HLS sequence reset.
-  const resumeData = peekResumeData(channelName);
+  const resumeData = peekResumeData(channelName, now);
   const currentStream = getStream(numericStreamId);
   const prerollSegmentCount = currentStream?.hls.prerollSegmentCount ?? 0;
 
@@ -1606,6 +1694,9 @@ async function completeStreamSetup(options: CompleteStreamSetupOptions): Promise
     onCircuitBreak
   );
 
+  // The tune-complete instant, read once here so the resume data's TTL check and the tune-time line below measure against the same moment.
+  const now = systemClock.now();
+
   // Fill in the pending registry entry with the real browser state. The entry was registered in Phase 1 (registerPendingStream or initializeStream).
   const stream = getStream(numericStreamId);
 
@@ -1658,7 +1749,7 @@ async function completeStreamSetup(options: CompleteStreamSetupOptions): Promise
       // If native streaming was not viable or not attempted, create the fMP4 segmenter for capture mode.
       if(streamingMode === "capture") {
 
-        if(!createCaptureSegmenter(setup, numericStreamId, channelName)) {
+        if(!createCaptureSegmenter(setup, numericStreamId, channelName, now)) {
 
           return null;
         }
@@ -1674,7 +1765,7 @@ async function completeStreamSetup(options: CompleteStreamSetupOptions): Promise
         (CONFIG.streaming.captureMode === "ffmpeg" ? "FFmpeg [" + ffmpegCodec + "]" : "Native fMP4");
       const displayName = channel?.name ?? url;
 
-      const tuneTime = ((Date.now() - setup.startTime.getTime()) / 1000).toFixed(1);
+      const tuneTime = ((now - setup.startTime) / 1000).toFixed(1);
 
       LOG.info("Streaming %s: %s, %s, %s. Tuned in %ss%s.", displayName, setup.serviceName, setup.profileName, captureMode,
         tuneTime, setup.directTune ? " (direct)" : "");
@@ -1749,22 +1840,13 @@ async function startHLSStream(channelName: string, url: string, req: Request, re
     return await initializeStream({ channel, channelName, clientAddress, profileOverride, url });
   } catch(error) {
 
-    if(error instanceof StreamSetupError) {
+    // A StreamSetupError is an expected refusal whose message is already meant for the client, so only an unexpected failure earns an error log here.
+    if(!(error instanceof StreamSetupError)) {
 
-      if(error.statusCode === 503) {
-
-        res.setHeader("Retry-After", "10");
-        res.setHeader("X-HDHomeRun-Error", "All Tuners In Use");
-      }
-
-      res.status(error.statusCode).send(error.userMessage);
-
-      return null;
+      LOG.error("Unexpected error during HLS stream setup: %s.", formatError(error));
     }
 
-    LOG.error("Unexpected error during HLS stream setup: %s.", formatError(error));
-
-    res.status(500).send("Internal server error.");
+    sendSetupFailure(describeSetupFailure(error), res);
 
     return null;
   }
@@ -1776,11 +1858,10 @@ async function startHLSStream(channelName: string, url: string, req: Request, re
  * Returns all streams that have exceeded the idle timeout and have no active MPEG-TS clients. Pretuned streams are excluded - they have no clients by design and
  * the pretune module manages their lifecycle via a safety timeout. The result is sorted by last access time (oldest first) so callers can efficiently pick the
  * longest-idle stream for reclamation.
+ * @param now - The instant each stream's idle window is measured against.
  * @returns Idle streams sorted by last access time ascending (oldest first).
  */
-function getIdleStreams(): StreamRegistryEntry[] {
-
-  const now = Date.now();
+function getIdleStreams(now: number): StreamRegistryEntry[] {
 
   return getAllStreams()
     .filter((stream) => !stream.preTuned && (stream.mpegTsClientCount === 0) && ((now - stream.info.lastPlaylistRequest) >= CONFIG.hls.idleTimeout))
@@ -1792,7 +1873,7 @@ function getIdleStreams(): StreamRegistryEntry[] {
  */
 export function cleanupIdleStreams(): void {
 
-  const idle = getIdleStreams();
+  const idle = getIdleStreams(systemClock.now());
 
   for(const stream of idle) {
 
@@ -1813,7 +1894,7 @@ export function cleanupIdleStreams(): void {
  */
 function reclaimIdleStream(): boolean {
 
-  const idle = getIdleStreams();
+  const idle = getIdleStreams(systemClock.now());
 
   if(idle.length === 0) {
 

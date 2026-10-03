@@ -3,8 +3,10 @@
  * probe.ts: HLS manifest probe and media-feed normalizer.
  */
 import type { DELTA_ELIGIBLE_BINDING_KEYS, MediaContainer, Nullable, ResolvedChannel } from "../types/index.ts";
-import { LOG, chromeFetch, startTimer, stringifySorted } from "../utils/index.ts";
+import { LOG, chromeFetch, resolveUrl, startTimer, stringifySorted, timeoutSignal } from "../utils/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import { inferMediaCodec } from "./codecInference.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* This module probes an intercepted HLS playlist URL and produces a fully described MediaFeed - the canonical input to the native proxy. The HLS spec defines
  * exactly two playlist kinds, and this module normalizes both to the same shape so downstream code does not branch on which kind arrived:
@@ -363,9 +365,11 @@ const PROBE_CACHE_TTL = 24 * 60 * 60 * 1000;
  * stream setup path to skip CDP interceptor installation for channels already known to use DRM.
  *
  * @param identity - The probe-cache identity to look up: the channel key that locates the entry, and the binding stamp the entry must match.
+ * @param now - The instant the entry's age is measured against, as epoch milliseconds. The caller reads it once and hands it down, so a lookup and the probe
+ *              that follows it compare against one reading.
  * @returns The cached encryption type, or null if not probed, probed under a different binding, or expired.
  */
-export function getCachedEncryption(identity: ProbeCacheIdentity): Nullable<EncryptionType> {
+export function getCachedEncryption(identity: ProbeCacheIdentity, now: number): Nullable<EncryptionType> {
 
   const entry = probeCache.get(identity.key);
 
@@ -385,7 +389,7 @@ export function getCachedEncryption(identity: ProbeCacheIdentity): Nullable<Encr
     return null;
   }
 
-  if((Date.now() - entry.timestamp) > PROBE_CACHE_TTL) {
+  if((now - entry.timestamp) > PROBE_CACHE_TTL) {
 
     probeCache.delete(identity.key);
 
@@ -420,6 +424,8 @@ export function clearProbeCache(channelKey: string): void {
  * @param playlistUrl - The HLS playlist URL (master or media; contains auth tokens from the browser's original request).
  * @param identity - The probe-cache identity this stream resolves under: the channel key for lookup, and the binding stamp any entry read or written must carry.
  * @param options - Probe options.
+ * @param options.clock - The clock this probe's cache instant, its timing line, and every fetch bound read. The tune path and the refresh path each pass
+ *                        theirs; a caller that holds no clock omits it and takes the system clock.
  * @param options.maxVariantAttempts - How many ranked variants a master playlist may fetch before giving up. Callers omit it and take the capped
  *                                     descending-bandwidth walk that is the selection policy for both tune and refresh; a caller naming a smaller number takes
  *                                     a narrower walk.
@@ -431,9 +437,12 @@ export function clearProbeCache(channelKey: string): void {
  * @returns The MediaFeed, or null when the probe fails or resolves a feed the supplied pipeline shape cannot absorb.
  */
 export async function probeManifest(playlistUrl: string, identity: ProbeCacheIdentity,
-  options: { maxVariantAttempts?: number; pipelineShape?: PipelineShape; rejectStaticPlaylists?: boolean } = {}): Promise<Nullable<MediaFeed>> {
+  options: { clock?: Clock; maxVariantAttempts?: number; pipelineShape?: PipelineShape; rejectStaticPlaylists?: boolean } = {}): Promise<Nullable<MediaFeed>> {
 
-  const { maxVariantAttempts = MAX_VARIANT_FALLBACK_ATTEMPTS, pipelineShape, rejectStaticPlaylists = false } = options;
+  const { clock = systemClock, maxVariantAttempts = MAX_VARIANT_FALLBACK_ATTEMPTS, pipelineShape, rejectStaticPlaylists = false } = options;
+
+  // One reading of the probe's clock serves the whole probe: it decides which cache entries are still fresh below, and it stamps whatever this probe writes back.
+  const now = clock.now();
 
   // Normalize to a floor of one whole attempt. Array.prototype.slice reads a negative count from the end of the list, so an out-of-range value from a caller
   // would otherwise become a surprising selection rather than a single top-ranked try.
@@ -441,7 +450,7 @@ export async function probeManifest(playlistUrl: string, identity: ProbeCacheIde
 
   // Short-circuit for DRM channels only. The cached DRM classification is stable within the TTL window (services rarely change DRM type), and the caller returns
   // null immediately on DRM without using any URLs. For clear/aes128 channels, we must re-probe to get fresh variant and key URLs with current auth tokens.
-  const cached = getCachedEncryption(identity);
+  const cached = getCachedEncryption(identity, now);
 
   if(cached === "drm") {
 
@@ -461,14 +470,14 @@ export async function probeManifest(playlistUrl: string, identity: ProbeCacheIde
     return { audioVariantUrl: null, bandwidth: 0, bestVariantUrl: "", codec: null, container: null, encryption: "drm", keyUrl: null, resolution: null };
   }
 
-  const elapsed = startTimer();
+  const elapsed = startTimer(clock);
 
   try {
 
     // Fetch the playlist body once and let classifyHlsPlaylist() decide which branch to take. The interceptor has already done a similar classification at the
     // network-observer layer, but we re-classify here because (a) the body can change between the interceptor's read and ours when the master URL serves a
     // live, mutating playlist, and (b) probeManifest() is also invoked directly by the token-refresh path which has no interceptor classification to inherit.
-    const body = await fetchManifestText(playlistUrl);
+    const body = await fetchManifestText(playlistUrl, clock);
 
     if(!body) {
 
@@ -478,8 +487,8 @@ export async function probeManifest(playlistUrl: string, identity: ProbeCacheIde
     }
 
     const kind = classifyHlsPlaylist(body);
-    const resolved = (kind === "master") ? await resolveMasterPlaylist(body, playlistUrl, variantAttempts, pipelineShape) :
-      (kind === "media") ? await resolveMediaPlaylist(body, playlistUrl, pipelineShape) :
+    const resolved = (kind === "master") ? await resolveMasterPlaylist(body, playlistUrl, variantAttempts, clock, pipelineShape) :
+      (kind === "media") ? await resolveMediaPlaylist(body, playlistUrl, clock, pipelineShape) :
         null;
 
     if(!resolved) {
@@ -511,7 +520,7 @@ export async function probeManifest(playlistUrl: string, identity: ProbeCacheIde
 
     // Classify encryption from the media body. This branch is identical for master-derived and media-only feeds because #EXT-X-KEY tags live on the media
     // playlist regardless of which playlist kind originally arrived.
-    const result = await classifyEncryption(resolved, identity.key);
+    const result = await classifyEncryption(resolved, identity.key, clock);
 
     /* Record the classification as the channel's fact only when the top-ranked variant produced it. The master walk falls back to a lower variant when the one
      * above it fails to fetch, and a fallback-derived classification describes a variant the next tune may not select - while the top variant's own encryption
@@ -521,7 +530,7 @@ export async function probeManifest(playlistUrl: string, identity: ProbeCacheIde
      */
     if(resolved.topRankedVariant) {
 
-      probeCache.set(identity.key, { encryption: result.encryption, stamp: identity.stamp, timestamp: Date.now() });
+      probeCache.set(identity.key, { encryption: result.encryption, stamp: identity.stamp, timestamp: now });
     }
 
     /* The constrained probe's guarantee is made here, once, against the finished classification. The walk compares each candidate as it reads the body, which is
@@ -552,13 +561,16 @@ export async function probeManifest(playlistUrl: string, identity: ProbeCacheIde
  * Fetches a manifest URL and returns the response text. Returns null on failure.
  *
  * @param url - The manifest URL to fetch.
+ * @param clock - The clock this fetch's bound arms on.
  * @returns The response text, or null on failure.
  */
-async function fetchManifestText(url: string): Promise<Nullable<string>> {
+async function fetchManifestText(url: string, clock: Clock): Promise<Nullable<string>> {
+
+  const bound = timeoutSignal(FETCH_TIMEOUT, { clock });
 
   try {
 
-    const response = await chromeFetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
+    const response = await chromeFetch(url, { signal: bound.signal });
 
     if(!response.ok) {
 
@@ -573,6 +585,9 @@ async function fetchManifestText(url: string): Promise<Nullable<string>> {
     LOG.debug("native:probe", "Manifest fetch error: %s.", String(error));
 
     return null;
+  } finally {
+
+    bound.cancel();
   }
 }
 
@@ -627,10 +642,11 @@ interface ResolvedMedia {
  * @param masterBody - The master manifest text.
  * @param masterUrl - The master manifest URL for resolving relative variant URLs.
  * @param maxVariantAttempts - How many candidate fetches to spend before giving up.
+ * @param clock - The clock every candidate fetch's bound arms on.
  * @param pipelineShape - The running consumer's compatibility envelope, or undefined for an unconstrained walk.
  * @returns The resolved media feed metadata, or null when the master yields no candidate this walk can use.
  */
-async function resolveMasterPlaylist(masterBody: string, masterUrl: string, maxVariantAttempts: number,
+async function resolveMasterPlaylist(masterBody: string, masterUrl: string, maxVariantAttempts: number, clock: Clock,
   pipelineShape?: PipelineShape): Promise<Nullable<ResolvedMedia>> {
 
   const variants = selectVariants(masterBody, masterUrl);
@@ -679,7 +695,7 @@ async function resolveMasterPlaylist(masterBody: string, masterUrl: string, maxV
      * a healthy top variant therefore costs exactly one fetch.
      */
     // eslint-disable-next-line no-await-in-loop
-    const variantBody = await fetchManifestText(variant.url);
+    const variantBody = await fetchManifestText(variant.url, clock);
 
     if(!variantBody) {
 
@@ -750,10 +766,11 @@ async function resolveMasterPlaylist(masterBody: string, masterUrl: string, maxV
  *
  * @param mediaBody - The media playlist text.
  * @param mediaUrl - The media playlist URL (the proxy will poll this).
+ * @param clock - The clock the codec inference's segment fetch arms its bound on.
  * @param pipelineShape - The running consumer's compatibility envelope, or undefined for an unconstrained resolution.
  * @returns The resolved media feed metadata, or null when the shape cannot absorb this feed.
  */
-async function resolveMediaPlaylist(mediaBody: string, mediaUrl: string, pipelineShape?: PipelineShape): Promise<Nullable<ResolvedMedia>> {
+async function resolveMediaPlaylist(mediaBody: string, mediaUrl: string, clock: Clock, pipelineShape?: PipelineShape): Promise<Nullable<ResolvedMedia>> {
 
   let container: Nullable<MediaContainer> = null;
 
@@ -773,7 +790,7 @@ async function resolveMediaPlaylist(mediaBody: string, mediaUrl: string, pipelin
   }
 
   // Best-effort codec inference. Returns codec=null on any failure (no segment, fetch error, unrecognized format) so the rest of the pipeline continues unimpaired.
-  const inferred = await inferMediaCodec({ baseUrl: mediaUrl, playlistBody: mediaBody });
+  const inferred = await inferMediaCodec({ baseUrl: mediaUrl, clock, playlistBody: mediaBody });
 
   return {
 
@@ -969,7 +986,7 @@ function scanEncryptionDeclaration(mediaBody: string): EncryptionDeclaration {
   return { kind: "clear" };
 }
 
-async function classifyEncryption(resolved: ResolvedMedia, channelKey: string): Promise<MediaFeed> {
+async function classifyEncryption(resolved: ResolvedMedia, channelKey: string, clock: Clock): Promise<MediaFeed> {
 
   const declaration = scanEncryptionDeclaration(resolved.mediaBody);
   let encryption: EncryptionType = declaration.kind;
@@ -982,7 +999,7 @@ async function classifyEncryption(resolved: ResolvedMedia, channelKey: string): 
       const rawKeyUrl = resolveUrl(declaration.keyUri, resolved.mediaUrl);
 
       // Test that the key is accessible and is exactly 16 bytes. This is the classification's only request, and a body that named no key never reaches it.
-      const keyAccessible = await testKeyAccessibility(rawKeyUrl);
+      const keyAccessible = await testKeyAccessibility(rawKeyUrl, clock);
 
       if(keyAccessible) {
 
@@ -1037,13 +1054,16 @@ async function classifyEncryption(resolved: ResolvedMedia, channelKey: string): 
  * Tests whether an AES-128 key URL is accessible and returns a 16-byte key.
  *
  * @param keyUrl - The key URL to test.
+ * @param clock - The clock this fetch's bound arms on.
  * @returns True if the key is accessible and exactly 16 bytes.
  */
-async function testKeyAccessibility(keyUrl: string): Promise<boolean> {
+async function testKeyAccessibility(keyUrl: string, clock: Clock): Promise<boolean> {
+
+  const bound = timeoutSignal(FETCH_TIMEOUT, { clock });
 
   try {
 
-    const response = await chromeFetch(keyUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT) });
+    const response = await chromeFetch(keyUrl, { signal: bound.signal });
 
     if(!response.ok) {
 
@@ -1060,6 +1080,9 @@ async function testKeyAccessibility(keyUrl: string): Promise<boolean> {
     LOG.debug("native:probe", "Key accessibility test failed: %s.", String(error));
 
     return false;
+  } finally {
+
+    bound.cancel();
   }
 }
 
@@ -1131,23 +1154,4 @@ function resolveAudioRendition(masterBody: string, masterUrl: string, audioGroup
   }
 
   return resolveUrl(candidateUri, masterUrl);
-}
-
-/**
- * Resolves a potentially relative URL against a base URL. Handles both absolute and relative URLs. Exported for reuse by the proxy module.
- *
- * @param url - The URL to resolve (may be relative or absolute).
- * @param baseUrl - The base URL for resolving relative references.
- * @returns The resolved absolute URL.
- */
-export function resolveUrl(url: string, baseUrl: string): string {
-
-  // If the URL is already absolute, return it directly.
-  if(url.startsWith("http://") || url.startsWith("https://")) {
-
-    return url;
-  }
-
-  // Use the URL constructor to resolve relative URLs against the base.
-  return new URL(url, baseUrl).href;
 }

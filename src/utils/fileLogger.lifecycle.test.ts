@@ -4,9 +4,10 @@
  * re-open after the retry window, initializeFileLogger's mkdir-failure recovery, and shutdownFileLogger. Basic writes/buffers live in fileLogger.test.ts; trim-path
  * tests live in fileLogger.trim.test.ts.
  */
-import { afterEach, describe, mock, test } from "node:test";
+import { afterEach, describe, test } from "node:test";
 import { flushLogBuffer, initializeFileLogger, shutdownFileLogger, writeLogEntry } from "./fileLogger.ts";
 import { readFile, rm, writeFile } from "node:fs/promises";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -84,16 +85,16 @@ describe("writeLogEntry - the first write after the retry window re-opens the fi
   afterEach(async () => {
 
     await shutdownFileLogger();
-    mock.reset();
   });
 
   test("re-opens the file when Date.now() has advanced past ERROR_RETRY_DELAY_MS since the pause", async () => {
 
     await withTempDir(async (dir) => {
 
+      const clock = new TestClock();
       const logPath = path.join(dir, "retry.log");
 
-      await initializeFileLogger(logPath, MAX_LOG_SIZE);
+      await initializeFileLogger(logPath, MAX_LOG_SIZE, clock);
 
       // Stub console.error so the cascading-error message isn't printed during the test.
       // eslint-disable-next-line no-console
@@ -116,11 +117,9 @@ describe("writeLogEntry - the first write after the retry window re-opens the fi
         await mkdir(dir, { recursive: true });
         await writeFile(logPath, "", "utf-8");
 
-        // Advance Date.now() past the 60-second retry window. We stub only Date.now via mock.method rather than enabling mock.timers with the Date API, because
-        // mock.timers would also take over setInterval and freeze the logger's live flush-timer interval running throughout this test.
-        const baseNow = Date.now() + 70000;
-
-        mock.method(Date, "now", () => baseNow);
+        // Move the logger's clock past the 60-second retry window. The pause stamp and the flush interval both run on it, so one advance carries the window the
+        // re-open reads and the periodic flushes that would have fired inside it.
+        clock.advance(70000);
 
         // The next writeLogEntry should observe the retry delay elapsed, clear the pause on the file it holds open, and append the entry to the buffer
         // instead of silently dropping it.
@@ -200,13 +199,32 @@ describe("initializeFileLogger - mkdir failure recovery", () => {
 
 describe("shutdownFileLogger", () => {
 
-  /* The rows here leave loggers running: the later-initialization row opens a second file, and the rows below park appends and a mkdir on one. The reset
-   * releases the flush timer that would otherwise hold the process open past the last row, and returns the clock APIs the rows enable.
+  /* The rows here leave loggers running: the later-initialization row opens a second file, and the rows below park appends and a mkdir on one. The shutdown
+   * releases the flush timer that would otherwise hold the process open past the last row; every timer these rows arm is on a clock they inject, so nothing
+   * platform-level is left to return.
    */
   afterEach(async () => {
 
     await shutdownFileLogger();
-    mock.timers.reset();
+  });
+
+  test("the transition out of the open state disposes the flush interval it carried", async () => {
+
+    /* The open state carries its flush interval as the port's handle, and the chokepoint that leaves that state is what disposes it. Reading the clock's
+     * outstanding count on both sides of the shutdown is the whole assertion: one armed timer while the file is open, none once it is not.
+     */
+    await withTempDir(async (dir) => {
+
+      const clock = new TestClock();
+
+      await initializeFileLogger(path.join(dir, "transition.log"), MAX_LOG_SIZE, clock);
+
+      assert.equal(clock.pending, 1, "the open state carries exactly one armed flush interval");
+
+      await shutdownFileLogger();
+
+      assert.equal(clock.pending, 0, "leaving the open state disposed the interval it carried");
+    });
   });
 
   test("is a no-op on an already-shut-down logger", async () => {
@@ -331,11 +349,11 @@ describe("shutdownFileLogger", () => {
   test("a write failure whose append settles after shutdown leaves the run that follows open", async (t) => {
 
     /* The shutdown drain is bounded, so a shutdown can complete while an append is still in flight. When that append then fails, the failure belongs to the
-     * run that ended: a later initialization must stay open and take its lines. The row parks the append, lapses the drain bound under mock timers, opens a
-     * second file, releases the failure, and asserts the second file still takes a line. Both timer APIs are virtual, so the periodic flush cannot slip a
-     * write of its own between the row's writes and flushes.
+     * run that ended: a later initialization must stay open and take its lines. The row parks the append, lapses the drain bound on the injected clock, opens a
+     * second file, releases the failure, and asserts the second file still takes a line. The flush interval and the bound share that clock, so the periodic
+     * flush cannot slip a write of its own between the row's writes and flushes.
      */
-    mock.timers.enable({ apis: [ "setInterval", "setTimeout" ] });
+    const clock = new TestClock();
 
     await withTempDir(async (dir) => {
 
@@ -368,7 +386,7 @@ describe("shutdownFileLogger", () => {
 
       try {
 
-        await initializeFileLogger(firstPath, MAX_LOG_SIZE);
+        await initializeFileLogger(firstPath, MAX_LOG_SIZE, clock);
 
         writeLogEntry("info", "Parked in the first run.", null);
 
@@ -378,10 +396,10 @@ describe("shutdownFileLogger", () => {
 
         const shutdown = shutdownFileLogger();
 
-        mock.timers.tick(SHUTDOWN_DRAIN_BOUND_MS);
+        clock.advance(SHUTDOWN_DRAIN_BOUND_MS);
 
         await shutdown;
-        await initializeFileLogger(secondPath, MAX_LOG_SIZE);
+        await initializeFileLogger(secondPath, MAX_LOG_SIZE, clock);
 
         releaseAppend.resolve(true);
 
@@ -406,10 +424,10 @@ describe("shutdownFileLogger", () => {
     /* A pause bounds a cascade of periodic retries against a disk that is refusing writes, and the final flush is one attempt rather than a cascade, so a line
      * logged while the drain runs is written whether or not the file was paused going in. The row parks two appends on one file: the first fails and pauses
      * the file, and the second is still in flight when the shutdown starts, which holds the drain open long enough to log line C into it. Line A goes down
-     * with the append that failed, line B is the one that queued behind it, and line C is the one the final flush has to attempt. Only setInterval is virtual
-     * here, because the drain's own bound has to stay real for the shutdown to settle on the released append rather than on a tick.
+     * with the append that failed, line B is the one that queued behind it, and line C is the one the final flush has to attempt. The row never advances the
+     * clock it injects, so the drain's own bound stays pending and the shutdown settles on the released append rather than on a deadline.
      */
-    mock.timers.enable({ apis: ["setInterval"] });
+    const clock = new TestClock();
 
     await withTempDir(async (dir) => {
 
@@ -454,7 +472,7 @@ describe("shutdownFileLogger", () => {
 
       try {
 
-        await initializeFileLogger(logPath, MAX_LOG_SIZE);
+        await initializeFileLogger(logPath, MAX_LOG_SIZE, clock);
 
         writeLogEntry("info", "Line A, carried by the append that fails.", null);
 
@@ -500,7 +518,7 @@ describe("shutdownFileLogger", () => {
      * which no file can take a line. The row parks the mkdir of a second initialization, logs into that gap, and asserts the line reached neither the file the
      * first run closed nor the file the second run is still opening.
      */
-    mock.timers.enable({ apis: ["setInterval"] });
+    const clock = new TestClock();
 
     await withTempDir(async (dir) => {
 
@@ -510,7 +528,7 @@ describe("shutdownFileLogger", () => {
       const mkdirReached = Promise.withResolvers<true>();
       const releaseMkdir = Promise.withResolvers<true>();
 
-      await initializeFileLogger(firstPath, MAX_LOG_SIZE);
+      await initializeFileLogger(firstPath, MAX_LOG_SIZE, clock);
       await shutdownFileLogger();
 
       // The second initialization's mkdir parks, which holds that initialization inside its own awaits while the row logs a line into the gap.
@@ -523,7 +541,7 @@ describe("shutdownFileLogger", () => {
         return realMkdir.call(fs.promises, dirPath, options as fs.MakeDirectoryOptions & { recursive: true });
       });
 
-      const initialization = initializeFileLogger(secondPath, MAX_LOG_SIZE);
+      const initialization = initializeFileLogger(secondPath, MAX_LOG_SIZE, clock);
 
       await mkdirReached.promise;
 

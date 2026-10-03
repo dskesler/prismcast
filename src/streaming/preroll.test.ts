@@ -6,15 +6,19 @@
  * each 404 branch. spawnAndCollect's deadline and collection semantics are exercised directly with Node child processes; only real-FFmpeg encoding
  * (generatePreroll) remains deferred to e2e.
  */
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
 import { buildPrerollEntries, computePrerollWindow, computeProgressiveReveal, computeReveal, generatePrerollPlaylist, getPrerollCodec, getPrerollMaxDuration,
   getPrerollSegmentCount, getPrerollSegmentDuration, getPrerollTotalDurationSec, isPrerollReady, setupPrerollRoutes, spawnAndCollect } from "./preroll.ts";
+import { describe, test } from "node:test";
 import { makeExpressStub, makeReqRes } from "../routes/express.helpers.ts";
 import type { Express } from "express";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 
-// The reference instant every mocked clock in this file counts from, so a row's expected timestamps read as offsets rather than absolute epochs.
+// The reference instant every row in this file counts from, so a row's expected timestamps read as offsets rather than absolute epochs.
 const BASE_TIME_MS = 1700000000000;
+
+// The generation deadline's own window, mirrored from preroll.ts so the deadline row advances exactly the bound the module arms by default.
+const PREROLL_GENERATION_TIMEOUT_MS = 60000;
 
 describe("isPrerollReady", () => {
 
@@ -246,20 +250,10 @@ describe("buildPrerollEntries", () => {
 
 describe("computeProgressiveReveal", () => {
 
-  beforeEach(() => {
-
-    mock.timers.enable({ apis: ["Date"], now: BASE_TIME_MS });
-  });
-
-  afterEach(() => {
-
-    mock.timers.reset();
-  });
-
   test("returns 0 when no variant has been generated for the codec", () => {
 
     // Boundary: the function returns 0 if the variant lookup fails. The compositor's downstream code treats 0 as "no segments visible yet."
-    const reveal = computeProgressiveReveal("h264", new Date(BASE_TIME_MS));
+    const reveal = computeProgressiveReveal({ codec: "h264", now: BASE_TIME_MS, prerollStartTime: BASE_TIME_MS });
 
     assert.equal(reveal, 0);
   });
@@ -267,9 +261,7 @@ describe("computeProgressiveReveal", () => {
   test("returns 0 immediately when no variant exists regardless of elapsed time", () => {
 
     // Same negative path, but with elapsed time advanced. The variant absence dominates.
-    mock.timers.tick(60000);
-
-    const reveal = computeProgressiveReveal("hevc", new Date(BASE_TIME_MS));
+    const reveal = computeProgressiveReveal({ codec: "hevc", now: BASE_TIME_MS + 60000, prerollStartTime: BASE_TIME_MS });
 
     assert.equal(reveal, 0);
   });
@@ -349,7 +341,8 @@ describe("generatePrerollPlaylist", () => {
      * spawning FFmpeg, which belongs to integration coverage rather than this unit suite. The early-return path is the one observable surface the unit tier
      * can assert without that subprocess.
      */
-    const playlist = generatePrerollPlaylist("http://example.test:5589", "h264", 0, new Date(BASE_TIME_MS));
+    const playlist = generatePrerollPlaylist({ baseUrl: "http://example.test:5589", codec: "h264", now: BASE_TIME_MS, prerollStartTime: BASE_TIME_MS,
+      startingSequence: 0 });
 
     assert.equal(playlist, "", "no variant -> empty playlist string");
   });
@@ -358,7 +351,8 @@ describe("generatePrerollPlaylist", () => {
 
     // Companion to the previous test: locks the contract that both codec branches share the same early-return semantics. A regression that hard-coded
     // "h264" in the readiness check would still pass the test above but fail here.
-    const playlist = generatePrerollPlaylist("http://example.test:5589", "hevc", 100, new Date(BASE_TIME_MS));
+    const playlist = generatePrerollPlaylist({ baseUrl: "http://example.test:5589", codec: "hevc", now: BASE_TIME_MS, prerollStartTime: BASE_TIME_MS,
+      startingSequence: 100 });
 
     assert.equal(playlist, "", "hevc without a variant also returns the empty string");
   });
@@ -469,30 +463,47 @@ describe("spawnAndCollect", () => {
 
   test("kills the child at the deadline and rejects with the timeout message", async () => {
 
-    /* A child that writes a little and then never exits is the hung-encoder shape the deadline exists for. The platform kills it when the deadline passes, and
-     * the rejection has to name the timeout rather than surfacing the raw abort error, since that message is what the caller's warning line puts in front of the
-     * operator. Real time is used deliberately: the deadline is the subject here, and mocking timers would only measure the mock. The deadline runs from the
-     * spawn, so a child killed before its script even executes still rejects through the same path - nothing here depends on the child getting anywhere.
+    /* A child that writes a little and then never exits is the hung-encoder shape the deadline exists for. The bound kills it when the deadline passes, and the
+     * rejection has to name the timeout rather than surfacing the raw abort error, since that message is what the caller's warning line puts in front of the
+     * operator. The deadline runs from the spawn, so a child killed before its script even executes still rejects through the same path - nothing here depends on
+     * the child getting anywhere.
+     *
+     * The deadline arms on a virtual clock at its full production width, so the advance below is the only thing that can fire it: a deadline reaching the child
+     * by any other route would take a real minute and end this row on the runner's own timeout instead of on the assertion.
      *
      * The child installs a SIGTERM handler that does nothing, which is the wedged encoder the production comment describes: a process that ignores the polite
      * signal. Passing therefore proves the kill carries SIGKILL strength rather than merely that some signal was sent, since SIGKILL is the one a process cannot
      * trap. The handler costs the success path nothing - an untrappable kill lands just as fast.
      */
-    await assert.rejects(spawnAndCollect(process.execPath,
-      [ "-e", "process.on(\"SIGTERM\", () => {}); process.stdout.write(\"partial\"); setInterval(() => {}, 1000);" ], 50), /timed out/);
+    const clock = new TestClock();
+
+    const collecting = spawnAndCollect(process.execPath,
+      [ "-e", "process.on(\"SIGTERM\", () => {}); process.stdout.write(\"partial\"); setInterval(() => {}, 1000);" ],
+      { clock, timeoutMs: PREROLL_GENERATION_TIMEOUT_MS });
+
+    assert.equal(clock.pending, 1, "the generation deadline is armed on the injected clock");
+    assert.deepEqual(clock.requested, [PREROLL_GENERATION_TIMEOUT_MS], "and it waits the deadline's own window");
+
+    clock.advance(PREROLL_GENERATION_TIMEOUT_MS);
+
+    await assert.rejects(collecting, /timed out/);
+
+    assert.equal(clock.pending, 0, "and the bound was cancelled rather than left armed");
   });
 
   test("collects stdout into a Buffer when the child exits cleanly inside the deadline", async () => {
 
     // A fast child under a generous deadline collects its stdout exactly as it would with no deadline at all - the success path must be undisturbed.
-    const output = await spawnAndCollect(process.execPath, [ "-e", "process.stdout.write(\"ok\");" ], 5000);
+    const clock = new TestClock();
+    const output = await spawnAndCollect(process.execPath, [ "-e", "process.stdout.write(\"ok\");" ], { clock, timeoutMs: 5000 });
 
     assert.equal(output.toString(), "ok");
+    assert.equal(clock.pending, 0, "the deadline is disposed at settlement rather than left armed for its full window");
   });
 
   test("rejects with the exit-code message when the child exits nonzero inside the deadline", async () => {
 
     // A failing child still reports its own exit code. This is what tells a correct implementation apart from one that reports every failure as a timeout.
-    await assert.rejects(spawnAndCollect(process.execPath, [ "-e", "process.exit(3)" ], 5000), /exited with code 3/);
+    await assert.rejects(spawnAndCollect(process.execPath, [ "-e", "process.exit(3)" ], { timeoutMs: 5000 }), /exited with code 3/);
   });
 });

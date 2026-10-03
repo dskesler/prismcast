@@ -9,7 +9,7 @@
  *
  * Why a port. The boot identifier is the guarantee runtime-identity tracking depends on - if two callers in the same process observe different values, the
  * guarantee breaks. So the default adapter (in bootSession.context.ts) snapshots its readings ONCE at adapter creation and returns the frozen values on every
- * subsequent call. This is intentionally different from realClock, where each call delegates live: clock readings should not be stable across calls, but boot
+ * subsequent call. This is intentionally different from the system clock, where each call delegates live: clock readings should not be stable across calls, but boot
  * identifiers must be. Tests bypass the snapshot by constructing context literals.
  */
 import type { Nullable } from "../types/index.ts";

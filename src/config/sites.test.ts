@@ -1,9 +1,9 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * sites.test.ts: Unit tests for the site profile and domain mapping module. The module is the SSOT for builtin profile data, the lookup precedence between
- * full-hostname and concise-domain matching, and the provider-module profile registry. We exercise every lookup path and the profile registration guards.
+ * sites.test.ts: Unit tests for the site profile and domain mapping module. The module is the SSOT for builtin profile data, the default profile, the
+ * domain-to-profile mappings, and the provider-module profile registry. We exercise each table's contents and the profile registration guards.
  */
-import { DOMAIN_CONFIG, PROVIDER_PROFILES, SITE_PROFILES, getBuiltinProfile, getDomainConfig, getRegisteredProviderModuleProfiles, isProviderProfile,
+import { DEFAULT_SITE_PROFILE, DOMAIN_CONFIG, PROVIDER_PROFILES, SITE_PROFILES, getBuiltinProfile, getRegisteredProviderModuleProfiles, isProviderProfile,
   registerProviderModuleProfile } from "./sites.ts";
 import { describe, test } from "node:test";
 import type { SiteProfile } from "../types/index.ts";
@@ -64,47 +64,17 @@ describe("DOMAIN_CONFIG", () => {
   });
 });
 
-describe("getDomainConfig", () => {
+describe("DEFAULT_SITE_PROFILE", () => {
 
-  test("resolves a known full hostname before the concise domain", () => {
+  test("declares every flag with an explicit (non-undefined) value", () => {
 
-    // tv.youtube.com -> youtubeTV must win over youtube.com -> keyboardDynamic for the same URL.
-    const result = getDomainConfig("https://tv.youtube.com/watch/abc");
-
-    assert.equal(result?.profile, "youtubeTV", "subdomain-specific entry wins");
-  });
-
-  test("falls back to the concise domain when the full hostname has no entry", () => {
-
-    const result = getDomainConfig("https://www.hulu.com/live");
-
-    assert.equal(result?.profile, "huluLive");
-  });
-
-  test("returns the matching entry verbatim (DomainConfig fields preserved)", () => {
-
-    const result = getDomainConfig("https://watch.spectrum.net/live");
-
-    assert.ok(result, "watch.spectrum.net resolves to a domain config");
-    assert.equal(result.profile, "spectrum");
-    assert.equal(result.service, "Spectrum TV");
-    assert.equal(result.serviceTag, "spectrum");
-  });
-
-  test("returns undefined for an unknown domain", () => {
-
-    assert.equal(getDomainConfig("https://example.example/live"), undefined);
-  });
-
-  test("returns undefined for an unparseable URL", () => {
-
-    // Boundary: new URL throws; the catch falls through to extractDomain (returns the input verbatim) which then misses the lookup.
-    assert.equal(getDomainConfig("not a url at all"), undefined);
-  });
-
-  test("returns undefined for an empty string", () => {
-
-    assert.equal(getDomainConfig(""), undefined);
+    // The resolution code starts with a copy of DEFAULT_SITE_PROFILE; missing flags would surface as undefined in resolved profiles. Locking the keys ensures
+    // the resolved shape is always complete.
+    assert.equal(DEFAULT_SITE_PROFILE.staticCapture, false);
+    assert.equal(DEFAULT_SITE_PROFILE.useRequestFullscreen, false);
+    assert.equal(DEFAULT_SITE_PROFILE.needsIframeHandling, false);
+    assert.equal(DEFAULT_SITE_PROFILE.fullscreenKey, null);
+    assert.equal(DEFAULT_SITE_PROFILE.channelSelector, null);
   });
 });
 

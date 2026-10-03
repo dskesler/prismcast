@@ -55,6 +55,9 @@ function makeDeps(failure: Error): CreatePageWithCaptureDeps {
 
     acquireCaptureStream: async (): Promise<CaptureStream> => Object.assign(new Readable({ read: (): void => { /* Nothing is read from the stub capture. */ } }),
       { stop: async (): Promise<void> => undefined, stopped: Promise.resolve() }),
+
+    // The refusal lands at the browser accessor, before any capture is attempted, so no verdict is ever asked for; the stub answers with none.
+    awaitCaptureVerdict: async (): Promise<null> => null,
     emulateCaptureSurface: async (): Promise<{ height: number; width: number }> => ({ height: 1080, width: 1920 }),
     getCurrentBrowser: async (purpose: BrowserPurpose): Promise<Browser> => {
 
@@ -118,7 +121,7 @@ describe("setupStream - a browser that can no longer start captures", () => {
 
     await assert.rejects(setupStream({ probeIdentity: PROBE_IDENTITY, url: STREAM_URL }, (): void => { /* No circuit break here. */ },
       makeDeps(new BrowserCaptureImpairedError(IMPAIRMENT))), (error: unknown) => (error instanceof StreamSetupError) && (error.statusCode === 503) &&
-      (error.userMessage === "The browser can no longer start captures and will relaunch once its current streams end. Please retry shortly."),
+      (error.userMessage === "The browser can no longer start captures and will relaunch as soon as nothing is using it. Please retry shortly."),
     "the refusal reaches the caller as a 503 carrying the impairment message");
 
     assert.deepEqual(purposes, ["capture"], "the establishment declared the capture purpose, so the refusal landed before a page existed");

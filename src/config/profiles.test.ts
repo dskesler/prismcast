@@ -1,26 +1,14 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * profiles.test.ts: Unit tests for the profile resolution module. The module composes inheritance chains, resolves URL- and channel-level overrides, and
- * gates the validation of inheritance cycles and missing references at startup. We exercise every resolution path and every error-collection branch of
- * validateProfiles. The user-profile/domain registry is left at its default (empty) state so resolution exercises only the static builtin tables.
+ * profiles.test.ts: Unit tests for the profile resolution module. The module resolves a URL to its domain configuration by the full-hostname-before-concise-domain
+ * precedence, composes inheritance chains, resolves URL- and channel-level overrides, and gates the validation of inheritance cycles and missing references at
+ * startup. We exercise every resolution path and every error-collection branch of validateProfiles. The user-profile/domain registry is left at its default
+ * (empty) state so resolution exercises only the static builtin tables.
  */
-import { DEFAULT_SITE_PROFILE, getProfileForChannel, getProfileForUrl, getProfiles, resolveProfile, validateProfiles } from "./profiles.ts";
 import { describe, test } from "node:test";
+import { getDomainConfig, getProfileForChannel, getProfileForUrl, getProfiles, resolveProfile, validateProfiles } from "./profiles.ts";
+import { DEFAULT_SITE_PROFILE } from "./sites.ts";
 import assert from "node:assert/strict";
-
-describe("DEFAULT_SITE_PROFILE", () => {
-
-  test("declares every flag with an explicit (non-undefined) value", () => {
-
-    // The resolution code starts with a copy of DEFAULT_SITE_PROFILE; missing flags would surface as undefined in resolved profiles. Locking the keys ensures
-    // the resolved shape is always complete.
-    assert.equal(DEFAULT_SITE_PROFILE.staticCapture, false);
-    assert.equal(DEFAULT_SITE_PROFILE.useRequestFullscreen, false);
-    assert.equal(DEFAULT_SITE_PROFILE.needsIframeHandling, false);
-    assert.equal(DEFAULT_SITE_PROFILE.fullscreenKey, null);
-    assert.equal(DEFAULT_SITE_PROFILE.channelSelector, null);
-  });
-});
 
 describe("resolveProfile", () => {
 
@@ -100,6 +88,50 @@ describe("resolveProfile", () => {
   });
 });
 
+describe("getDomainConfig", () => {
+
+  test("resolves a known full hostname before the concise domain", () => {
+
+    // tv.youtube.com -> youtubeTV must win over youtube.com -> keyboardDynamic for the same URL.
+    const result = getDomainConfig("https://tv.youtube.com/watch/abc");
+
+    assert.equal(result?.profile, "youtubeTV", "subdomain-specific entry wins");
+  });
+
+  test("falls back to the concise domain when the full hostname has no entry", () => {
+
+    const result = getDomainConfig("https://www.hulu.com/live");
+
+    assert.equal(result?.profile, "huluLive");
+  });
+
+  test("returns the matching entry verbatim (DomainConfig fields preserved)", () => {
+
+    const result = getDomainConfig("https://watch.spectrum.net/live");
+
+    assert.ok(result, "watch.spectrum.net resolves to a domain config");
+    assert.equal(result.profile, "spectrum");
+    assert.equal(result.service, "Spectrum TV");
+    assert.equal(result.serviceTag, "spectrum");
+  });
+
+  test("returns undefined for an unknown domain", () => {
+
+    assert.equal(getDomainConfig("https://example.example/live"), undefined);
+  });
+
+  test("returns undefined for an unparseable URL", () => {
+
+    // Boundary: new URL throws; the catch falls through to extractDomain (returns the input verbatim) which then misses the lookup.
+    assert.equal(getDomainConfig("not a url at all"), undefined);
+  });
+
+  test("returns undefined for an empty string", () => {
+
+    assert.equal(getDomainConfig(""), undefined);
+  });
+});
+
 describe("getProfileForUrl", () => {
 
   test("returns the default profile and 'default' name when url is undefined", () => {
@@ -145,6 +177,15 @@ describe("getProfileForUrl", () => {
     const result = getProfileForUrl("https://www.nbc.com/live");
 
     assert.equal(result.profile.maxContinuousPlayback, 4);
+  });
+
+  test("merges domain-level hideSelector when configured (cnn.com)", () => {
+
+    // cnn.com carries hideSelector in its DOMAIN_CONFIG entry while resolving to the shared fullscreenApi profile, so the value can only reach the resolved
+    // profile through the domain merge.
+    const result = getProfileForUrl("https://www.cnn.com/videos/cnn");
+
+    assert.equal(result.profile.hideSelector, "#piano-bottom-bar");
   });
 });
 

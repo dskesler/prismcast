@@ -11,13 +11,12 @@
  * also what lets a row fire the pipeline's own FFmpeg error callback at a chosen moment, before or after the swap, and read which way it was routed.
  */
 import type { CreatePageWithCaptureOptions, CreatePageWithCaptureResult } from "./setup.ts";
+import type { FMP4SegmenterResult, SegmenterContinuity } from "./fmp4Segmenter.ts";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { getStream, makePendingCaptureIdentity, registerStream, unregisterStream } from "./registry.ts";
 import type { CaptureSession } from "./captureSession.ts";
-import type { FMP4SegmenterResult } from "./fmp4Segmenter.ts";
 import type { Nullable } from "../types/index.ts";
 import type { Page } from "puppeteer-core";
-import type { SegmenterContinuity } from "./fmp4Segmenter.ts";
 import type { StreamRegistryEntry } from "./registry.ts";
 import type { TabReplacementDeps } from "./hls.ts";
 import assert from "node:assert/strict";

@@ -5,7 +5,6 @@
 export * from "./bootSession.ts";
 export * from "./chromeFetch.ts";
 export * from "./cliOutput.ts";
-export * from "./clock.ts";
 export * from "./debugFilter.ts";
 export * from "./delay.ts";
 export * from "./errors.ts";

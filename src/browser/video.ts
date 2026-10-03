@@ -2,15 +2,19 @@
  *
  * video.ts: Video context and playback handling for PrismCast.
  */
-import { EvaluateAbortError, LOG, delay, evaluateWithAbort, extractDomain, formatError, startTimer, waitWithTimeout } from "../utils/index.ts";
+import { EvaluateAbortError, LOG, evaluateWithAbort, extractDomain, formatError, pollUntil, startTimer, waitWithTimeout } from "../utils/index.ts";
 import type { Frame, Page } from "puppeteer-core";
 import type { Nullable, ResolvedSiteProfile, TuneResult, VideoSelectorType } from "../types/index.ts";
-import { getProvidersForDomain, invalidateDirectUrl, resolveDirectUrl, selectChannel } from "./channelSelection.ts";
+import { getProvidersForDomain, getStrategyNavigator, invalidateDirectUrl, resolveDirectUrl, selectChannel } from "./channelSelection.ts";
+import { loadDocument, reloadDocument } from "./navigation.ts";
 import { CONFIG } from "../config/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
+import type { EvaluateOptions } from "../utils/index.ts";
 import type { OverlayPhase } from "./consent.ts";
 import { classifyBlockedPage } from "./blockedPage.ts";
 import { markDomainAuthRequired } from "../config/health.ts";
 import { startOverlayHandling } from "./consent.ts";
+import { systemClock } from "homebridge-plugin-utils";
 import { withTabSelected } from "./tabSelection.ts";
 
 /* These functions manage the video element lifecycle for streaming capture. The key challenges we solve:
@@ -109,11 +113,14 @@ const FULLSCREEN_SELECTION_CEILING_MS = 6000;
  */
 export interface FullscreenDeps {
 
+  // The clock the ladder's settle sleeps, its retry pauses, and the activation click's own pause run on, and the one the native path's queue bound arms on.
+  readonly clock: Clock;
+
   readonly withTabSelected: typeof withTabSelected;
 }
 
 // The production collaborator.
-export const defaultFullscreenDeps: FullscreenDeps = { withTabSelected };
+export const defaultFullscreenDeps: FullscreenDeps = { clock: systemClock, withTabSelected };
 
 /**
  * Video state information returned by getVideoState(). Contains all properties needed to assess playback health.
@@ -155,11 +162,12 @@ export interface VideoStateInfo {
  * Gets the current state of the video element for health monitoring. Returns null if no video element is found.
  * @param context - The frame or page containing the video element.
  * @param selectorType - The video selector type for finding the element.
- * @param timeoutMs - How long to wait for the read before giving up. Omit for the evaluate wrapper's default bound; a caller that already has reason to suspect
- *                    an unresponsive tab passes a shorter one, since it needs to tell a hung page from a live one rather than wait out a slow answer.
+ * @param options - The clock the read's bound arms on and how long that bound is. Omit the bound for the evaluate wrapper's default; a caller that already has
+ *                  reason to suspect an unresponsive tab passes a shorter one, since it needs to tell a hung page from a live one rather than wait out a slow
+ *                  answer.
  * @returns The video state or null if no video found.
  */
-export async function getVideoState(context: Frame | Page, selectorType: VideoSelectorType, timeoutMs?: number): Promise<Nullable<VideoStateInfo>> {
+export async function getVideoState(context: Frame | Page, selectorType: VideoSelectorType, options: EvaluateOptions = {}): Promise<Nullable<VideoStateInfo>> {
 
   return evaluateWithAbort(context, (type: string): Nullable<VideoStateInfo> => {
 
@@ -183,7 +191,7 @@ export async function getVideoState(context: Frame | Page, selectorType: VideoSe
       videoWidth: video.videoWidth,
       volume: video.volume
     };
-  }, [selectorType], timeoutMs);
+  }, [selectorType], options);
 }
 
 /**
@@ -430,76 +438,47 @@ export async function startVideoPlayback(context: Frame | Page, selectorType: Vi
 }
 
 /**
- * Navigates a browser page to the specified URL with site-appropriate wait conditions. The navigation strategy depends on the site's player implementation:
- *
- * - waitForNetworkIdle=true: Wait for network activity to settle, allowing up to 2 concurrent connections for 500ms. This ensures all JavaScript has loaded
- *   and the player is fully initialized. Used for sites with complex async initialization.
- *
- * - waitForNetworkIdle=false: Return as soon as the page fires load event. Used for sites that have persistent connections or polling that would prevent
- *   networkidle from ever completing.
- *
- * Navigation timeouts are handled gracefully - we log a warning but don't throw, since the video may have loaded successfully even if networkidle never
- * completed.
+ * Puts the page on the given URL the way the profile's strategy enters its site: through the strategy's own navigator when its provider declares one, and
+ * otherwise through a plain document load under the profile's wait preference. Every navigation on the tune path, the re-establishment path, and the recovery
+ * route comes through here, which is what lets a provider that cannot always load its guide by URL take over the route without any caller knowing.
  * @param page - The Puppeteer page object.
  * @param url - The URL to navigate to.
- * @param profile - The site profile containing navigation preferences.
+ * @param profile - The site profile whose strategy and wait preference select the route.
  */
 export async function navigateToPage(page: Page, url: string, profile: ResolvedSiteProfile): Promise<void> {
 
-  if(profile.waitForNetworkIdle) {
+  const navigate = getStrategyNavigator(profile);
 
-    try {
+  if(navigate) {
 
-      // Wait for network activity to settle. This ensures complex JavaScript players have fully initialized. The networkidle2 strategy allows up to 2
-      // concurrent requests, which handles sites with persistent connections for analytics.
-      await page.goto(url, { timeout: CONFIG.streaming.navigationTimeout, waitUntil: "networkidle2" });
-    } catch(error) {
+    await navigate(page, url);
 
-      // Timeout errors during navigation are common and often non-fatal - the video may have loaded successfully even if some background requests never
-      // completed. We log a warning and continue rather than throwing.
-      if(error && ((error as Error).name === "TimeoutError")) {
-
-        LOG.warn("Page navigation timed out after %sms for %s.", CONFIG.streaming.navigationTimeout, url);
-      } else {
-
-        // Non-timeout errors (network failure, invalid URL, etc.) should be propagated for retry handling.
-        throw error;
-      }
-    }
-  } else {
-
-    // Simple navigation without waiting for network idle. Returns after the load event fires. Used for sites that would never reach networkidle due to
-    // persistent connections, streaming data, or continuous polling.
-    await page.goto(url);
+    return;
   }
+
+  await loadDocument(page, url, { waitForNetworkIdle: profile.waitForNetworkIdle });
 }
 
 /**
  * Reloads the current page, mirroring navigateToPage's wait strategy. Two callers, one mechanism. An accepted embedded-player consent gate only creates the player
  * iframe on a fresh load, so a reload re-renders the page with consent persisted and the video resolves on the second pass. A guide that never rendered is the
- * other: the reload is what gives channel selection a fresh surface to read.
+ * other: the reload is what gives channel selection a fresh surface to read. A strategy that owns its route re-enters at the page's current URL rather than
+ * reloading it, because a reload requests that URL directly - the load the strategy exists to avoid.
  * @param page - The Puppeteer page object.
- * @param profile - The site profile, whose waitForNetworkIdle flag selects the reload wait condition.
+ * @param profile - The site profile, whose strategy and waitForNetworkIdle flag select the reload route and its wait condition.
  */
 async function reloadPage(page: Page, profile: ResolvedSiteProfile): Promise<void> {
 
-  const waitUntil = profile.waitForNetworkIdle ? "networkidle2" : "load";
+  const navigate = getStrategyNavigator(profile);
 
-  try {
+  if(navigate) {
 
-    await page.reload({ timeout: CONFIG.streaming.navigationTimeout, waitUntil });
-  } catch(error) {
+    await navigate(page, page.url());
 
-    // A reload timeout is often non-fatal - the player may already be present even if some background requests never settled. Mirror navigateToPage: warn and
-    // continue on timeout, propagate other errors.
-    if(error && ((error as Error).name === "TimeoutError")) {
-
-      LOG.warn("Page reload timed out after %sms.", CONFIG.streaming.navigationTimeout);
-    } else {
-
-      throw error;
-    }
+    return;
   }
+
+  await reloadDocument(page, { waitForNetworkIdle: profile.waitForNetworkIdle });
 }
 
 /**
@@ -514,9 +493,10 @@ async function reloadPage(page: Page, profile: ResolvedSiteProfile): Promise<voi
  * 5. Fall back to the main page if no iframe contains a video
  * @param page - The Puppeteer page object.
  * @param profile - The site profile indicating whether iframe handling is needed.
+ * @param clock - The clock the search's cadence and ceiling read; defaults to the system clock.
  * @returns The frame or page containing the video element.
  */
-export async function findVideoContext(page: Page, profile: ResolvedSiteProfile): Promise<Frame | Page> {
+export async function findVideoContext(page: Page, profile: ResolvedSiteProfile, clock: Clock = systemClock): Promise<Frame | Page> {
 
   // For sites that don't use iframes (most common case), the video is directly in the main page document. Skip the iframe search.
   if(!profile.needsIframeHandling) {
@@ -527,15 +507,14 @@ export async function findVideoContext(page: Page, profile: ResolvedSiteProfile)
   // Wait for an iframe element to appear in the page DOM. This ensures the site has created the embedded player container.
   await page.waitForSelector("iframe", { timeout: CONFIG.streaming.videoTimeout });
 
-  // Poll for a video element to appear in any iframe. Complex embedded players (Brightcove, JW Player, etc.) load additional resources and scripts after the
-  // iframe element appears, so the video may not be immediately available. We retry the search with brief pauses, using the configured delay as the overall
-  // timeout ceiling. Polling with early exit avoids waiting the full delay when the video appears quickly.
-  const deadline = Date.now() + CONFIG.playback.iframeInitDelay;
-
-  let iframeSearchComplete = false;
+  /* Poll for a video element to appear in any iframe, through the project's poll policy: one scan of every frame is the read, the 200 ms cadence spaces the scans,
+   * and the configured iframe delay is the ceiling. Complex embedded players (Brightcove, JW Player, etc.) load additional resources and scripts after the iframe
+   * element appears, so the video may not be immediately available; a scan that finds one ends the poll straight away rather than waiting the full budget out. A
+   * scan that meets a terminated stream answers "aborted", which ends the poll exactly as a hit does and falls through to the main-page fallback below.
+   */
   let lastFrameCount = 0;
 
-  while(!iframeSearchComplete && (Date.now() < deadline)) {
+  const search = await pollUntil({ cadenceMs: 200, ceilingMs: CONFIG.playback.iframeInitDelay, clock, read: async (): Promise<Frame | "aborted" | null> => {
 
     const pageFrames = page.frames();
 
@@ -556,7 +535,7 @@ export async function findVideoContext(page: Page, profile: ResolvedSiteProfile)
         const hasVideo = await evaluateWithAbort(frame, (): boolean => {
 
           return !!document.querySelector("video");
-        }, undefined, 2000);
+        }, undefined, { clock, timeoutMs: 2000 });
 
         if(hasVideo) {
 
@@ -564,24 +543,22 @@ export async function findVideoContext(page: Page, profile: ResolvedSiteProfile)
         }
       } catch(error) {
 
-        // AbortError means stream was terminated - stop polling immediately.
+        // AbortError means stream was terminated - stop scanning immediately.
         if(error instanceof EvaluateAbortError) {
 
-          iframeSearchComplete = true;
-
-          break;
+          return "aborted";
         }
 
         // Other errors (cross-origin, detached frame) - skip this frame and continue searching.
       }
     }
 
-    // Brief pause before re-checking. 200ms intervals provide responsive polling without excessive CDP overhead.
-    if(!iframeSearchComplete && (Date.now() < deadline)) {
+    return null;
+  }, until: (found): boolean => found !== null });
 
-      // eslint-disable-next-line no-await-in-loop
-      await delay(200);
-    }
+  if((search.value !== null) && (search.value !== "aborted")) {
+
+    return search.value;
   }
 
   // No iframe contained a video, so fall back to the main page. This is a designed branch of the function's contract, not an error: it is reached transiently and
@@ -897,12 +874,14 @@ export async function lockVolumeProperties(context: Frame | Page, selectorType: 
  * @param context - The frame or page containing the video element.
  * @param profile - The site profile indicating fullscreen method.
  * @param selectorType - The video selector type for finding the element.
+ * @param clock - The clock the settle pause after a button click runs on.
  */
 export async function triggerFullscreen(
   page: Page,
   context: Frame | Page,
   profile: ResolvedSiteProfile,
-  selectorType: VideoSelectorType
+  selectorType: VideoSelectorType,
+  clock: Clock
 ): Promise<void> {
 
   // Try clicking a fullscreen button if configured. This fires before keyboard and API methods because clicking the site's own fullscreen control is the most
@@ -919,7 +898,7 @@ export async function triggerFullscreen(
         await page.click(profile.fullscreenSelector);
 
         // Brief delay for the site's fullscreen animation to complete before subsequent checks.
-        await delay(300);
+        await clock.delay(300);
       }
     } catch(error) {
 
@@ -1052,8 +1031,9 @@ async function isNativeFullscreenActive(context: Frame | Page): Promise<boolean>
  * @param page - The Puppeteer page object.
  * @param context - The frame or page containing the video element.
  * @param selectorType - The video selector type for finding the element.
+ * @param clock - The clock the pause after the click runs on.
  */
-async function clickVideoForActivation(page: Page, context: Frame | Page, selectorType: VideoSelectorType): Promise<void> {
+async function clickVideoForActivation(page: Page, context: Frame | Page, selectorType: VideoSelectorType, clock: Clock): Promise<void> {
 
   try {
 
@@ -1074,7 +1054,7 @@ async function clickVideoForActivation(page: Page, context: Frame | Page, select
     if(coords) {
 
       await page.mouse.click(coords.x, coords.y);
-      await delay(100);
+      await clock.delay(100);
     }
   } catch {
 
@@ -1210,7 +1190,7 @@ export async function ensureFullscreen(
   // CSS-only path (monitor recovery or profiles without native fullscreen). No serialization needed - CSS styling works fine from background tabs.
   if(!useNativeFullscreen) {
 
-    return runFullscreenSequence(page, context, profile, selectorType, false);
+    return runFullscreenSequence(page, context, profile, selectorType, false, deps.clock);
   }
 
   // Native fullscreen path. Serialize through the fullscreen queue so only one tab at a time goes through select -> requestFullscreen -> verify. Without this,
@@ -1221,8 +1201,9 @@ export async function ensureFullscreen(
 
     try {
 
-      await waitWithTimeout(deps.withTabSelected(page, async (): Promise<void> => runFullscreenSequence(page, context, profile, selectorType, true),
-        { ceilingMs: FULLSCREEN_SELECTION_CEILING_MS }), FULLSCREEN_QUEUE_TIMEOUT, new Error("Fullscreen queue entry timed out."));
+      await waitWithTimeout(deps.withTabSelected(page, async (): Promise<void> => runFullscreenSequence(page, context, profile, selectorType, true, deps.clock),
+        { ceilingMs: FULLSCREEN_SELECTION_CEILING_MS }), FULLSCREEN_QUEUE_TIMEOUT,
+      { clock: deps.clock, reason: new Error("Fullscreen queue entry timed out.") });
     } catch(error) {
 
       LOG.warn("Fullscreen queue entry failed: %s.", formatError(error));
@@ -1249,13 +1230,15 @@ export async function ensureFullscreen(
  * @param selectorType - The video selector type for finding the element.
  * @param useNativeFullscreen - Whether to use the native Fullscreen API (click-for-activation, API verification). The caller selects the tab for the whole
  *   sequence when this is set, because Chrome grants the API to the selected tab.
+ * @param clock - The clock every settle and retry pause in the ladder runs on.
  */
 async function runFullscreenSequence(
   page: Page,
   context: Frame | Page,
   profile: ResolvedSiteProfile,
   selectorType: VideoSelectorType,
-  useNativeFullscreen: boolean
+  useNativeFullscreen: boolean,
+  clock: Clock
 ): Promise<void> {
 
   // Configuration for retry behavior. These values are tuned for typical page load timing.
@@ -1271,7 +1254,7 @@ async function runFullscreenSequence(
     if((attempt > 1) && useNativeFullscreen) {
 
       // eslint-disable-next-line no-await-in-loop
-      await clickVideoForActivation(page, context, selectorType);
+      await clickVideoForActivation(page, context, selectorType, clock);
     }
 
     // Apply CSS styles to make the video fill the viewport.
@@ -1280,11 +1263,11 @@ async function runFullscreenSequence(
 
     // Trigger native fullscreen using the site's preferred method (keyboard shortcut or JavaScript API).
     // eslint-disable-next-line no-await-in-loop
-    await triggerFullscreen(page, context, profile, selectorType);
+    await triggerFullscreen(page, context, profile, selectorType, clock);
 
     // Wait a moment for fullscreen to take effect. The browser needs time to process the style changes and any fullscreen API calls.
     // eslint-disable-next-line no-await-in-loop
-    await delay(verifyDelay);
+    await clock.delay(verifyDelay);
 
     // Verify that fullscreen succeeded by checking video dimensions.
     // eslint-disable-next-line no-await-in-loop
@@ -1306,7 +1289,7 @@ async function runFullscreenSequence(
             LOG.debug("browser:video", "Native fullscreen not active (attempt %s/%s). Retrying with user activation.", attempt, maxSimpleRetries);
 
             // eslint-disable-next-line no-await-in-loop
-            await delay(retryDelay);
+            await clock.delay(retryDelay);
           }
 
           continue;
@@ -1327,7 +1310,7 @@ async function runFullscreenSequence(
       LOG.debug("browser:video", "Fullscreen verification failed (attempt %s/%s). Retrying after %sms.", attempt, maxSimpleRetries, retryDelay);
 
       // eslint-disable-next-line no-await-in-loop
-      await delay(retryDelay);
+      await clock.delay(retryDelay);
     }
   }
 
@@ -1337,7 +1320,7 @@ async function runFullscreenSequence(
   // Click for user activation before the aggressive attempt when the native Fullscreen API is in use.
   if(useNativeFullscreen) {
 
-    await clickVideoForActivation(page, context, selectorType);
+    await clickVideoForActivation(page, context, selectorType, clock);
   }
 
   await applyAggressiveFullscreen(context, selectorType);
@@ -1345,11 +1328,11 @@ async function runFullscreenSequence(
   // Re-trigger the Fullscreen API after aggressive styling - the aggressive CSS ensures the video fills the viewport, and the API call hides site UI.
   if(useNativeFullscreen) {
 
-    await triggerFullscreen(page, context, profile, selectorType);
+    await triggerFullscreen(page, context, profile, selectorType, clock);
   }
 
   // Final verification after aggressive techniques.
-  await delay(verifyDelay);
+  await clock.delay(verifyDelay);
 
   const finalCheck = await verifyFullscreen(context, selectorType);
 
@@ -1381,13 +1364,16 @@ async function runFullscreenSequence(
  */
 interface EnsurePlaybackOptions {
 
+  /** The clock the source-reload wait runs on, and the one the fullscreen ladder below it is handed. Defaults to the system clock. */
+  readonly clock?: Clock;
+
   /** The escalation level (1-2). Level 1 is basic play/unmute recovery. Level 2 adds video source reload. Defaults to 1. */
-  recoveryLevel?: number;
+  readonly recoveryLevel?: number;
 
   /** When true, skips native Fullscreen API actions (click-for-activation, API verification, API retries) during the fullscreen step. CSS styling and keyboard
    * shortcuts still run. Used by the monitor during recovery where user activation is unavailable and click-for-activation can toggle playback state. The
    * monitor's own lightweight fullscreen maintenance loop handles ongoing CSS reapplication independently. Defaults to false. */
-  skipNativeFullscreen?: boolean;
+  readonly skipNativeFullscreen?: boolean;
 }
 
 /**
@@ -1423,6 +1409,7 @@ export async function ensurePlayback(
   options?: EnsurePlaybackOptions
 ): Promise<void> {
 
+  const clock = options?.clock ?? systemClock;
   const selectorType = buildVideoSelectorType(profile);
   const level = options?.recoveryLevel ?? 1;
 
@@ -1435,7 +1422,7 @@ export async function ensurePlayback(
       await reloadVideoSource(context, selectorType);
 
       // Wait for the source to reload. The player needs time to parse the manifest, establish connections, and buffer initial data.
-      await delay(CONFIG.playback.sourceReloadDelay);
+      await clock.delay(CONFIG.playback.sourceReloadDelay);
     } catch(_error) {
 
       // Source reload errors are non-fatal - we continue with basic recovery actions.
@@ -1454,7 +1441,11 @@ export async function ensurePlayback(
 
   // Ensure fullscreen with verification and retry. This applies CSS styling, triggers native fullscreen, verifies the video fills the viewport, and retries with
   // escalating techniques if needed.
-  await ensureFullscreen(page, context, profile, selectorType, options?.skipNativeFullscreen);
+  /* The default path hands the ladder the shared collaborator const and allocates nothing; a call that carries its own clock composes one deps object over
+   * that const for this call alone, so the module default stays the object every other tune reads.
+   */
+  await ensureFullscreen(page, context, profile, selectorType, options?.skipNativeFullscreen,
+    options?.clock ? { ...defaultFullscreenDeps, clock: options.clock } : defaultFullscreenDeps);
 
   // Apply volume locking if the profile requires it. This prevents the site from muting the video after we've set volume.
   if(profile.lockVolumeProperties) {
@@ -1469,17 +1460,22 @@ export async function ensurePlayback(
  * allocated once at load, because initializePlayback is on the streaming hot path (every stream start and every recovery tune) and a per-call deps object would
  * allocate on each tune. It is cycle-safe: none of channelSelection/consent/blockedPage import video.ts, and every member is a hoisted function declaration, so
  * the const's references resolve at load with no temporal-dead-zone hazard. markDomainAuthRequired stays a direct import - it is not a substituted collaborator
- * (the test asserts the real domain-auth state). This is the collaborator-injection form of the Clock port (utils/clock.ts).
+ * (the test asserts the real domain-auth state). This is the collaborator-injection form of the library's Clock port.
  */
 export interface VideoTuneDeps {
 
   readonly classifyBlockedPage: typeof classifyBlockedPage;
+
+  /* The clock the video-context search's cadence, the overlay polls this tune launches, and channel selection's scroll poll all read. Production wires the system
+   * clock; a test wires a virtual clock and drives the whole tune timeline from one advance rather than from a timer mock per module.
+   */
+  readonly clock: Clock;
   readonly getProvidersForDomain: typeof getProvidersForDomain;
   readonly selectChannel: typeof selectChannel;
   readonly startOverlayHandling: typeof startOverlayHandling;
 }
 
-const defaultVideoTuneDeps: VideoTuneDeps = { classifyBlockedPage, getProvidersForDomain, selectChannel, startOverlayHandling };
+const defaultVideoTuneDeps: VideoTuneDeps = { classifyBlockedPage, clock: systemClock, getProvidersForDomain, selectChannel, startOverlayHandling };
 
 /**
  * Diagnoses a failed tune by classifying the still-open page, which holds the evidence of why the tune failed. A confirmed provider authentication wall marks the
@@ -1583,7 +1579,7 @@ async function withOverlayGuard<T>(page: Page, profile: ResolvedSiteProfile, pha
 
   const controller = new AbortController();
 
-  void deps.startOverlayHandling(page, profile, { phase, signal: controller.signal });
+  void deps.startOverlayHandling(page, profile, { clock: deps.clock, phase, signal: controller.signal });
 
   try {
 
@@ -1613,7 +1609,7 @@ async function withOverlayGuard<T>(page: Page, profile: ResolvedSiteProfile, pha
 export async function initializePlayback(page: Page, profile: ResolvedSiteProfile, options: InitializePlaybackOptions = {},
   deps: VideoTuneDeps = defaultVideoTuneDeps): Promise<TuneResult> {
 
-  const elapsed = startTimer();
+  const elapsed = startTimer(deps.clock);
   const { persistResolution, requestedUrl, skipChannelSelection = false } = options;
 
   // Mute any existing video elements to suppress wrong-channel audio during tuning. On SPA-based providers (Hulu, Fox, USA Network, etc.), a default livestream
@@ -1633,7 +1629,7 @@ export async function initializePlayback(page: Page, profile: ResolvedSiteProfil
 
     if(!skipChannelSelection) {
 
-      let channelResult = await deps.selectChannel(page, profile, { persistResolution });
+      let channelResult = await deps.selectChannel(page, profile, { clock: deps.clock, persistResolution });
 
       if(!channelResult.success) {
 
@@ -1656,7 +1652,7 @@ export async function initializePlayback(page: Page, profile: ResolvedSiteProfil
           // second selection lands. The re-establishment path mutes after its own reload for the same reason.
           await muteExistingVideos(page);
 
-          channelResult = await deps.selectChannel(page, profile, { persistResolution });
+          channelResult = await deps.selectChannel(page, profile, { clock: deps.clock, persistResolution });
         }
 
         if(!channelResult.success) {
@@ -1690,7 +1686,7 @@ export async function initializePlayback(page: Page, profile: ResolvedSiteProfil
 
     try {
 
-      context = await findVideoContext(page, profile);
+      context = await findVideoContext(page, profile, deps.clock);
     } catch(contextError) {
 
       if(requestedUrl !== undefined) {
@@ -1747,6 +1743,7 @@ export async function initializePlayback(page: Page, profile: ResolvedSiteProfil
 
   void deps.startOverlayHandling(page, profile, {
 
+    clock: deps.clock,
     onEmbedGateAccepted: (): void => {
 
       embedGate.resolve("gate");
@@ -1779,7 +1776,7 @@ export async function initializePlayback(page: Page, profile: ResolvedSiteProfil
       // the detect-and-guide path below.
       context = await withOverlayGuard(page, profile, "postGateReload", deps, async (): Promise<Frame | Page> => {
 
-        const reloadedContext = await findVideoContext(page, profile);
+        const reloadedContext = await findVideoContext(page, profile, deps.clock);
 
         await waitForVideoReady(reloadedContext, profile);
 
@@ -1807,7 +1804,7 @@ export async function initializePlayback(page: Page, profile: ResolvedSiteProfil
   LOG.debug("timing:tune", "Video ready. (+%sms)", elapsed());
 
   // Ensure playback is started, unmuted, and fullscreen. This applies CSS styling, triggers native fullscreen, and enforces volume settings.
-  await ensurePlayback(page, context, profile);
+  await ensurePlayback(page, context, profile, { clock: deps.clock });
 
   LOG.debug("timing:tune", "Playback ensured. (+%sms)", elapsed());
 
@@ -1836,11 +1833,12 @@ export async function initializePlayback(page: Page, profile: ResolvedSiteProfil
  * @param page - The Puppeteer page object.
  * @param url - The URL to navigate to.
  * @param profile - The site profile containing all behavior flags.
+ * @param clock - The clock this tune's timing lines and every collaborator it composes run on; defaults to the system clock.
  * @returns The video context (frame or page) for subsequent monitoring, and a directTune flag when the channel was tuned via API interception.
  */
-export async function tuneToChannel(page: Page, url: string, profile: ResolvedSiteProfile): Promise<TuneResult> {
+export async function tuneToChannel(page: Page, url: string, profile: ResolvedSiteProfile, clock: Clock = systemClock): Promise<TuneResult> {
 
-  const tuneElapsed = startTimer();
+  const tuneElapsed = startTimer(clock);
 
   // Check for a direct watch URL. If available, navigate directly to it and skip channel selection, avoiding guide page navigation entirely. On failure, hand the
   // cause to the cache coordinator - which keeps the entry when the failure describes a dead page rather than a bad URL - and fall through to the normal
@@ -1857,7 +1855,10 @@ export async function tuneToChannel(page: Page, url: string, profile: ResolvedSi
 
       LOG.debug("timing:tune", "Direct URL navigation complete. (+%sms)", tuneElapsed());
 
-      const result = await initializePlayback(page, profile, { skipChannelSelection: true });
+      /* The deps object is composed per tune only here - on a level-3 recovery, or under a test - because this is the one path that can be handed a clock other
+       * than the system's. The module default stays the shared const every other tune reads.
+       */
+      const result = await initializePlayback(page, profile, { skipChannelSelection: true }, { ...defaultVideoTuneDeps, clock });
 
       LOG.debug("timing:tune", "Tune complete (cached). Total: %sms.", tuneElapsed());
 
@@ -1878,7 +1879,7 @@ export async function tuneToChannel(page: Page, url: string, profile: ResolvedSi
   // Perform all post-navigation initialization: channel selection, video context resolution, click to play, video readiness, and fullscreen. The guide URL is carried
   // along so a failed tune can diagnose the blocked page; the cached-direct attempt above deliberately does not pass it, since its failure is swallowed and retried
   // through this authoritative path.
-  const result = await initializePlayback(page, profile, { requestedUrl: url });
+  const result = await initializePlayback(page, profile, { requestedUrl: url }, { ...defaultVideoTuneDeps, clock });
 
   LOG.debug("timing:tune", "Tune complete. Total: %sms.", tuneElapsed());
 

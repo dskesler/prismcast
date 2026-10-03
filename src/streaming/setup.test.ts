@@ -10,11 +10,12 @@
  */
 import { CaptureDeadlineError, CaptureTurnTimeoutError } from "./captureLock.ts";
 import { StreamSetupError, classifyCaptureProbeFailure, generateStreamId, validateStreamUrl, verifyManifestSelection, withSignInGuidance } from "./setup.ts";
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
+import { afterEach, beforeEach, describe, test } from "node:test";
 import { loadHealthState, markDomainAuth, markDomainAuthRequired } from "../config/health.ts";
 import { mkdtemp, rm } from "node:fs/promises";
 import type { ManifestInterceptionResult } from "../browser/manifestInterceptor.ts";
 import type { Nullable } from "../types/index.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { closePuppeteerStreamWssOnIdle } from "../testing.helpers.ts";
 import { initializeDataDir } from "../config/paths.ts";
@@ -217,16 +218,14 @@ describe("withSignInGuidance", () => {
     initializeDataDir(dir);
     await initializeUserChannels();
 
-    // Reload health state from the fresh (empty) data dir so domain auth residue from other test files cannot leak into the guidance decision.
-    await loadHealthState();
-
-    // We mock Date for deterministic timestamps and setTimeout to suppress the 2-second debounced health flush timer the mark calls below schedule.
-    mock.timers.enable({ apis: [ "Date", "setTimeout" ], now: 1700000000000 });
+    /* Reload health state from the fresh (empty) data dir so domain auth residue from other test files cannot leak into the guidance decision. The load takes a
+     * clock, which is what stamps the marks below at a fixed instant and puts their debounced flush on virtual time rather than a two-second platform timer.
+     */
+    await loadHealthState(new TestClock(1700000000000));
   });
 
   afterEach(async () => {
 
-    mock.timers.reset();
     await rm(dir, { force: true, recursive: true });
   });
 

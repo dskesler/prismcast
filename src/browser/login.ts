@@ -4,7 +4,9 @@
  */
 import type { Browser, Page } from "puppeteer-core";
 import { LOG, formatError } from "../utils/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* Login mode allows users to authenticate with TV providers directly from the PrismCast web UI. When login mode is active:
  *
@@ -40,33 +42,47 @@ let loginUrl: Nullable<string> = null;
 // Timestamp when login mode started. Used for status reporting and timeout calculation.
 let loginStartTime: Nullable<number> = null;
 
-// Timeout handle for auto-ending login mode after 15 minutes.
-let loginTimeoutHandle: Nullable<ReturnType<typeof setTimeout>> = null;
+// The clock's one-shot handle for auto-ending login mode after 15 minutes. Disposing it cancels the countdown; a normal end and a crash end both dispose it.
+let loginTimeoutHandle: Nullable<Disposable> = null;
 
 // Login timeout duration (15 minutes).
 const LOGIN_TIMEOUT_MS = 15 * 60 * 1000;
 
-// Browser accessor functions injected by browser/index.ts via setBrowserAccessors(). This avoids a circular dependency - login.ts needs getBrowserInstance and the
+// Login's injected dependency set, supplied by browser/index.ts via setLoginDeps(). This avoids a circular dependency - login.ts needs getBrowserInstance and the
 // window-visibility sync from index.ts, which imports login functions. The setter/getter pattern matches setChromeUserAgent in chromeFetch.ts and
 // registerProviderModuleProfile in sites.ts.
-interface BrowserAccessors {
+interface LoginDeps {
 
-  getBrowserInstance: () => Nullable<Browser>;
-  syncWindowVisibility: (page?: Page) => Promise<void>;
+  // The clock the login start instant and the fifteen-minute timeout read. Defaults to the system clock, so a caller that holds no clock supplies nothing; a test
+  // injects a virtual clock and advances it to fire the timeout.
+  readonly clock?: Clock;
+
+  readonly getBrowserInstance: () => Nullable<Browser>;
+  readonly syncWindowVisibility: (page?: Page) => Promise<void>;
 }
 
-let browserAccessors: Nullable<BrowserAccessors> = null;
+let loginDeps: Nullable<LoginDeps> = null;
 
 /**
- * Registers the browser accessor functions for use by login mode. Called once by browser/index.ts at module evaluation time after the accessor functions are defined.
- * @param accessors - The browser accessor functions.
+ * Registers login's dependency set. Called once by browser/index.ts at module evaluation time after the accessor functions are defined.
+ * @param deps - Login's injected dependencies.
  */
-export function setBrowserAccessors(accessors: BrowserAccessors): void {
+export function setLoginDeps(deps: LoginDeps): void {
 
-  browserAccessors = accessors;
+  loginDeps = deps;
 }
 
-// Login-end observer injected by the composition root (app.ts) via setLoginModeEndObserver(). Follows the same injected-accessor pattern as setBrowserAccessors
+/**
+ * Reads the clock login's timers and instants run on. The one place the system-clock default is applied, so every time read in this module goes through the same
+ * resolution whether or not the injected port carries a clock.
+ * @returns The injected clock, or the system clock when none was supplied.
+ */
+function loginClock(): Clock {
+
+  return loginDeps?.clock ?? systemClock;
+}
+
+// Login-end observer injected by the composition root (app.ts) via setLoginModeEndObserver(). Follows the same injected-accessor pattern as setLoginDeps
 // above so this module stays free of discovery knowledge. Null until wired.
 let loginModeEndObserver: Nullable<(url: string) => void> = null;
 
@@ -126,7 +142,7 @@ export async function startLoginMode(url: string): Promise<{ error?: string; suc
   }
 
   // Ensure browser is available.
-  const browser = browserAccessors?.getBrowserInstance() ?? null;
+  const browser = loginDeps?.getBrowserInstance() ?? null;
 
   if(!browser?.connected) {
 
@@ -169,16 +185,16 @@ export async function startLoginMode(url: string): Promise<{ error?: string; suc
     // Set login state.
     loginModeActive = true;
     loginUrl = url;
-    loginStartTime = Date.now();
+    loginStartTime = loginClock().now();
 
     /* Bring the window on screen through the policy rather than by issuing the CDP command here, and do it after the state above is set so the policy reads this
      * session as active. Routing through the one executor is what keeps a concurrent pass from deciding "minimize" and landing after this one: a pass already in
      * flight either lands first and is corrected by this one, or re-reads the flag inside its own loop and decides visible.
      */
-    await browserAccessors?.syncWindowVisibility(page);
+    await loginDeps?.syncWindowVisibility(page);
 
     // Set up the 15-minute timeout.
-    loginTimeoutHandle = setTimeout(() => {
+    loginTimeoutHandle = loginClock().schedule(() => {
 
       LOG.warn("Login mode timed out after 15 minutes. Ending login mode.");
 
@@ -225,10 +241,10 @@ export async function endLoginMode(): Promise<void> {
   // invocation wins the wasActive latch must still see the URL that resetLoginState() nulls out.
   const observedUrl = loginUrl;
 
-  // Clear the timeout if it hasn't fired yet.
+  // Dispose the timeout if it hasn't fired yet.
   if(loginTimeoutHandle) {
 
-    clearTimeout(loginTimeoutHandle);
+    loginTimeoutHandle[Symbol.dispose]();
     loginTimeoutHandle = null;
   }
 
@@ -252,9 +268,9 @@ export async function endLoginMode(): Promise<void> {
   // Settle the browser window against the policy now that this session's claim on it is gone.
   if(wasActive) {
 
-    if(browserAccessors?.getBrowserInstance()?.connected) {
+    if(loginDeps?.getBrowserInstance()?.connected) {
 
-      await browserAccessors.syncWindowVisibility();
+      await loginDeps.syncWindowVisibility();
     }
 
     LOG.info("Login mode ended.");
@@ -325,7 +341,7 @@ export function clearLoginState(): boolean {
 
   if(loginTimeoutHandle) {
 
-    clearTimeout(loginTimeoutHandle);
+    loginTimeoutHandle[Symbol.dispose]();
     loginTimeoutHandle = null;
   }
 

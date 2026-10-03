@@ -9,11 +9,11 @@
  * binding updated.
  */
 import { bootApp, createIntegrationContext, initializePersistence, readPersistedJson } from "../../helpers/integration.helpers.ts";
-import { clearChannelOverrides, getAllChannels, mutateChannels } from "../../../src/config/userChannels.ts";
+import { clearChannelOverrides, getAllChannels, mutateChannels, mutateServiceSelections, setServiceSelection } from "../../../src/config/userChannels.ts";
 import { describe, test } from "node:test";
-import { getServiceSelections, mutateServiceSelections, setServiceSelection } from "../../../src/config/services.ts";
 import { PREDEFINED_CHANNELS } from "../../../src/channels/index.ts";
 import assert from "node:assert/strict";
+import { getServiceSelections } from "../../../src/config/services.ts";
 
 describe("variant resolution guarantees", () => {
 

@@ -5,13 +5,13 @@
  * safely, and the lapse, where the confirmation never arrives and the function warns and returns rather than holding the page open for a browser that has
  * stopped answering. The stub capture is a real PassThrough carrying the two capture controls, so the destroy under test is a genuine one.
  */
+import { TestClock, settle } from "homebridge-plugin-utils/testing";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import type { CaptureStream } from "../browser/tabCapture.ts";
 import type { LogEntry } from "../utils/logEmitter.ts";
 import { PassThrough } from "node:stream";
 import assert from "node:assert/strict";
 import { closePuppeteerStreamWssOnIdle } from "../testing.helpers.ts";
-import { makeFakeClock } from "../utils/clock.helpers.ts";
 import { retireRawStream } from "./setup.ts";
 import { subscribeToLogs } from "../utils/logEmitter.ts";
 
@@ -48,13 +48,17 @@ describe("retireRawStream", () => {
 
     // The destroy is what sends the stop request, and the confirmation is what makes the page safe to close afterwards. Neither is optional, and a confirmation
     // that arrives normally is not an event worth logging.
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
     const stream = makeStubCapture(Promise.resolve());
 
     await retireRawStream(stream, clock);
 
     assert.equal(stream.destroyed, true, "the capture was destroyed, which is what sends the stop request");
     assert.deepEqual(captured.filter((entry) => entry.level === "warn"), [], "an ordinary retire says nothing");
+
+    await settle();
+
+    assert.equal(clock.pending, 0, "the bound was cancelled once the confirmation arrived");
   });
 
   test("warns and returns when the confirmation never arrives, rather than holding the page open", async () => {
@@ -65,16 +69,20 @@ describe("retireRawStream", () => {
      */
     // eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- Standard pattern for signal promises.
     const { promise: never } = Promise.withResolvers<void>();
-    const { clock } = makeFakeClock({
-
-      waitWithTimeout: async <T>(_promise: Promise<T>, timeoutMs: number, timeoutError?: Error): Promise<T> => {
-
-        throw timeoutError ?? new Error("timed out after " + String(timeoutMs) + "ms.");
-      }
-    });
+    const clock = new TestClock();
     const stream = makeStubCapture(never);
+    const retiring = retireRawStream(stream, clock);
 
-    await assert.doesNotReject(() => retireRawStream(stream, clock), "a lapsed confirmation is not a failure the caller has to handle");
+    // The expectation is attached before the clock is driven, so whatever the lapse produces is observed rather than left unhandled.
+    const settled = assert.doesNotReject(() => retiring, "a lapsed confirmation is not a failure the caller has to handle");
+
+    await settle();
+
+    assert.equal(clock.nextDeadline, 3000, "the bound is armed at the stop-confirmation ceiling");
+
+    clock.advance(3000);
+
+    await settled;
 
     assert.equal(stream.destroyed, true, "the capture was still destroyed");
 

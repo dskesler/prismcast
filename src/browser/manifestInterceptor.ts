@@ -4,6 +4,8 @@
  */
 import type { HlsPlaylistObserver, ObservedHlsPlaylist } from "./hlsPlaylistObserver.ts";
 import { LOG, extractPathname, startTimer } from "../utils/index.ts";
+import { TimerRegistry, systemClock } from "homebridge-plugin-utils";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import type { Page } from "puppeteer-core";
 import type { RecognizedHlsPlaylistKind } from "../native/probe.ts";
@@ -40,6 +42,26 @@ export const FINALIZE_SETTLE_DELAY = 1500;
 
 // Default timeout for awaitMatchingManifest. Tune verification is a short-lived check after a click, so the budget is tighter than the native interception path.
 const VERIFICATION_TIMEOUT = 8000;
+
+// The identity of the interception's timeout guard on its registry.
+const INTERCEPT_GUARD_KEY = "guard";
+
+// The identity of the interception's finalize settle delay on its registry.
+const INTERCEPT_FINALIZE_KEY = "finalize";
+
+/**
+ * The injection surface the two interception functions share: the clock their guards and settle delay arm on, and the playlist observer factory they install.
+ * Both default to production - the system clock and the real observer - so the two production call sites pass neither, and both are injectable so the selection
+ * state machine runs without a live browser and on a virtual timeline.
+ */
+export interface ManifestInterceptorOptions {
+
+  // The clock the interception's timeout guard and finalize settle delay arm on. Defaults to the system clock; a test injects a virtual clock and advances it.
+  readonly clock?: Clock;
+
+  // The HLS playlist observer factory. Defaults to the production observer; a test injects a double so no browser is needed.
+  readonly observeFactory?: typeof observeHlsPlaylists;
+}
 
 /**
  * A master playlist observation reduced to the facts selection needs: the declared child playlist URLs (for membership judgment), the wire-arrival ordinal, and
@@ -304,13 +326,14 @@ interface SettleOptions {
  * @param page - The puppeteer page to monitor.
  * @param timeout - Maximum time in milliseconds to wait for a manifest. Required: every caller sizes its interception window consciously to outlive the phases it
  *   observes, so no production caller relies on a shared default. Acts as a safety net if finalize() is never called.
- * @param observeFactory - The HLS playlist observer factory (default observeHlsPlaylists); injectable so the selection state machine can run without a live browser.
+ * @param options - The clock the guards arm on and the HLS playlist observer factory to install. See ManifestInterceptorOptions.
  * @returns The interceptor handle, or null if the observer could not be installed.
  */
 export async function installManifestInterceptor(page: Page, timeout: number,
-  observeFactory: typeof observeHlsPlaylists = observeHlsPlaylists): Promise<Nullable<ManifestInterceptorHandle>> {
+  options: ManifestInterceptorOptions = {}): Promise<Nullable<ManifestInterceptorHandle>> {
 
-  const elapsed = startTimer();
+  const { clock = systemClock, observeFactory = observeHlsPlaylists } = options;
+  const elapsed = startTimer(clock);
 
   // Track the first and latest observation per kind, plus the epoch fence. Slot updates are guarded by wire-arrival order, not delivery order: the first slot
   // holds the lowest-ordinal arrival and the latest facts hold the highest, so a body fetch that resolves out of order still records arrival truth. Under
@@ -327,6 +350,7 @@ export async function installManifestInterceptor(page: Page, timeout: number,
 
   const observer: Nullable<HlsPlaylistObserver> = await observeFactory(page, {
 
+    clock,
     logCategory: "native:intercept",
     onPlaylist: (playlist: ObservedHlsPlaylist): void => {
 
@@ -392,7 +416,9 @@ export async function installManifestInterceptor(page: Page, timeout: number,
     }
 
     resolved = true;
-    clearTimeout(timer);
+
+    // Retire the whole registry, so whichever of the guard and the finalize delay is still pending is drained and nothing can arm against a settled interception.
+    timers.dispose();
 
     const selection = selectInterceptedManifest(buildState(directTune, epochFree));
 
@@ -413,7 +439,9 @@ export async function installManifestInterceptor(page: Page, timeout: number,
   // Timeout guard. If finalize() is never called (defensive), settle epoch-free after the timeout: the timeout cannot know the tune kind, and the epoch rule must
   // never engage on a path a direct tune can reach, so it resolves with the categorical master-preferred outcome. With the interception budget sized by the
   // caller to outlive the tune (streaming/setup.ts), this path is last-resort defense rather than a routine finish.
-  const timer = setTimeout((): void => { settle({ directTune: false, epochFree: true, reason: "timed out" }); }, timeout);
+  const timers = new TimerRegistry({ clock });
+
+  timers.setTimeout(INTERCEPT_GUARD_KEY, (): void => { settle({ directTune: false, epochFree: true, reason: "timed out" }); }, timeout);
 
   // Finalize function exposed on the returned handle. Called by the stream setup code after channel selection is complete. The resolution strategy depends on
   // two factors: whether a qualifying manifest has already been captured, and whether the tune is direct or guide-based.
@@ -435,7 +463,8 @@ export async function installManifestInterceptor(page: Page, timeout: number,
       settle({ directTune: true, reason: "finalized" });
     } else {
 
-      setTimeout((): void => { settle({ directTune, reason: "finalized" }); }, FINALIZE_SETTLE_DELAY);
+      // The registry holds this delay, so settlement on any path drains it and no timer outlives the interception.
+      timers.setTimeout(INTERCEPT_FINALIZE_KEY, (): void => { settle({ directTune, reason: "finalized" }); }, FINALIZE_SETTLE_DELAY);
     }
   };
 
@@ -464,7 +493,9 @@ export async function installManifestInterceptor(page: Page, timeout: number,
     }
 
     resolved = true;
-    clearTimeout(timer);
+
+    // The dispose path settles without going through settle(), so it retires the registry itself.
+    timers.dispose();
 
     LOG.debug("native:intercept", "Interception disposed in %sms with %s capture(s) and no resolution selected.", elapsed(), manifestCount);
     observer.dispose();
@@ -485,13 +516,14 @@ export async function installManifestInterceptor(page: Page, timeout: number,
  * @param page - The puppeteer page to monitor.
  * @param predicate - Test applied to each verified master manifest URL. Return true to accept the URL and resolve.
  * @param timeout - Maximum time in milliseconds to wait for a matching manifest.
- * @param observeFactory - The HLS playlist observer factory (default observeHlsPlaylists); injectable so the verification state machine can run without a live browser.
+ * @param options - The clock the guard arms on and the HLS playlist observer factory to install. See ManifestInterceptorOptions.
  * @returns The matching URL, or null on timeout.
  */
 export async function awaitMatchingManifest(page: Page, predicate: (url: string) => boolean,
-  timeout: number = VERIFICATION_TIMEOUT, observeFactory: typeof observeHlsPlaylists = observeHlsPlaylists): Promise<Nullable<string>> {
+  timeout: number = VERIFICATION_TIMEOUT, options: ManifestInterceptorOptions = {}): Promise<Nullable<string>> {
 
-  const elapsed = startTimer();
+  const { clock = systemClock, observeFactory = observeHlsPlaylists } = options;
+  const elapsed = startTimer(clock);
   let resolved = false;
 
   const { promise, resolve } = Promise.withResolvers<Nullable<string>>();
@@ -501,6 +533,7 @@ export async function awaitMatchingManifest(page: Page, predicate: (url: string)
   // the observer keeps a single canonical contract (forward all recognized HLS playlists with their kind).
   const observer: Nullable<HlsPlaylistObserver> = await observeFactory(page, {
 
+    clock,
     logCategory: "native:intercept",
     onPlaylist: (playlist: ObservedHlsPlaylist): void => {
 
@@ -522,7 +555,7 @@ export async function awaitMatchingManifest(page: Page, predicate: (url: string)
 
         LOG.debug("native:intercept", "Matching manifest found in %sms: %s.", elapsed(), playlist.url.slice(0, 120));
         observer?.dispose();
-        clearTimeout(timer);
+        timer[Symbol.dispose]();
         resolve(playlist.url);
       } else {
 
@@ -536,7 +569,7 @@ export async function awaitMatchingManifest(page: Page, predicate: (url: string)
     return null;
   }
 
-  const timer = setTimeout((): void => {
+  const timer = clock.schedule((): void => {
 
     if(resolved) {
 

@@ -107,15 +107,15 @@ describe("makeRegistryEntry", () => {
     assert.deepEqual(entry.info, { lastPlaylistRequest: 0, storeKey: "test-channel" });
   });
 
-  test("startTime is a Date instance close to now", () => {
+  test("startTime is an epoch millisecond instant close to now", () => {
 
-    // The factory uses new Date() as the default. Tests can override with a fixed value if they need deterministic timestamps.
+    // The factory reads the wall clock for its default. Tests can override with a fixed value if they need deterministic timestamps.
     const before = Date.now();
     const entry = makeRegistryEntry();
     const after = Date.now();
 
-    assert.ok(entry.startTime instanceof Date);
-    assert.ok((entry.startTime.getTime() >= before) && (entry.startTime.getTime() <= after), "startTime is current");
+    assert.equal(typeof entry.startTime, "number");
+    assert.ok((entry.startTime >= before) && (entry.startTime <= after), "startTime is current");
   });
 
   test("merges overrides shallowly on top of defaults", () => {

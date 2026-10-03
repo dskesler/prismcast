@@ -4,29 +4,31 @@
  */
 import type { Nullable } from "../types/index.ts";
 import { isIP } from "node:net";
+import { systemClock } from "homebridge-plugin-utils";
 
 /**
  * Formats the current date and time as a log timestamp string: `yyyy/mm/dd hh:mm:ss.mmm AM/PM`. Uses 12-hour time with decimalized seconds and AM/PM.
  * Single source of truth for all log timestamp formatting - used by the console wrapper in app.ts, the file logger, the Morgan HTTP request logger, and the SSE log
  * emitter.
+ * @param now - The instant to format, as epoch milliseconds; defaults to the system clock's reading.
  * @returns Formatted timestamp string.
  */
-export function formatTimestamp(): string {
+export function formatTimestamp(now: number = systemClock.now()): string {
 
-  const now = new Date();
-  const yyyy = String(now.getFullYear());
-  const mm = String(now.getMonth() + 1).padStart(2, "0");
-  const dd = String(now.getDate()).padStart(2, "0");
-  let hours = now.getHours();
+  const stamp = new Date(now);
+  const yyyy = String(stamp.getFullYear());
+  const mm = String(stamp.getMonth() + 1).padStart(2, "0");
+  const dd = String(stamp.getDate()).padStart(2, "0");
+  let hours = stamp.getHours();
   const ampm = (hours >= 12) ? "PM" : "AM";
 
   hours = hours % 12;
   hours ||= 12;
 
   const hh = String(hours).padStart(2, "0");
-  const min = String(now.getMinutes()).padStart(2, "0");
-  const ss = String(now.getSeconds()).padStart(2, "0");
-  const ms = String(now.getMilliseconds()).padStart(3, "0");
+  const min = String(stamp.getMinutes()).padStart(2, "0");
+  const ss = String(stamp.getSeconds()).padStart(2, "0");
+  const ms = String(stamp.getMilliseconds()).padStart(3, "0");
 
   return yyyy + "/" + mm + "/" + dd + " " + hh + ":" + min + ":" + ss + "." + ms + " " + ampm;
 }
@@ -66,11 +68,12 @@ export function formatDuration(value: number, unit: "ms" | "s" = "ms"): string {
  * Formats a Unix millisecond timestamp as a human-readable relative time string (e.g., "2 minutes ago", "3 hours ago", "5 days ago"). Used for health indicator
  * tooltips where absolute timestamps would be harder to interpret at a glance.
  * @param timestamp - Unix millisecond timestamp.
+ * @param now - The instant the distance is measured from, as epoch milliseconds; defaults to the system clock's reading.
  * @returns Relative time string.
  */
-export function formatTimeAgo(timestamp: number): string {
+export function formatTimeAgo(timestamp: number, now: number = systemClock.now()): string {
 
-  const seconds = Math.floor((Date.now() - timestamp) / 1000);
+  const seconds = Math.floor((now - timestamp) / 1000);
 
   if(seconds < 60) {
 
@@ -184,6 +187,25 @@ export function extractPathname(url: string): Nullable<string> {
 
     return null;
   }
+}
+
+/**
+ * Resolves a potentially relative URL against a base URL. Handles both absolute and relative URLs.
+ *
+ * @param url - The URL to resolve (may be relative or absolute).
+ * @param baseUrl - The base URL for resolving relative references.
+ * @returns The resolved absolute URL.
+ */
+export function resolveUrl(url: string, baseUrl: string): string {
+
+  // If the URL is already absolute, return it directly.
+  if(url.startsWith("http://") || url.startsWith("https://")) {
+
+    return url;
+  }
+
+  // Use the URL constructor to resolve relative URLs against the base.
+  return new URL(url, baseUrl).href;
 }
 
 /**

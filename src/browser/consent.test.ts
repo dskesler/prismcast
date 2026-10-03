@@ -4,13 +4,14 @@
  * poll (startOverlayHandling), and the detect-and-guide probe (consentOverlayPresent). The in-page heuristics themselves (the embed-gate selector/keyword matching
  * and the coordinate resolution inside page.evaluate) are asserted against a synthetic happy-dom document in the co-located consent.heuristics.test.ts; here a page
  * stub returns scripted page.evaluate results so the poll's decision flow - phase masking, reject-then-accept ordering, the embed-gate signal, the probe/act split,
- * malformed-selector fault isolation, the tick-error taxonomy, and abort handling - is locked without spinning up Chrome. Time is driven by an injected fake clock
- * so multi-tick behavior is deterministic with no real timers. LOG is spied via the test-context mock so the logging contract is asserted directly on the
+ * malformed-selector fault isolation, the tick-error taxonomy, and abort handling - is locked without spinning up Chrome. Time is driven by an injected TestClock,
+ * so a multi-tick row parks on the poll's cadence until it advances and its tick count is exact rather than merely eventual; the rows whose poll ends inside its
+ * first tick supply no clock at all and run on the system clock. LOG is spied via the test-context mock so the logging contract is asserted directly on the
  * production LOG object.
  */
+import { TestClock, drainClock, settle } from "homebridge-plugin-utils/testing";
 import { clickSelectorInPage, consentOverlayPresent, isSelectorAtPoint, logAutoDismiss, startOverlayHandling } from "./consent.ts";
 import { describe, test } from "node:test";
-import type { Clock } from "../utils/index.ts";
 import { LOG } from "../utils/index.ts";
 import type { Page } from "puppeteer-core";
 import assert from "node:assert/strict";
@@ -77,21 +78,6 @@ function makePageStub(router: (arg: unknown, fn: unknown) => unknown, options: P
   } as unknown as Page;
 
   return { page, stub };
-}
-
-/* A deterministic fake Clock: now() advances only when sleep() is called, so the poll's schedule is a pure function of its tick count with no wall-clock dependency.
- * waitWithTimeout is unused by the consent module and simply forwards the promise.
- */
-function makeFakeClock(): Clock {
-
-  let now = 0;
-
-  return {
-
-    now: (): number => now,
-    sleep: async (ms: number): Promise<void> => { now += ms; },
-    waitWithTimeout: async <T>(promise: Promise<T>): Promise<T> => promise
-  };
 }
 
 // True when the argument is the embed-gate probe payload (locateEmbedGate passes { accept, act, exclude, gate }).
@@ -273,10 +259,18 @@ describe("startOverlayHandling", () => {
       return null;
     });
 
-    await startOverlayHandling(page, makeProfile({ dismissSelector: DISMISS_SELECTOR }),
-      { clock: makeFakeClock(), onEmbedGateAccepted: () => { /* The gate never fires; the videoWait arm of the union requires the callback. */ }, phase: "videoWait",
+    const clock = new TestClock();
+
+    const running = startOverlayHandling(page, makeProfile({ dismissSelector: DISMISS_SELECTOR }),
+      { clock, onEmbedGateAccepted: () => { /* The gate never fires; the videoWait arm of the union requires the callback. */ }, phase: "videoWait",
         signal: controller.signal });
 
+    await drainClock(clock);
+    await running;
+
+    // One 200 for the settle the located reject control pays, and no 500 at all: the abort landed inside the first tick, so no cadence ever followed it.
+    assert.deepEqual(clock.requested, [200], "the tick's own settle was the only wait registered; the abort ended the poll before any cadence");
+    assert.equal(clock.pending, 0, "nothing stayed registered on the clock after the poll ended");
     assert.deepEqual(stub.clicks, [{ x: 5, y: 6 }], "only the CMP reject dispatched before the abort halted the tick");
     assert.equal(stub.evaluateArgs.filter(isGateProbe).length, 0, "the post-reject abort check skipped the embed-gate probe");
     assert.ok(!stub.evaluateArgs.includes(DISMISS_SELECTOR), "the post-reject abort check skipped the per-site modal dismiss");
@@ -303,8 +297,16 @@ describe("startOverlayHandling", () => {
       return (arg === DISMISS_SELECTOR) ? "clicked" : null;
     });
 
-    await startOverlayHandling(page, makeProfile({ dismissSelector: DISMISS_SELECTOR }),
-      { clock: makeFakeClock(), onEmbedGateAccepted: () => { /* Terminates the poll. */ }, phase: "videoWait" });
+    const clock = new TestClock();
+
+    const running = startOverlayHandling(page, makeProfile({ dismissSelector: DISMISS_SELECTOR }),
+      { clock, onEmbedGateAccepted: () => { /* Terminates the poll. */ }, phase: "videoWait" });
+
+    await settle();
+    assert.equal(clock.pending, 1, "the first tick found no gate, so its cadence is parked on the clock");
+
+    await drainClock(clock);
+    await running;
 
     const modalProbes = stub.evaluateArgs.filter((arg) => arg === DISMISS_SELECTOR);
 
@@ -345,8 +347,16 @@ describe("startOverlayHandling", () => {
       return null;
     });
 
-    await startOverlayHandling(page, makeProfile({ dismissSelector: DISMISS_SELECTOR }),
-      { clock: makeFakeClock(), onEmbedGateAccepted: () => { /* The gate never fires in this test. */ }, phase: "videoWait", signal: controller.signal });
+    const clock = new TestClock();
+
+    const running = startOverlayHandling(page, makeProfile({ dismissSelector: DISMISS_SELECTOR }),
+      { clock, onEmbedGateAccepted: () => { /* The gate never fires in this test. */ }, phase: "videoWait", signal: controller.signal });
+
+    await settle();
+    assert.equal(clock.pending, 1, "the first tick's cadence is parked on the clock");
+
+    await drainClock(clock);
+    await running;
 
     const modalProbes = stub.evaluateArgs.filter((arg) => arg === DISMISS_SELECTOR);
 
@@ -374,7 +384,17 @@ describe("startOverlayHandling", () => {
       return (arg === DIDOMI_REJECT) ? { x: 2, y: 2 } : null;
     });
 
-    await startOverlayHandling(page, makeProfile(), { clock: makeFakeClock(), onEmbedGateAccepted: () => { /* Terminates the poll. */ }, phase: "videoWait" });
+    const clock = new TestClock();
+
+    const running = startOverlayHandling(page, makeProfile(), { clock, onEmbedGateAccepted: () => { /* Terminates the poll. */ }, phase: "videoWait" });
+
+    await drainClock(clock);
+    await running;
+
+    // One 200 per tick that located a coordinate target - the reject's settle on tick one, the gate accept's on tick two - and one 500 for the single cadence
+    // between them.
+    assert.deepEqual(clock.requested, [ 200, 500, 200 ], "the reject's settle, one cadence, then the gate's settle");
+    assert.equal(clock.pending, 0, "nothing stayed registered on the clock after the poll ended");
 
     const rejectProbes = stub.evaluateArgs.filter((arg) => arg === DIDOMI_REJECT);
 
@@ -411,11 +431,20 @@ describe("startOverlayHandling", () => {
       return { x: 2, y: 2 };
     }, { onTop: false });
 
-    await startOverlayHandling(page, makeProfile({ videoTimeout: 1000 }),
-      { clock: makeFakeClock(), onEmbedGateAccepted: () => { /* No gate is ever located in this row. */ }, phase: "videoWait" });
+    const clock = new TestClock();
+
+    const running = startOverlayHandling(page, makeProfile({ videoTimeout: 1000 }),
+      { clock, onEmbedGateAccepted: () => { /* No gate is ever located in this row. */ }, phase: "videoWait" });
+
+    await drainClock(clock);
+    await running;
 
     const messages = info.mock.calls.map((call) => String(call.arguments[0]));
 
+    // The settle runs whenever the reject control is located, before the on-top test decides between the pointer click and the in-page click, so the covered
+    // control's one located tick registers a 200. The vendor is handled from there on, so the two later ticks locate nothing and only their cadences remain.
+    assert.deepEqual(clock.requested, [ 200, 500, 500 ], "the located tick's settle, then the two cadences the 1000 ms window afforded");
+    assert.equal(clock.pending, 0, "nothing stayed registered on the clock after the poll ended");
     assert.equal(stub.clicks.length, 0, "a covered control is never pointer-clicked");
     assert.equal(syntheticClicks, 1, "the in-page click ran once, on the same selector the coordinate click resolved");
     assert.equal(messages.filter((m) => m.includes("cookie-consent prompt")).length, 1, "the fallback dismissal is logged once and the vendor is handled");
@@ -449,11 +478,20 @@ describe("startOverlayHandling", () => {
       return { x: 2, y: 2 };
     }, { onTop: false });
 
-    await startOverlayHandling(page, makeProfile({ videoTimeout: 1000 }),
-      { clock: makeFakeClock(), onEmbedGateAccepted: () => { /* No gate is ever located in this row. */ }, phase: "videoWait" });
+    const clock = new TestClock();
+
+    const running = startOverlayHandling(page, makeProfile({ videoTimeout: 1000 }),
+      { clock, onEmbedGateAccepted: () => { /* No gate is ever located in this row. */ }, phase: "videoWait" });
+
+    await drainClock(clock);
+    await running;
 
     const messages = info.mock.calls.map((call) => String(call.arguments[0]));
 
+    // The vendor is never marked handled, so all three ticks locate the control and each registers its own 200 settle; the 1000 ms window affords two cadences
+    // between them.
+    assert.deepEqual(clock.requested, [ 200, 500, 200, 500, 200 ], "a settle on every tick that located the control, with two cadences between the three ticks");
+    assert.equal(clock.pending, 0, "nothing stayed registered on the clock after the poll ended");
     assert.equal(stub.clicks.length, 0, "a covered control is never pointer-clicked");
     assert.ok(locateProbes >= 2, "an unhandled vendor is resolved again on a later tick");
     assert.ok(!messages.some((m) => m.includes("cookie-consent prompt")), "nothing was dismissed, so no dismissal is logged");
@@ -493,8 +531,16 @@ describe("startOverlayHandling", () => {
         return null;
       });
 
-      await startOverlayHandling(page, makeProfile({ dismissSelector: DISMISS_SELECTOR }), { clock: makeFakeClock(), phase, signal: controller.signal });
+      const clock = new TestClock();
 
+      const running = startOverlayHandling(page, makeProfile({ dismissSelector: DISMISS_SELECTOR }), { clock, phase, signal: controller.signal });
+
+      await drainClock(clock);
+      await running;
+
+      // One 200 for the reject's settle on the single tick the abort allowed, and no 500 at all: the abort landed inside that tick, so no cadence ever followed it.
+      assert.deepEqual(clock.requested, [200], "the tick's own settle was the only wait registered; the abort ended the poll before any cadence");
+      assert.equal(clock.pending, 0, "nothing stayed registered on the clock after the poll ended");
       assert.equal(stub.evaluateArgs.filter(isGateProbe).length, 0, "a masked phase never issues the embed-gate probe");
       assert.ok(stub.clicks.some((click) => (click.x === 5) && (click.y === 6)), "the CMP banner is still rejected");
       assert.ok(stub.evaluateArgs.includes(DISMISS_SELECTOR), "the per-site modal is still dismissed");
@@ -577,10 +623,19 @@ describe("startOverlayHandling", () => {
 
     const firstController = new AbortController();
     const first = makePageStub(makeRouter(firstController));
+    const firstClock = new TestClock();
 
-    await startOverlayHandling(first.page, makeProfile({ dismissSelector: badSelector }),
-      { clock: makeFakeClock(), onEmbedGateAccepted: () => { /* The gate never fires in this test; the videoWait arm of the union requires the callback. */ },
+    const firstPoll = startOverlayHandling(first.page, makeProfile({ dismissSelector: badSelector }),
+      { clock: firstClock, onEmbedGateAccepted: () => { /* The gate never fires in this test; the videoWait arm of the union requires the callback. */ },
         phase: "videoWait", signal: firstController.signal });
+
+    await drainClock(firstClock);
+    await firstPoll;
+
+    // The ledger reads one 200 for the reject's settle on the first tick and one 500 for the cadence between the two ticks the abort allowed. The second tick
+    // locates nothing - its vendor is already handled - and the malformed selector is dispatched in-page, so neither registers a settle of its own.
+    assert.deepEqual(firstClock.requested, [ 200, 500 ], "the reject's settle, then the one cadence between the two ticks");
+    assert.equal(firstClock.pending, 0, "nothing stayed registered on the first poll's clock");
 
     const firstDismissProbes = first.stub.evaluateArgs.filter((arg) => arg === badSelector);
 
@@ -592,10 +647,17 @@ describe("startOverlayHandling", () => {
     // A second poll instance with the SAME selector re-disables silently: the process-wide warned set already holds it, so no second warning is emitted.
     const secondController = new AbortController();
     const second = makePageStub(makeRouter(secondController));
+    const secondClock = new TestClock();
 
-    await startOverlayHandling(second.page, makeProfile({ dismissSelector: badSelector }),
-      { clock: makeFakeClock(), onEmbedGateAccepted: () => { /* The gate never fires in this test; the videoWait arm of the union requires the callback. */ },
+    const secondPoll = startOverlayHandling(second.page, makeProfile({ dismissSelector: badSelector }),
+      { clock: secondClock, onEmbedGateAccepted: () => { /* The gate never fires in this test; the videoWait arm of the union requires the callback. */ },
         phase: "videoWait", signal: secondController.signal });
+
+    await drainClock(secondClock);
+    await secondPoll;
+
+    assert.deepEqual(secondClock.requested, [ 200, 500 ], "the second poll ran the same two ticks on its own clock, with the same settle and cadence");
+    assert.equal(secondClock.pending, 0, "nothing stayed registered on the second poll's clock");
 
     assert.equal(second.stub.evaluateArgs.filter((arg) => arg === badSelector).length, 1, "the second poll still probes and disables the selector");
     assert.equal(warn.mock.calls.length, 1, "the second poll re-disables silently - still exactly one warning across both polls");
@@ -628,23 +690,37 @@ describe("startOverlayHandling", () => {
       return null;
     });
 
-    await startOverlayHandling(live.page, makeProfile(), { clock: makeFakeClock(), onEmbedGateAccepted: () => { /* Unused. */ }, phase: "videoWait",
+    const liveClock = new TestClock();
+
+    const livePoll = startOverlayHandling(live.page, makeProfile(), { clock: liveClock, onEmbedGateAccepted: () => { /* Unused. */ }, phase: "videoWait",
       signal: liveController.signal });
+
+    await settle();
+    assert.equal(liveClock.pending, 1, "the live page's first tick survived its error and parked the next cadence");
+
+    await drainClock(liveClock);
+    await livePoll;
 
     assert.ok(live.stub.evaluateArgs.length >= 2, "a transient tick error let the poll continue to a subsequent evaluate");
 
     // Closed page: the first evaluate throws and isClosed reports true, so the tick stops the poll with no further evaluate.
     const closed = makePageStub(() => { throw new Error("Target closed."); }, { isClosed: (): boolean => true });
 
-    await startOverlayHandling(closed.page, makeProfile(), { clock: makeFakeClock(), onEmbedGateAccepted: () => { /* Unused. */ }, phase: "videoWait" });
+    const closedClock = new TestClock();
 
+    await startOverlayHandling(closed.page, makeProfile(), { clock: closedClock, onEmbedGateAccepted: () => { /* Unused. */ }, phase: "videoWait" });
+
+    assert.deepEqual(closedClock.requested, [], "a closed page stops the poll inside its first tick, so no cadence is registered");
     assert.equal(closed.stub.evaluateArgs.length, 1, "a closed page stops the poll after the throwing evaluate, with no further probe");
 
     // Disconnected browser: the first evaluate throws and the browser reports not connected, so the tick stops the poll with no further evaluate.
     const disconnected = makePageStub(() => { throw new Error("Session closed."); }, { connected: false });
 
-    await startOverlayHandling(disconnected.page, makeProfile(), { clock: makeFakeClock(), onEmbedGateAccepted: () => { /* Unused. */ }, phase: "videoWait" });
+    const disconnectedClock = new TestClock();
 
+    await startOverlayHandling(disconnected.page, makeProfile(), { clock: disconnectedClock, onEmbedGateAccepted: () => { /* Unused. */ }, phase: "videoWait" });
+
+    assert.deepEqual(disconnectedClock.requested, [], "a disconnected browser stops the poll inside its first tick, so no cadence is registered");
     assert.equal(disconnected.stub.evaluateArgs.length, 1, "a disconnected browser stops the poll after the throwing evaluate, with no further probe");
   });
 
@@ -671,16 +747,63 @@ describe("startOverlayHandling", () => {
       return null;
     });
 
+    const clock = new TestClock();
+
     let gateSignals = 0;
 
-    await startOverlayHandling(page, makeProfile({ videoTimeout: 10000 }),
-      { clock: makeFakeClock(), onEmbedGateAccepted: () => { gateSignals++; }, phase: "videoWait", signal: controller.signal });
+    const running = startOverlayHandling(page, makeProfile({ videoTimeout: 10000 }),
+      { clock, onEmbedGateAccepted: () => { gateSignals++; }, phase: "videoWait", signal: controller.signal });
 
+    await settle();
+    assert.equal(clock.pending, 1, "the first no-op tick parked its cadence on the clock");
+
+    await drainClock(clock);
+    await running;
+
+    assert.deepEqual(clock.requested, [500], "exactly one cadence separated the two ticks");
     assert.equal(stub.clicks.length, 0, "a no-overlay poll never clicks");
     assert.equal(gateSignals, 0, "a no-overlay poll never signals a gate");
     assert.equal(stub.evaluateArgs.length, 4, "exactly two no-op ticks (CMP + gate probe each) ran before the abort ended the poll");
   });
 
+  test("an abort that lands while the poll is parked in its cadence ends it inside the sleep", async (t) => {
+
+    t.mock.method(LOG, "info", () => { /* Silenced. */ });
+
+    /* Every other abort row in this file fires its abort from inside a tick's evaluate, so none of them reaches the checkpoint the cadence sleep itself carries.
+     * Here the first tick finds nothing and returns "continue", the poll parks its cadence, and the abort arrives while it is parked: the sleep ends on the abort
+     * rather than at the cadence's end, the handler resolves, and no second tick ever runs.
+     */
+    const controller = new AbortController();
+    const clock = new TestClock();
+
+    let ticks = 0;
+
+    const { page } = makePageStub((arg) => {
+
+      if(isGateProbe(arg)) {
+
+        ticks++;
+      }
+
+      return null;
+    });
+
+    const running = startOverlayHandling(page, makeProfile({ videoTimeout: 10000 }),
+      { clock, onEmbedGateAccepted: () => { /* No gate is ever located in this row. */ }, phase: "videoWait", signal: controller.signal });
+
+    await settle();
+    assert.equal(ticks, 1, "the first tick ran and found nothing");
+    assert.equal(clock.pending, 1, "the poll is parked in its cadence");
+    assert.deepEqual(clock.requested, [500], "the one cadence the first tick registered");
+
+    controller.abort();
+    await settle();
+    await running;
+
+    assert.equal(ticks, 1, "no second tick ran: the abort ended the poll inside the sleep");
+    assert.equal(clock.pending, 0, "the aborted sleep left the clock");
+  });
   test("the tuneSetup phase keeps polling past any fixed budget and stops on the caller's abort", async (t) => {
 
     t.mock.method(LOG, "info", () => { /* Silenced. */ });
@@ -690,7 +813,7 @@ describe("startOverlayHandling", () => {
      * this row the detector for the window's removal rather than a restatement of the abort path.
      */
     const controller = new AbortController();
-    const clock = makeFakeClock();
+    const clock = new TestClock();
 
     let ticks = 0;
 
@@ -709,7 +832,13 @@ describe("startOverlayHandling", () => {
       return null;
     });
 
-    await startOverlayHandling(page, makeProfile(), { clock, phase: "tuneSetup", signal: controller.signal });
+    const running = startOverlayHandling(page, makeProfile(), { clock, phase: "tuneSetup", signal: controller.signal });
+
+    await settle();
+    assert.equal(clock.pending, 1, "the first tick parked its cadence on the clock");
+
+    await drainClock(clock);
+    await running;
 
     assert.equal(stub.evaluateArgs.length, 95, "the poll ran 95 ticks - no fixed window cut it short - and the abort ended it");
     assert.equal(clock.now(), 47000, "the poll was still ticking at 47000 ms of poll time, past any budget the phase could have carried");
@@ -727,19 +856,23 @@ describe("startOverlayHandling", () => {
 
       t.mock.method(LOG, "info", () => { /* Silenced. */ });
 
-      const clock = makeFakeClock();
+      const clock = new TestClock();
       const { page, stub } = makePageStub(() => null);
 
       // The two profile-derived phases read their window from videoTimeout, so the profile carries the same 10000 ms those rows expect; the fixed-window phases
       // ignore it. The video wait is the only phase whose union arm requires the gate callback, which never fires here because nothing is ever present.
-      if(phase === "videoWait") {
+      const running = (phase === "videoWait") ? startOverlayHandling(page, makeProfile({ videoTimeout: 10000 }),
+        { clock, onEmbedGateAccepted: (): void => { /* No gate is ever located in a no-op poll. */ }, phase }) :
+        startOverlayHandling(page, makeProfile({ videoTimeout: 10000 }), { clock, phase });
 
-        await startOverlayHandling(page, makeProfile({ videoTimeout: 10000 }),
-          { clock, onEmbedGateAccepted: (): void => { /* No gate is ever located in a no-op poll. */ }, phase });
-      } else {
+      await settle();
+      assert.equal(clock.pending, 1, "the first tick parked its cadence on the clock");
 
-        await startOverlayHandling(page, makeProfile({ videoTimeout: 10000 }), { clock, phase });
-      }
+      const steps = await drainClock(clock);
+
+      await running;
+
+      assert.equal(steps, ticks - 1, "the drain stepped one cadence between each pair of ticks");
 
       const cmpProbes = stub.evaluateArgs.filter((arg) => arg === DIDOMI_REJECT);
 

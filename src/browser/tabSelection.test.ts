@@ -10,17 +10,16 @@
  */
 import type { Browser, Page, Target } from "puppeteer-core";
 import type { SelectedTab, SharedWindowTabDeps, TabSelectionDeps } from "./tabSelection.ts";
-import { TAB_NOT_FOUND_MESSAGE, TAB_NOT_SELECTED_MESSAGE, getCachedTabId, onTabActivation, openSharedWindowTab, withTabSelected } from "./tabSelection.ts";
+import { TAB_NOT_FOUND_MESSAGE, TAB_NOT_SELECTED_MESSAGE, getCachedTabId, installStrayOpenTabReaper, onTabActivation, openSharedWindowTab,
+  withTabSelected } from "./tabSelection.ts";
+import { TestClock, settle } from "homebridge-plugin-utils/testing";
 import { beforeEach, describe, test } from "node:test";
 import { CONFIG } from "../config/index.ts";
-import type { Clock } from "../utils/index.ts";
 import type { LogEntry } from "../utils/logEmitter.ts";
 import type { Nullable } from "../types/index.ts";
 import assert from "node:assert/strict";
 import { closePuppeteerStreamWssOnIdle } from "../testing.helpers.ts";
 import { setImmediate as immediate } from "node:timers/promises";
-import { installStrayOpenTabReaper } from "./tabSelection.ts";
-import { makeFakeClock } from "../utils/clock.helpers.ts";
 import { subscribeToLogs } from "../utils/logEmitter.ts";
 
 // This file imports the module that imports puppeteer-stream, which spawns a WebSocketServer at load and would otherwise hold the runner open.
@@ -608,11 +607,11 @@ function makeOpenDeps(world: OpenWorld): SharedWindowTabDeps {
  */
 describe("withTabSelected", () => {
 
-  let clock: Clock;
+  let clock: TestClock;
 
   beforeEach(() => {
 
-    clock = makeFakeClock().clock;
+    clock = new TestClock();
   });
 
   test("selects the tab, runs the body, and hands back the tab that was selected before it, in that order", async () => {
@@ -942,19 +941,7 @@ describe("withTabSelected", () => {
      */
     const fixture = makeFixture();
     const queuedFixture = makeFixture();
-    const ceilings: number[] = [];
-
-    const lapsingClock: Clock = {
-
-      now: (): number => 0,
-      sleep: async (): Promise<void> => undefined,
-      waitWithTimeout: async <T>(_promise: Promise<T>, timeoutMs: number, timeoutError?: Error): Promise<T> => {
-
-        ceilings.push(timeoutMs);
-
-        throw timeoutError ?? new Error("The bound lapsed.");
-      }
-    };
+    const lapsingClock = new TestClock();
 
     // eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- Standard pattern for signal promises.
     const { promise, resolve } = Promise.withResolvers<void>();
@@ -971,6 +958,12 @@ describe("withTabSelected", () => {
 
     const queued = withTabSelected(queuedFixture.page, async (): Promise<void> => undefined, { clock, deps: makeDeps(queuedFixture) });
 
+    await settle();
+    assert.equal((lapsingClock.nextDeadline ?? -1) - lapsingClock.now(), CONFIG.streaming.navigationTimeout,
+      "a bare call uses the deadline a capture start already runs under");
+
+    lapsingClock.advance(CONFIG.streaming.navigationTimeout);
+
     await queued;
 
     assert.equal(fixture.timeline.at(-1), "update:7", "the selection went back at the ceiling, to the tab that had it");
@@ -981,8 +974,6 @@ describe("withTabSelected", () => {
     assert.equal(await held, "the body's answer", "the caller still receives what its body produced");
 
     unsubscribe();
-
-    assert.deepEqual(ceilings, [CONFIG.streaming.navigationTimeout], "a bare call uses the deadline a capture start already runs under");
 
     const lapseWarnings = warnings.filter((entry) => entry.level === "warn");
 
@@ -995,23 +986,12 @@ describe("withTabSelected", () => {
     // The fullscreen path holds a selection for a whole activation sequence and passes a ceiling of its own, so the value has to be the caller's rather than a
     // constant of this module's.
     const fixture = makeFixture();
-    const ceilings: number[] = [];
-
-    const recordingClock: Clock = {
-
-      now: (): number => 0,
-      sleep: async (): Promise<void> => undefined,
-      waitWithTimeout: async <T>(promise: Promise<T>, timeoutMs: number): Promise<T> => {
-
-        ceilings.push(timeoutMs);
-
-        return promise;
-      }
-    };
+    const recordingClock = new TestClock();
 
     await withTabSelected(fixture.page, async (): Promise<void> => undefined, { ceilingMs: 6000, clock: recordingClock, deps: makeDeps(fixture) });
 
-    assert.deepEqual(ceilings, [6000], "the context's ceiling is the one the bound runs on");
+    assert.deepEqual(recordingClock.requested, [6000], "the context's ceiling is the one the bound runs on");
+    assert.equal(recordingClock.pending, 0, "and the bound was cancelled once the body settled");
   });
 
   test("re-asserts a selection that was taken away during the hold, and issues nothing when it still holds", async () => {
@@ -1291,7 +1271,7 @@ describe("openSharedWindowTab", () => {
     // eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- Standard pattern for signal promises.
     const { promise, resolve } = Promise.withResolvers<void>();
 
-    const holding = withTabSelected(held.page, async (): Promise<void> => { await promise; }, { clock: makeFakeClock().clock, deps: makeDeps(held) });
+    const holding = withTabSelected(held.page, async (): Promise<void> => { await promise; }, { clock: new TestClock(), deps: makeDeps(held) });
     const opening = openSharedWindowTab(world.browser, { deps: makeOpenDeps(world) });
 
     await Promise.resolve();
@@ -1446,13 +1426,19 @@ describe("openSharedWindowTab", () => {
      */
     const world = makeOpenWorld();
     const queuedFixture = makeFixture();
+    const ceiling = new TestClock();
 
     world.targetHangs = true;
 
     const warnings = await captureWarnings(async () => {
 
-      const opening = openSharedWindowTab(world.browser, { ceilingMs: 150, deps: makeOpenDeps(world) });
-      const queued = withTabSelected(queuedFixture.page, async (): Promise<void> => undefined, { clock: makeFakeClock().clock, deps: makeDeps(queuedFixture) });
+      const opening = openSharedWindowTab(world.browser, { ceilingMs: 150, clock: ceiling, deps: makeOpenDeps(world) });
+      const queued = withTabSelected(queuedFixture.page, async (): Promise<void> => undefined, { clock: new TestClock(), deps: makeDeps(queuedFixture) });
+
+      await settle();
+      assert.equal((ceiling.nextDeadline ?? -1) - ceiling.now(), 150, "the turn's ceiling is armed at the ceiling the caller named");
+
+      ceiling.advance(150);
 
       assert.equal(await opening, world.createdPages[0], "the caller receives a plainly created page");
 
@@ -1486,7 +1472,15 @@ describe("installStrayOpenTabReaper", () => {
 
     world.targetHangs = true;
 
-    const page = await openSharedWindowTab(world.browser, { ceilingMs: 150, deps: makeOpenDeps(world) });
+    const ceiling = new TestClock();
+    const opening = openSharedWindowTab(world.browser, { ceilingMs: 150, clock: ceiling, deps: makeOpenDeps(world) });
+
+    await settle();
+    assert.equal((ceiling.nextDeadline ?? -1) - ceiling.now(), 150, "the turn's ceiling is armed at the ceiling the caller named");
+
+    ceiling.advance(150);
+
+    const page = await opening;
 
     assert.equal(page, world.createdPages[0], "the caller received the page the fallback created");
 
@@ -1515,7 +1509,8 @@ describe("installStrayOpenTabReaper", () => {
     world.targetHangs = true;
     world.onTargetWait = (): void => { parked.resolve(); };
 
-    const opening = openSharedWindowTab(world.browser, { ceilingMs: 150, deps: makeOpenDeps(world) });
+    const ceiling = new TestClock();
+    const opening = openSharedWindowTab(world.browser, { ceilingMs: 150, clock: ceiling, deps: makeOpenDeps(world) });
 
     await parked.promise;
 
@@ -1525,6 +1520,11 @@ describe("installStrayOpenTabReaper", () => {
     await settleReaper();
 
     assert.equal(closesOf(world, tab.page), 0, "the tab the parked pass is waiting for was left where that pass could claim it");
+
+    await settle();
+    assert.equal((ceiling.nextDeadline ?? -1) - ceiling.now(), 150, "the turn's ceiling is armed at the ceiling the caller named");
+
+    ceiling.advance(150);
 
     await opening;
 
@@ -1557,7 +1557,15 @@ describe("installStrayOpenTabReaper", () => {
       emitTarget(world, "targetcreated", { page: late, url: late.url() });
     };
 
-    await openSharedWindowTab(world.browser, { ceilingMs: 150, deps: makeOpenDeps(world) });
+    const ceiling = new TestClock();
+    const opening = openSharedWindowTab(world.browser, { ceilingMs: 150, clock: ceiling, deps: makeOpenDeps(world) });
+
+    await settle();
+    assert.equal((ceiling.nextDeadline ?? -1) - ceiling.now(), 150, "the turn's ceiling is armed at the ceiling the caller named");
+
+    ceiling.advance(150);
+
+    await opening;
     await settleReaper();
 
     assert.equal(landed.length, 1, "the scan ran once and the tab landed behind it");
@@ -1688,7 +1696,15 @@ describe("installStrayOpenTabReaper", () => {
 
     world.targetHangs = true;
 
-    await openSharedWindowTab(world.browser, { ceilingMs: 150, deps: makeOpenDeps(world) });
+    const ceiling = new TestClock();
+    const opening = openSharedWindowTab(world.browser, { ceilingMs: 150, clock: ceiling, deps: makeOpenDeps(world) });
+
+    await settle();
+    assert.equal((ceiling.nextDeadline ?? -1) - ceiling.now(), 150, "the turn's ceiling is armed at the ceiling the caller named");
+
+    ceiling.advance(150);
+
+    await opening;
 
     const stray = makeRecordingPage(world, world.openUrls[0] ?? "");
 

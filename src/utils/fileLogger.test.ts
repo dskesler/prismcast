@@ -9,7 +9,8 @@
  * temp directory via withTempDir and calls shutdownFileLogger() in afterEach to reset the singleton between cases. The flush timer would run in the background
  * during real use; we always shut it down to avoid cross-test interference.
  */
-import { afterEach, describe, mock, test } from "node:test";
+import { TestClock, waitUntil } from "homebridge-plugin-utils/testing";
+import { afterEach, describe, test } from "node:test";
 import { flushLogBuffer, flushLogBufferSync, initializeFileLogger, shutdownFileLogger, writeLogEntry } from "./fileLogger.ts";
 import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import assert from "node:assert/strict";
@@ -20,6 +21,9 @@ import { withTempDir } from "../testing.helpers.ts";
 
 // A size cap far above anything these rows write, so no trim runs and the assertions read the file exactly as it was appended.
 const MAX_LOG_SIZE = 1000000;
+
+// The logger's flush interval, restated here because it is private to fileLogger.ts. The periodic-flush row crosses exactly this window.
+const FLUSH_INTERVAL_MS = 1000;
 
 describe("initializeFileLogger and writeLogEntry", () => {
 
@@ -326,39 +330,40 @@ describe("initializeFileLogger - existing-file branch", () => {
 
 describe("flushTimer interval", () => {
 
-  /* The periodic flush timer is set up in initializeFileLogger and fires every FLUSH_INTERVAL_MS (1000) milliseconds. Tests above exercise flushLogBuffer
-   * directly; here we exercise the timer-driven flush path by enabling mock.timers and ticking past the interval boundary.
+  /* The periodic flush timer is armed in initializeFileLogger and fires every FLUSH_INTERVAL_MS milliseconds. Tests above exercise flushLogBuffer directly;
+   * here we exercise the timer-driven flush path by crossing the interval boundary on the clock the logger was initialized with.
    */
 
   afterEach(async () => {
 
     await shutdownFileLogger();
-    mock.timers.reset();
   });
 
   test("buffered writes flush automatically when the periodic timer fires", async () => {
 
-    mock.timers.enable({ apis: [ "setInterval", "setTimeout" ] });
-
     await withTempDir(async (dir) => {
 
+      const clock = new TestClock();
       const logPath = path.join(dir, "timer.log");
 
-      await initializeFileLogger(logPath, MAX_LOG_SIZE);
+      await initializeFileLogger(logPath, MAX_LOG_SIZE, clock);
 
       writeLogEntry("info", "Buffered entry.", null);
 
-      // Before the tick, the buffer holds the entry but the file is empty (init wrote "").
+      // Before the advance, the buffer holds the entry but the file is empty (init wrote "").
       const beforeContent = await readFile(logPath, "utf-8");
 
       assert.equal(beforeContent, "", "file empty before periodic flush");
 
-      // Tick past the FLUSH_INTERVAL_MS boundary. The setInterval callback fires void flushLogBuffer().
-      mock.timers.tick(1100);
+      // Cross the FLUSH_INTERVAL_MS boundary on the logger's own clock. The interval's callback runs inside the advance and starts the append.
+      clock.advance(FLUSH_INTERVAL_MS);
 
-      // The flush is async (void Promise) - drain the microtask queue so the appendFile completes.
-      await new Promise((resolve) => setImmediate(resolve));
-      await new Promise((resolve) => setImmediate(resolve));
+      /* The append the callback started settles on a later event-loop turn, so the read waits for it to land rather than for a fixed number of turns: a row
+       * that yielded a fixed count would read an empty file whenever the filesystem took one turn longer. A timer that never fired leaves nothing to land, so
+       * the wait lapses and the row fails on its own bound.
+       */
+      await waitUntil(() => fs.readFileSync(logPath, "utf-8").includes("Buffered entry."),
+        { description: "the periodic flush's append to land on disk", timeoutMs: 5000 });
 
       const afterContent = await readFile(logPath, "utf-8");
 

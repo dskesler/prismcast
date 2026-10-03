@@ -3,17 +3,20 @@
  * registry.test.ts: Unit tests for the stream registry SSOT. registry.ts owns the in-memory state for every active streaming session: the streamRegistry Map keyed by
  * numeric stream ID, the monotonic streamIdCounter, and the createHLSState/getStreamMemoryUsage helpers used across capture, native, and lifecycle code paths. These
  * tests lock the registry's contract: register/unregister round-trips, ID monotonicity, getAllStreams snapshot independence, lookup with getStream, byte counter
- * arithmetic in getStreamMemoryUsage, the capture-activity predicate the browser window's visibility policy reads, and the shape of a freshly-minted HLSState.
+ * arithmetic in getStreamMemoryUsage, the capture-activity predicate the browser window's visibility policy reads, the established-stream predicate the impaired
+ * browser's relaunch waits on, and the shape of a freshly-minted HLSState.
  */
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
 import { applyNativeQualityRefresh, cancelPrerollTimer, createHLSState, getAllStreams, getLastSegmentHasVideo, getLastSegmentSize, getNextStreamId, getStream,
-  getStreamCount, getStreamMemoryUsage, getTotalSegmentMemory, hasActiveCaptureStreams, makePendingCaptureIdentity, registerStream, unregisterStream,
-  updateLastAccess } from "./registry.ts";
+  getStreamCount, getStreamMemoryUsage, getTotalSegmentMemory, hasActiveCaptureStreams, hasEstablishedStreams, makePendingCaptureIdentity, registerStream,
+  unregisterStream, updateLastAccess } from "./registry.ts";
+import { beforeEach, describe, test } from "node:test";
 import { makeNativeIdentity, makeRegistryEntry } from "./registry.helpers.ts";
 import type { FMP4SegmenterResult } from "./fmp4Segmenter.ts";
 import type { Nullable } from "../types/index.ts";
+import type { Page } from "puppeteer-core";
 import type { Readable } from "node:stream";
 import type { StreamRegistryEntry } from "./registry.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { createCaptureSession } from "./captureSession.ts";
 
@@ -298,29 +301,79 @@ describe("hasActiveCaptureStreams", () => {
   });
 });
 
+describe("hasEstablishedStreams", () => {
+
+  beforeEach(() => {
+
+    clearRegistry();
+  });
+
+  test("returns false for an empty registry", () => {
+
+    assert.equal(hasEstablishedStreams(), false, "nothing registered means nothing depends on the browser");
+  });
+
+  test("returns false for a pending entry that holds no page yet", () => {
+
+    /* The case the whole predicate exists for. A tune refused its capture start releases its page and waits for the relaunch that would serve it, and its
+     * registry entry is still there while it waits - so counting pending entries would leave that relaunch waiting on the very tune waiting for it.
+     */
+    registerStream(makeRegistryEntry());
+
+    assert.equal(hasEstablishedStreams(), false, "an entry with no page is a tune in progress, not a claim on the browser");
+  });
+
+  test("returns true once an entry holds its page, in either mode", () => {
+
+    // A capture reads its page's compositor output and a native relay keeps its page for re-establishment, so both depend on the browser that page lives in.
+    const capture = makeRegistryEntry({ page: {} as unknown as Page });
+
+    registerStream(capture);
+    assert.equal(hasEstablishedStreams(), true, "a capture stream that holds its page is established");
+
+    clearRegistry();
+    registerStream(makeRegistryEntry({ identity: makeNativeIdentity(), page: {} as unknown as Page }));
+    assert.equal(hasEstablishedStreams(), true, "and so is a native one");
+  });
+
+  test("finds an established entry that is not the first in a mixed registry", () => {
+
+    // The case a first-entry-only implementation gets wrong: the established stream sits behind several pending ones.
+    registerStream(makeRegistryEntry());
+    registerStream(makeRegistryEntry());
+    registerStream(makeRegistryEntry({ page: {} as unknown as Page }));
+
+    assert.equal(hasEstablishedStreams(), true, "an established entry behind pending ones still counts");
+  });
+
+  test("drops back to false once the last established entry unregisters", () => {
+
+    const entry = makeRegistryEntry({ page: {} as unknown as Page });
+
+    registerStream(entry);
+    unregisterStream(entry.id);
+
+    assert.equal(hasEstablishedStreams(), false, "a torn-down stream leaves nothing depending on the browser");
+  });
+});
+
 describe("updateLastAccess", () => {
 
   beforeEach(() => {
 
     clearRegistry();
-    mock.timers.enable({ apis: ["Date"], now: 1700000000000 });
   });
 
-  afterEach(() => {
-
-    mock.timers.reset();
-  });
-
-  test("sets lastPlaylistRequest to Date.now() for a known stream", () => {
+  test("sets lastPlaylistRequest to the supplied instant for a known stream", () => {
 
     const entry = makeRegistryEntry();
 
     entry.info.lastPlaylistRequest = 0;
 
     registerStream(entry);
-    updateLastAccess(entry.id);
+    updateLastAccess(entry.id, 1700000000000);
 
-    assert.equal(entry.info.lastPlaylistRequest, 1700000000000, "stamped to current Date.now()");
+    assert.equal(entry.info.lastPlaylistRequest, 1700000000000, "stamped to the instant the caller handed it");
   });
 
   test("is a no-op for an unknown stream", () => {
@@ -329,7 +382,7 @@ describe("updateLastAccess", () => {
     // terminates between client poll and registry lookup.
     assert.doesNotThrow(() => {
 
-      updateLastAccess(999);
+      updateLastAccess(999, 1700000000000);
     });
   });
 });
@@ -360,6 +413,7 @@ describe("createHLSState", () => {
     assert.equal(state.resumeSegmentIndex, 0);
     assert.equal(state.segmentBytes, 0);
     assert.equal(state.segments.size, 0);
+    assert.equal(state.setupFailure, null);
     assert.equal(state.videoPlaylist, "");
   });
 
@@ -417,26 +471,28 @@ describe("createHLSState", () => {
 
 describe("cancelPrerollTimer", () => {
 
-  test("disarms an armed timer so its callback never runs and nulls the handle", async () => {
+  test("disarms an armed timer so its callback never runs and nulls the handle", () => {
 
-    // Arm a real short timer that flips a flag, cancel it, then wait well past the original delay. A helper that failed to clear the timer would let the callback run
-    // and flip the flag - this assertion fails against a broken no-op helper, which is what makes it distinguish a working helper from a broken one rather than
-    // merely asserting the handle is null.
+    // Arm a timer on a virtual clock that flips a flag, cancel it, then advance well past the original delay. A helper that failed to dispose the handle would let
+    // the callback run and flip the flag - this assertion fails against a broken no-op helper, which is what makes it tell a working helper from a broken one
+    // rather than merely asserting the handle is null.
+    const clock = new TestClock();
     const state = createHLSState();
 
     let fired = false;
 
-    state.prerollTimer = setTimeout(() => {
+    state.prerollTimer = clock.schedule(() => {
 
       fired = true;
     }, 20);
 
     cancelPrerollTimer(state);
 
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    clock.advance(60);
 
     assert.equal(fired, false, "the cancelled timer's callback never ran");
     assert.equal(state.prerollTimer, null, "the timer handle is nulled after cancellation");
+    assert.equal(clock.pending, 0, "the disarm left nothing on the timeline");
   });
 
   test("is a no-op when no timer is armed and leaves the handle null", () => {

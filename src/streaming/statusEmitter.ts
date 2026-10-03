@@ -144,7 +144,7 @@ export function createInitialStreamStatus(options: {
   logoUrl?: string;
   numericStreamId: number;
   serviceName: string;
-  startTime: Date;
+  startTime: number;
   streamingMode?: StreamingMode;
   url: string;
 }): StreamStatus {
@@ -177,7 +177,7 @@ export function createInitialStreamStatus(options: {
     serviceName: options.serviceName,
     showName: "",
     sourceResolution: null,
-    startTime: options.startTime.toISOString(),
+    startTime: new Date(options.startTime).toISOString(),
     streamingMode: options.streamingMode ?? "capture",
     url: options.url
   };

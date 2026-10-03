@@ -9,6 +9,7 @@
  * trigger was still satisfied all along and the throttle is what held it.
  */
 import type { MonitorDeps, MonitorStreamInfo } from "./monitor.ts";
+import type { MonitorHandle, TabReplacementResult } from "./recovery.ts";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { closePuppeteerStreamWssOnIdle, flushMicrotasks, makeFakePage } from "../testing.helpers.ts";
 import { makeNativeIdentity, makeRegistryEntry } from "./registry.helpers.ts";
@@ -19,11 +20,10 @@ import type { CaptureImpairment } from "../browser/browserSupervisor.ts";
 import type { CaptureSession } from "./captureSession.ts";
 import type { FMP4SegmenterResult } from "./fmp4Segmenter.ts";
 import { LOG } from "../utils/index.ts";
-import type { MonitorHandle } from "./recovery.ts";
 import type { NativeProxy } from "../native/proxy.ts";
 import type { Nullable } from "../types/index.ts";
 import type { StreamRegistryEntry } from "./registry.ts";
-import type { TabReplacementResult } from "./recovery.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { makeProfile } from "../config/profiles.helpers.ts";
@@ -48,11 +48,11 @@ const UNRESPONSIVE_PROBE_TIMEOUT = 2000;
 const HEALTHY_SEGMENT_BYTES = 1000000;
 
 /**
- * Advances mock timers in interval-sized steps, letting each tick body settle before the next firing.
- * @param t - The test context owning the mock timers.
+ * Advances the clock in interval-sized steps, letting each tick body settle before the next firing.
+ * @param clock - The clock the row's monitor runs on.
  * @param totalMs - How much time to advance.
  */
-async function advance(t: TestContext, totalMs: number): Promise<void> {
+async function advance(clock: TestClock, totalMs: number): Promise<void> {
 
   let remaining = totalMs;
 
@@ -60,7 +60,7 @@ async function advance(t: TestContext, totalMs: number): Promise<void> {
 
     const step = Math.min(MONITOR_INTERVAL, remaining);
 
-    t.mock.timers.tick(step);
+    clock.advance(step);
     remaining -= step;
 
     // Sequential by definition: each step must let the work it caused settle before the next step fires.
@@ -110,28 +110,45 @@ function countMessages(messages: string[], prefix: string): number {
   return messages.filter((message) => message.startsWith(prefix)).length;
 }
 
-// The deps every row starts from: an unmarked browser, so tab replacement is on the table, and codec answers that DIVERGE from the pending identity's null and
-// false. The divergence is what lets a row tell a fallback that re-derived its codec facts from one that merely left them as it found them.
-const DIVERGENT_DEPS: MonitorDeps = {
+/* The deps every row starts from: an unmarked browser, so tab replacement is on the table, and codec answers that DIVERGE from the pending identity's null and
+ * false. The divergence is what lets a row tell a fallback that re-derived its codec facts from one that merely left them as it found them. The clock is the
+ * row's own, because the monitor arms its tick and reads every instant through it.
+ * @param clock - The clock the row drives.
+ * @returns The dependency set.
+ */
+function makeDivergentDeps(clock: TestClock): MonitorDeps {
 
-  getCaptureImpairment: (): null => null,
-  getEffectiveCaptureCodec: (): CaptureCodec => "hevc",
-  isCaptureHardwareAccelerated: (): boolean => true,
-  syncWindowVisibility: async (): Promise<void> => { syncs++; }
-};
+  return {
+
+    clock,
+    getCaptureImpairment: (): null => null,
+    getEffectiveCaptureCodec: (): CaptureCodec => "hevc",
+    isCaptureHardwareAccelerated: (): boolean => true,
+    syncWindowVisibility: async (): Promise<void> => { syncs++; }
+  };
+}
 
 // The mark a browser carries once it can no longer start a capture, and the deps object that reports it. Every replacement decision consults that read, so a
 // frozen mark is what puts a row on a browser where no replacement can start. The codec answers match DIVERGENT_DEPS, so the mark is the only thing that differs
 // from the deps every other row starts from.
 const MARK: CaptureImpairment = { reason: "Could not start video source", since: 0 };
 
-const MARKED_DEPS: MonitorDeps = {
+/**
+ * Builds the deps a marked browser reports through, over the row's own clock.
+ * @param clock - The clock the row drives.
+ * @returns The dependency set.
+ */
+function makeMarkedDeps(clock: TestClock): MonitorDeps {
 
-  getCaptureImpairment: (): Nullable<CaptureImpairment> => MARK,
-  getEffectiveCaptureCodec: (): CaptureCodec => "hevc",
-  isCaptureHardwareAccelerated: (): boolean => true,
-  syncWindowVisibility: async (): Promise<void> => { syncs++; }
-};
+  return {
+
+    clock,
+    getCaptureImpairment: (): Nullable<CaptureImpairment> => MARK,
+    getEffectiveCaptureCodec: (): CaptureCodec => "hevc",
+    isCaptureHardwareAccelerated: (): boolean => true,
+    syncWindowVisibility: async (): Promise<void> => { syncs++; }
+  };
+}
 
 // How many window syncs the fallback asked for.
 let syncs: number;
@@ -208,17 +225,17 @@ function makeStarvingSegmenter(): FMP4SegmenterResult {
 /**
  * Answers a run of health reads with a progressing, healthy video state. Every outstanding read is answered on each pass rather than one indexed read, so the
  * drive stays correct whichever tick a given read belongs to; a read that is already settled ignores a second answer.
- * @param t - The test context owning the mock timers.
+ * @param clock - The clock the row's monitor runs on.
  * @param fake - The Page double whose reads are answered.
  * @param ticks - How many ticks to drive.
  */
-async function driveHealthyTicks(t: TestContext, fake: ReturnType<typeof makeFakePage>, ticks: number): Promise<void> {
+async function driveHealthyTicks(clock: TestClock, fake: ReturnType<typeof makeFakePage>, ticks: number): Promise<void> {
 
   for(let tick = 0; tick < ticks; tick++) {
 
     // Sequential by definition: each tick's read must settle before the next firing.
     // eslint-disable-next-line no-await-in-loop
-    await advance(t, MONITOR_INTERVAL);
+    await advance(clock, MONITOR_INTERVAL);
 
     /* The playhead advances monotonically across the whole drive, not within one call. A drive that restarted it would report a stalled video, which sends the
      * general recovery ladder down a path this row is not about and takes the segment trigger out of reach entirely.
@@ -250,12 +267,12 @@ function makeEntry(numericStreamId: number): StreamRegistryEntry {
 let entry: StreamRegistryEntry;
 let handle: Nullable<MonitorHandle>;
 
-const streamInfo = (numericStreamId: number): MonitorStreamInfo => ({
+const streamInfo = (numericStreamId: number, clock: TestClock): MonitorStreamInfo => ({
 
   channelName: "Two Phase Test",
   numericStreamId,
   serviceName: "two-phase-test",
-  startTime: new Date()
+  startTime: clock.now()
 });
 
 beforeEach(() => {
@@ -280,7 +297,7 @@ describe("monitorPlaybackHealth: a failed replacement throttles the next attempt
      * recording. The row spends most of a grace window and demands the count stay at exactly one; the positive control that follows spends past the window and
      * demands it become two, which is what proves the trigger was still live the whole time and the window is what held it.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const segmenter = makeStarvingSegmenter();
     const session = { attachSegmenter: (): void => undefined, dispose: (): void => undefined, disposed: false, segmenter,
@@ -290,17 +307,17 @@ describe("monitorPlaybackHealth: a failed replacement throttles the next attempt
     registerStream(entry);
 
     const messages = captureLogs(t);
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
     let replacements = 0;
 
-    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "tiny-grace-1", streamInfo(9301),
+    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "tiny-grace-1", streamInfo(9301, clock),
       (): void => { /* The breaker is not what this row reads. */ }, async (): Promise<Nullable<TabReplacementResult>> => {
 
         replacements++;
 
         return null;
-      }, DIVERGENT_DEPS);
+      }, makeDivergentDeps(clock));
 
     // Drive one tick at a time until the undersized-segment count crosses its threshold, so the window opens at an instant this row knows.
     const episodes = (): number => countMessages(messages, "Detected");
@@ -309,19 +326,19 @@ describe("monitorPlaybackHealth: a failed replacement throttles the next attempt
 
       // Sequential by definition: the trigger's own state advances one tick at a time.
       // eslint-disable-next-line no-await-in-loop
-      await driveHealthyTicks(t, fake, 1);
+      await driveHealthyTicks(clock, fake, 1);
     }
 
     assert.equal(episodes(), 1, "the trigger fired, once");
     assert.ok(replacements > 0, "and reached the replacement handler");
 
-    const openedAt = Date.now();
+    const openedAt = clock.now();
 
     // Most of the window, with the trigger continuously satisfied: every tick still produces another undersized, video-free segment.
-    while((Date.now() - openedAt) < (RECOVERY_GRACE_MS - (MONITOR_INTERVAL * 2))) {
+    while((clock.now() - openedAt) < (RECOVERY_GRACE_MS - (MONITOR_INTERVAL * 2))) {
 
       // eslint-disable-next-line no-await-in-loop
-      await driveHealthyTicks(t, fake, 1);
+      await driveHealthyTicks(clock, fake, 1);
     }
 
     assert.equal(episodes(), 1, "still exactly one escalation inside the window");
@@ -334,7 +351,7 @@ describe("monitorPlaybackHealth: a failed replacement throttles the next attempt
     for(let tick = 0; (tick < 60) && (episodes() === 1); tick++) {
 
       // eslint-disable-next-line no-await-in-loop
-      await driveHealthyTicks(t, fake, 1);
+      await driveHealthyTicks(clock, fake, 1);
     }
 
     assert.equal(episodes(), 2, "the window closing releases exactly one more escalation");
@@ -346,47 +363,47 @@ describe("monitorPlaybackHealth: a failed replacement throttles the next attempt
     /* The same throttle on the trigger with the sharpest consequence. Evaluate timeouts against a page mid-establishment are ordinary, so a monitor that
      * escalated on them inside the settling window would spend attempts - and eventually terminate the stream - on evidence the window exists to discount.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     entry = makeEntry(9302);
     registerStream(entry);
 
     const messages = captureLogs(t);
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
     let replacements = 0;
 
-    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "hung-grace-1", streamInfo(9302),
+    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "hung-grace-1", streamInfo(9302, clock),
       (): void => { /* The breaker is not what this row reads. */ }, async (): Promise<Nullable<TabReplacementResult>> => {
 
         replacements++;
 
         return null;
-      }, DIVERGENT_DEPS);
+      }, makeDivergentDeps(clock));
 
     const episodes = (): number => countMessages(messages, "Tab unresponsive - recovering via");
 
     // Three unanswered reads take the tab past its timeout streak and fire the first replacement.
-    await driveTimeoutStrike(t, true);
-    await driveTimeoutStrike(t, false);
-    await driveTimeoutStrike(t, false);
+    await driveTimeoutStrike(clock, true);
+    await driveTimeoutStrike(clock, false);
+    await driveTimeoutStrike(clock, false);
 
     assert.equal(episodes(), 1, "the hung tab was replaced, once");
     assert.ok(replacements > 0, "and the replacement handler was reached");
 
-    const openedAt = Date.now();
+    const openedAt = clock.now();
     const attemptsAtFirstEscalation = replacements;
 
     // A further strike inside the window. The timeout tally keeps climbing, so the trigger condition is satisfied on it too.
-    await driveTimeoutStrike(t, false);
+    await driveTimeoutStrike(clock, false);
 
-    assert.ok((Date.now() - openedAt) < RECOVERY_GRACE_MS, "the strike landed inside the window, which is what this row is about");
+    assert.ok((clock.now() - openedAt) < RECOVERY_GRACE_MS, "the strike landed inside the window, which is what this row is about");
     assert.equal(episodes(), 1, "no second escalation inside the window");
     assert.equal(replacements, attemptsAtFirstEscalation, "and the handler was not reached again");
 
     // The control: past the window, the same strike escalates.
-    await advance(t, RECOVERY_GRACE_MS);
-    await driveTimeoutStrike(t, false);
+    await advance(clock, RECOVERY_GRACE_MS);
+    await driveTimeoutStrike(clock, false);
 
     assert.equal(episodes(), 2, "the window closing releases exactly one more escalation");
   });
@@ -400,28 +417,29 @@ describe("monitorPlaybackHealth: a failed replacement throttles the next attempt
      * The row directly above is the negative control: the same drive on an unmarked browser still waits the window out before it escalates again. The one thing
      * that differs here is the mark the replacement itself lands, which is why the deps object is mutable rather than one of the file's frozen ones.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     entry = makeEntry(9303);
     registerStream(entry);
 
     const messages = captureLogs(t);
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
     let impairment: Nullable<CaptureImpairment> = null;
     let replacements = 0;
     let breaks = 0;
 
-    // The deps DIVERGENT_DEPS carries, with the impairment read made live so the mark the replacement lands is visible to every later read.
+    // The deps every row starts from, with the impairment read made live so the mark the replacement lands is visible to every later read.
     const markableDeps: MonitorDeps = {
 
+      clock,
       getCaptureImpairment: (): Nullable<CaptureImpairment> => impairment,
       getEffectiveCaptureCodec: (): CaptureCodec => "hevc",
       isCaptureHardwareAccelerated: (): boolean => true,
       syncWindowVisibility: async (): Promise<void> => { syncs++; }
     };
 
-    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "hung-marked-1", streamInfo(9303),
+    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "hung-marked-1", streamInfo(9303, clock),
       (): void => { breaks++; }, async (): Promise<Nullable<TabReplacementResult>> => {
 
         replacements++;
@@ -429,27 +447,27 @@ describe("monitorPlaybackHealth: a failed replacement throttles the next attempt
         /* Chrome refusing the capture start mid-attempt is what marks the browser, so the mark lands while this attempt is still settling - before the exhaustion
          * that follows it reads whether another replacement could start.
          */
-        impairment = { reason: "Could not start video source", since: Date.now() };
+        impairment = { reason: "Could not start video source", since: clock.now() };
 
         return null;
       }, markableDeps);
 
     // Three unanswered reads take the tab past its timeout streak and fire the first replacement.
-    await driveTimeoutStrike(t, true);
-    await driveTimeoutStrike(t, false);
-    await driveTimeoutStrike(t, false);
+    await driveTimeoutStrike(clock, true);
+    await driveTimeoutStrike(clock, false);
+    await driveTimeoutStrike(clock, false);
 
     assert.equal(countMessages(messages, "Tab unresponsive - recovering via"), 1, "the hung tab was replaced, once");
     assert.ok(replacements > 0, "and the replacement handler was reached");
     assert.equal(countMessages(messages, "Tab replacement was unsuccessful"), 1, "the attempt was exhausted, on the browser it had just marked");
 
-    const failedAt = Date.now();
+    const failedAt = clock.now();
     const attemptsAtFailure = replacements;
 
     // The next strike, at an instant a window would still have been covering had one been armed.
-    await driveTimeoutStrike(t, false);
+    await driveTimeoutStrike(clock, false);
 
-    assert.ok((Date.now() - failedAt) < RECOVERY_GRACE_MS, "the strike landed inside what would have been the window, which is what this row is about");
+    assert.ok((clock.now() - failedAt) < RECOVERY_GRACE_MS, "the strike landed inside what would have been the window, which is what this row is about");
     assert.equal(countMessages(messages, "Tab unresponsive and tab replacement is unavailable"), 1, "and the unrecoverable stream terminated on it");
     assert.equal(breaks, 1, "through the breaker, exactly once");
     assert.equal(replacements, attemptsAtFailure, "with no further attempt made, because none could start");
@@ -458,13 +476,13 @@ describe("monitorPlaybackHealth: a failed replacement throttles the next attempt
   /**
    * Drives one evaluate timeout strike against a page that never answers. The first strike of a streak lapses at the evaluate wrapper's full bound; every strike
    * after it lapses at the short confirmation probe the streak arms, which is the cadence a genuinely hung tab produces.
-   * @param t - The test context owning the mock timers.
+   * @param clock - The clock the row's monitor runs on.
    * @param first - Whether this is the strike that opens the streak.
    */
-  async function driveTimeoutStrike(t: TestContext, first: boolean): Promise<void> {
+  async function driveTimeoutStrike(clock: TestClock, first: boolean): Promise<void> {
 
-    await advance(t, MONITOR_INTERVAL);
-    await advance(t, first ? DEFAULT_EVALUATE_TIMEOUT : UNRESPONSIVE_PROBE_TIMEOUT);
+    await advance(clock, MONITOR_INTERVAL);
+    await advance(clock, first ? DEFAULT_EVALUATE_TIMEOUT : UNRESPONSIVE_PROBE_TIMEOUT);
   }
 });
 
@@ -512,23 +530,23 @@ describe("monitorPlaybackHealth: a dead pipeline on a browser that can start no 
      * no replacement attempted, and no ladder announcement at all. The throttle describe's tiny-segment row is the control: the same double and the same drive on
      * an unmarked browser reach the replacement handler instead.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     registerCapturing(9320, makeStarvingSegmenter());
 
     const messages = captureLogs(t);
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
     let replacements = 0;
     let breaks = 0;
 
-    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "tiny-marked-1", streamInfo(9320),
+    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "tiny-marked-1", streamInfo(9320, clock),
       (): void => { breaks++; }, async (): Promise<Nullable<TabReplacementResult>> => {
 
         replacements++;
 
         return null;
-      }, MARKED_DEPS);
+      }, makeMarkedDeps(clock));
 
     // Drive one tick at a time until the stream terminates, so nothing but the trigger's own firing decides which tick the assertions read.
     const terminations = (): number => countMessages(messages, TERMINATION_LINE);
@@ -537,7 +555,7 @@ describe("monitorPlaybackHealth: a dead pipeline on a browser that can start no 
 
       // Sequential by definition: the trigger's own state advances one tick at a time.
       // eslint-disable-next-line no-await-in-loop
-      await driveHealthyTicks(t, fake, 1);
+      await driveHealthyTicks(clock, fake, 1);
     }
 
     assert.equal(terminations(), 1, "the unrecoverable stream was terminated, once");
@@ -549,7 +567,7 @@ describe("monitorPlaybackHealth: a dead pipeline on a browser that can start no 
     const evaluationsAtTermination = fake.evaluations.length;
 
     // The positive control on the termination itself: a monitor that logged and broke without stopping would keep reading the page on every later tick.
-    await driveHealthyTicks(t, fake, 5);
+    await driveHealthyTicks(clock, fake, 5);
 
     assert.equal(fake.evaluations.length, evaluationsAtTermination, "and the monitor stopped, so no later tick read the page");
   });
@@ -559,23 +577,23 @@ describe("monitorPlaybackHealth: a dead pipeline on a browser that can start no 
     /* The same judgment reached through the other trigger. A frozen segment index leaves the video element looking perfectly healthy - the playhead advances and
      * nothing errors - so this is the case where only the segment facts say the capture is gone, and the decision site has to be the same one either way.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     registerCapturing(9321, makeStalledSegmenter());
 
     const messages = captureLogs(t);
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
     let replacements = 0;
     let breaks = 0;
 
-    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "stale-marked-1", streamInfo(9321),
+    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "stale-marked-1", streamInfo(9321, clock),
       (): void => { breaks++; }, async (): Promise<Nullable<TabReplacementResult>> => {
 
         replacements++;
 
         return null;
-      }, MARKED_DEPS);
+      }, makeMarkedDeps(clock));
 
     const terminations = (): number => countMessages(messages, TERMINATION_LINE);
 
@@ -583,7 +601,7 @@ describe("monitorPlaybackHealth: a dead pipeline on a browser that can start no 
 
       // Sequential by definition: the staleness clock advances one tick at a time.
       // eslint-disable-next-line no-await-in-loop
-      await driveHealthyTicks(t, fake, 1);
+      await driveHealthyTicks(clock, fake, 1);
     }
 
     assert.equal(terminations(), 1, "the unrecoverable stream was terminated, once");
@@ -594,7 +612,7 @@ describe("monitorPlaybackHealth: a dead pipeline on a browser that can start no 
 
     const evaluationsAtTermination = fake.evaluations.length;
 
-    await driveHealthyTicks(t, fake, 5);
+    await driveHealthyTicks(clock, fake, 5);
 
     assert.equal(fake.evaluations.length, evaluationsAtTermination, "and the monitor stopped, so no later tick read the page");
   });
@@ -604,29 +622,29 @@ describe("monitorPlaybackHealth: a dead pipeline on a browser that can start no 
     /* The control for the row above, and the one that keeps it meaningful. The double and the drive are identical and the mark is the only difference, so a row
      * that terminated here would be saying the double never reached the trigger at all rather than that the mark is what decides the outcome.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     registerCapturing(9322, makeStalledSegmenter());
 
     const messages = captureLogs(t);
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
     let replacements = 0;
     let breaks = 0;
 
-    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "stale-able-1", streamInfo(9322),
+    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "stale-able-1", streamInfo(9322, clock),
       (): void => { breaks++; }, async (): Promise<Nullable<TabReplacementResult>> => {
 
         replacements++;
 
         return null;
-      }, DIVERGENT_DEPS);
+      }, makeDivergentDeps(clock));
 
     for(let tick = 0; (tick < 80) && (replacements === 0); tick++) {
 
       // Sequential by definition: the staleness clock advances one tick at a time.
       // eslint-disable-next-line no-await-in-loop
-      await driveHealthyTicks(t, fake, 1);
+      await driveHealthyTicks(clock, fake, 1);
     }
 
     assert.equal(countMessages(messages, "No new segments produced"), 1, "the trigger fired, once");
@@ -645,7 +663,7 @@ describe("monitorPlaybackHealth: a dead pipeline on a browser that can start no 
      * trigger fires on; the subject then stops one tick short and parks that tick at its health read. Encoding the number here would make the row a hostage of
      * the undersized-segment threshold rather than a statement about the stop check.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const messages = captureLogs(t);
 
@@ -653,10 +671,10 @@ describe("monitorPlaybackHealth: a dead pipeline on a browser that can start no 
     registerCapturing(9323, makeStarvingSegmenter());
 
     const controlEntryId = entry.id;
-    const controlPage = makeFakePage();
+    const controlPage = makeFakePage({ clock });
     const controlHandle = monitorPlaybackHealth(controlPage.page, controlPage.page, makeProfile(), "https://two-phase.test/watch", "resumed-control-1",
-      streamInfo(9323), (): void => { /* The control counts ticks and nothing else. */ },
-      async (): Promise<Nullable<TabReplacementResult>> => null, MARKED_DEPS);
+      streamInfo(9323, clock), (): void => { /* The control counts ticks and nothing else. */ },
+      async (): Promise<Nullable<TabReplacementResult>> => null, makeMarkedDeps(clock));
 
     const terminations = (): number => countMessages(messages, TERMINATION_LINE);
 
@@ -666,7 +684,7 @@ describe("monitorPlaybackHealth: a dead pipeline on a browser that can start no 
 
       // Sequential by definition: the trigger's own state advances one tick at a time.
       // eslint-disable-next-line no-await-in-loop
-      await driveHealthyTicks(t, controlPage, 1);
+      await driveHealthyTicks(clock, controlPage, 1);
     }
 
     controlHandle.dispose();
@@ -677,27 +695,27 @@ describe("monitorPlaybackHealth: a dead pipeline on a browser that can start no 
     // The subject: the same drive stopped one tick short, so the trigger fires on a tick whose health read is still outstanding when the monitor is disposed.
     registerCapturing(9324, makeStarvingSegmenter());
 
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
     let replacements = 0;
     let breaks = 0;
 
-    const subjectHandle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "resumed-subject-1", streamInfo(9324),
+    const subjectHandle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "resumed-subject-1", streamInfo(9324, clock),
       (): void => { breaks++; }, async (): Promise<Nullable<TabReplacementResult>> => {
 
         replacements++;
 
         return null;
-      }, MARKED_DEPS);
+      }, makeMarkedDeps(clock));
 
     handle = subjectHandle;
 
     const sliceStart = messages.length;
 
-    await driveHealthyTicks(t, fake, ticksToTrigger - 1);
+    await driveHealthyTicks(clock, fake, ticksToTrigger - 1);
 
     // The trigger tick fires and parks at its health read, the monitor stops while that read is outstanding, and only then does the read resolve.
-    await advance(t, MONITOR_INTERVAL);
+    await advance(clock, MONITOR_INTERVAL);
 
     subjectHandle.dispose();
     playheadSeconds++;
@@ -729,14 +747,14 @@ describe("monitorPlaybackHealth: a dead pipeline on a browser that can start no 
 
 describe("executeNativeL3Fallback: the relay is released on exactly the exits that hand the stream on", () => {
 
-  test("a successful fallback releases the relay and re-derives the codec facts from the capture decision", async (t) => {
+  test("a successful fallback releases the relay and re-derives the codec facts from the capture decision", async () => {
 
     /* The success arm. The relay is done - the capture pipeline owns the stream now - so it is stopped, and the identity the handler wrote is refreshed with the
      * codec facts the capture decision actually produced. Without that refresh the entry keeps the label read off the service's manifest, describing a feed this
      * stream stopped consuming, for the rest of its life. The injected codec answers diverge from the pending identity's null and false precisely so a fallback
      * that skipped the refresh cannot pass by coincidence.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const relay = makeProxyDouble({ errored: true });
     const swapped = makeSwappedSession();
@@ -744,18 +762,18 @@ describe("executeNativeL3Fallback: the relay is released on exactly the exits th
     entry = { ...makeEntry(9310), identity: makeNativeIdentity({ captureCodec: "H264", nativeProxy: relay.proxy }) };
     registerStream(entry);
 
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
-    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "l3-success-1", streamInfo(9310),
+    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "l3-success-1", streamInfo(9310, clock),
       (): void => { /* The breaker is not reached on this arm. */ }, async (): Promise<Nullable<TabReplacementResult>> => {
 
         // Stands in for the real handler's swap: it installs the capture pipeline on the entry and hands back the new page.
         entry.identity = { ...makePendingCaptureIdentity(), captureSession: swapped };
 
         return { context: fake.page, page: fake.page };
-      }, DIVERGENT_DEPS);
+      }, makeDivergentDeps(clock));
 
-    await advance(t, MONITOR_INTERVAL * 2);
+    await advance(clock, MONITOR_INTERVAL * 2);
 
     assert.equal(relay.stops(), 1, "the relay is released exactly once");
     assert.equal(entry.identity.mode, "capture", "the stream is capturing");
@@ -771,7 +789,7 @@ describe("executeNativeL3Fallback: the relay is released on exactly the exits th
      * reference-equality assertion is what says "the same one" rather than "an equivalent one", and the health-read count on the next tick is what says the
      * restored relay is genuinely back in service rather than sitting in a state the monitor no-ops over.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const relay = makeProxyDouble({ errored: true });
 
@@ -780,12 +798,12 @@ describe("executeNativeL3Fallback: the relay is released on exactly the exits th
 
     const held = entry.identity;
     const messages = captureLogs(t);
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
-    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "l3-failed-1", streamInfo(9311),
-      (): void => { /* The breaker does not trip on a single failure. */ }, async (): Promise<Nullable<TabReplacementResult>> => null, DIVERGENT_DEPS);
+    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "l3-failed-1", streamInfo(9311, clock),
+      (): void => { /* The breaker does not trip on a single failure. */ }, async (): Promise<Nullable<TabReplacementResult>> => null, makeDivergentDeps(clock));
 
-    await advance(t, MONITOR_INTERVAL * 2);
+    await advance(clock, MONITOR_INTERVAL * 2);
 
     assert.equal(relay.stops(), 0, "the relay was never stopped - it is what the stream is still running on");
     assert.equal(entry.identity, held, "and the entry holds the very identity object it started with");
@@ -794,7 +812,7 @@ describe("executeNativeL3Fallback: the relay is released on exactly the exits th
 
     const readsAfterFallback = relay.healthReads();
 
-    await advance(t, MONITOR_INTERVAL);
+    await advance(clock, MONITOR_INTERVAL);
 
     assert.ok(relay.healthReads() > readsAfterFallback, "the restored relay is consulted again on the next native tick");
   });
@@ -806,7 +824,7 @@ describe("executeNativeL3Fallback: the relay is released on exactly the exits th
      * inside a window every other trigger is respecting. The sync count is the instrument, because it advances once per cycle that actually entered the fallback,
      * and the debug breadcrumb is what says the tick was seen and held rather than never reaching the decision at all.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const relay = makeProxyDouble({ errored: false, lastSegmentTime: 1 });
 
@@ -817,17 +835,17 @@ describe("executeNativeL3Fallback: the relay is released on exactly the exits th
     const messages = captureLogs(t);
     const breadcrumbs: string[] = [];
 
-    t.mock.method(LOG, "debug", (category: string, message: string) => { breadcrumbs.push(message); });
+    t.mock.method(LOG, "debug", (_category: string, message: string) => { breadcrumbs.push(message); });
 
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
-    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "l3-deferred-1", streamInfo(9312),
-      (): void => { /* The breaker does not trip on a single failure. */ }, async (): Promise<Nullable<TabReplacementResult>> => null, DIVERGENT_DEPS);
+    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "l3-deferred-1", streamInfo(9312, clock),
+      (): void => { /* The breaker does not trip on a single failure. */ }, async (): Promise<Nullable<TabReplacementResult>> => null, makeDivergentDeps(clock));
 
     /* The staleness ladder needs a lapsed reload attempt before it escalates, and the entry carries no probe identity, so the reload declines and leaves the
      * attempt counted - which is exactly the "the reload did not work" signal the classifier escalates on.
      */
-    await advance(t, MONITOR_INTERVAL * 8);
+    await advance(clock, MONITOR_INTERVAL * 8);
 
     assert.equal(countMessages(messages, "Capture fallback failed for"), 1, "the first escalation ran and failed, arming the window");
     assert.equal(syncs, 1, "one cycle ran and reverted");
@@ -837,7 +855,7 @@ describe("executeNativeL3Fallback: the relay is released on exactly the exits th
     const breadcrumbsAfterFailure = countMessages(breadcrumbs, heldBreadcrumb);
 
     // Two more stalled ticks, each satisfying the same escalation condition, inside the window the failure armed.
-    await advance(t, MONITOR_INTERVAL * 2);
+    await advance(clock, MONITOR_INTERVAL * 2);
 
     assert.equal(syncs, 1, "and not one of those ticks re-entered the fallback");
     assert.equal(entry.identity, held, "the entry was never even pre-flipped, so it still holds the identity it started with");
@@ -848,20 +866,20 @@ describe("executeNativeL3Fallback: the relay is released on exactly the exits th
     /* Past the window, where the still-stalled stream is free to escalate again. This is the control: without it, a row asserting "nothing happened" would pass
      * just as well against a monitor that had stopped detecting the stall at all.
      */
-    await advance(t, RECOVERY_GRACE_MS);
+    await advance(clock, RECOVERY_GRACE_MS);
 
     assert.equal(countMessages(messages, "Capture fallback failed for"), 2, "the window closing releases exactly one more escalation");
     assert.equal(syncs, 2, "which entered the fallback and reverted out of it, exactly once");
   });
 
-  test("a dead relay does not re-enter the fallback on every tick inside the window", async (t) => {
+  test("a dead relay does not re-enter the fallback on every tick inside the window", async () => {
 
     /* The fast path above the fallback reads the window itself rather than leaving it to the replacement primitive, because a relay that stopped itself stays
      * stopped: the condition holds on every tick from then on. Without the read here the whole cycle - the mode pre-flip, the attempt, the revert, the window
      * sync - would run twice a second inside a window every other trigger is respecting. The sync count is the instrument, because it advances once per cycle
      * that actually entered the fallback.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const relay = makeProxyDouble({ errored: true });
 
@@ -869,29 +887,29 @@ describe("executeNativeL3Fallback: the relay is released on exactly the exits th
     registerStream(entry);
 
     const held = entry.identity;
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
     let attempts = 0;
 
-    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "l3-fastpath-grace-1", streamInfo(9315),
+    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "l3-fastpath-grace-1", streamInfo(9315, clock),
       (): void => { /* The breaker does not trip on a single failure. */ }, async (): Promise<Nullable<TabReplacementResult>> => {
 
         attempts++;
 
         return null;
-      }, DIVERGENT_DEPS);
+      }, makeDivergentDeps(clock));
 
-    await advance(t, MONITOR_INTERVAL * 2);
+    await advance(clock, MONITOR_INTERVAL * 2);
 
     assert.equal(syncs, 1, "one cycle ran and reverted");
 
     const attemptsAfterFirstCycle = attempts;
-    const openedAt = Date.now();
+    const openedAt = clock.now();
 
     // Several more ticks inside the window, with the relay reporting itself dead on every one of them.
-    await advance(t, MONITOR_INTERVAL * 3);
+    await advance(clock, MONITOR_INTERVAL * 3);
 
-    assert.ok((Date.now() - openedAt) < RECOVERY_GRACE_MS, "those ticks landed inside the window, which is what this row is about");
+    assert.ok((clock.now() - openedAt) < RECOVERY_GRACE_MS, "those ticks landed inside the window, which is what this row is about");
     assert.equal(syncs, 1, "and not one of them re-entered the fallback");
     assert.equal(attempts, attemptsAfterFirstCycle, "nor reached the replacement handler again");
     assert.equal(entry.identity, held, "the entry was never even pre-flipped, so it still holds the identity it started with");
@@ -903,7 +921,7 @@ describe("executeNativeL3Fallback: the relay is released on exactly the exits th
      * over is gone - and a pre-swap failure is not that state: the page is open and still serving, so the net must stay quiet, the breaker simply counts, and the
      * monitor goes on running against the stream it kept. A net that fired here would terminate a live recording, which is the loss this whole shape prevents.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const relay = makeProxyDouble({ errored: true });
 
@@ -911,14 +929,14 @@ describe("executeNativeL3Fallback: the relay is released on exactly the exits th
     registerStream(entry);
 
     const messages = captureLogs(t);
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
     let breaks = 0;
 
-    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "exhaustion-open-page-1", streamInfo(9316),
-      (): void => { breaks++; }, async (): Promise<Nullable<TabReplacementResult>> => null, DIVERGENT_DEPS);
+    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "exhaustion-open-page-1", streamInfo(9316, clock),
+      (): void => { breaks++; }, async (): Promise<Nullable<TabReplacementResult>> => null, makeDivergentDeps(clock));
 
-    await advance(t, MONITOR_INTERVAL * 2);
+    await advance(clock, MONITOR_INTERVAL * 2);
 
     assert.equal(countMessages(messages, "Tab replacement was unsuccessful"), 1, "the attempt exhausted");
     assert.equal(breaks, 0, "and the stream was not terminated - its page is still open and still serving");
@@ -926,66 +944,66 @@ describe("executeNativeL3Fallback: the relay is released on exactly the exits th
 
     const readsAfterExhaustion = relay.healthReads();
 
-    await advance(t, MONITOR_INTERVAL * 2);
+    await advance(clock, MONITOR_INTERVAL * 2);
 
     assert.ok(relay.healthReads() > readsAfterExhaustion, "and the monitor is still running against the stream it kept");
   });
 
-  test("a fallback whose stream terminates mid-attempt releases the relay exactly once", async (t) => {
+  test("a fallback whose stream terminates mid-attempt releases the relay exactly once", async () => {
 
     /* The orphan exits, where the stream is gone or going. Termination disposed whatever the registry held, which during the attempt is the pending capture
      * identity - and that holds nothing - so the relay this frame is still carrying would poll and refresh forever if this arm did not release it. The count is
      * the whole assertion: one stop, from the single site that owns the matrix, not one per arm.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const relay = makeProxyDouble({ errored: true });
 
     entry = { ...makeEntry(9313), identity: makeNativeIdentity({ nativeProxy: relay.proxy }) };
     registerStream(entry);
 
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
-    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "l3-stopped-1", streamInfo(9313),
+    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "l3-stopped-1", streamInfo(9313, clock),
       (): void => { /* The breaker is not what ends this stream. */ }, async (): Promise<Nullable<TabReplacementResult>> => {
 
         // The stream terminates while the replacement is in flight, which stops the monitor.
         handle?.dispose();
 
         return null;
-      }, DIVERGENT_DEPS);
+      }, makeDivergentDeps(clock));
 
-    await advance(t, MONITOR_INTERVAL * 2);
+    await advance(clock, MONITOR_INTERVAL * 2);
 
     assert.equal(relay.stops(), 1, "the relay is released exactly once on the orphan exit");
   });
 
-  test("a fallback that ends in termination releases the relay exactly once", async (t) => {
+  test("a fallback that ends in termination releases the relay exactly once", async () => {
 
     /* The other orphan exit: the attempt exhausts while the page it would have replaced is already gone, which is the one state that still strands a stream, so
      * the monitor terminates it explicitly. The relay is released on the way out for the same reason as the stop arm.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const relay = makeProxyDouble({ errored: true });
 
     entry = { ...makeEntry(9314), identity: makeNativeIdentity({ nativeProxy: relay.proxy }) };
     registerStream(entry);
 
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
     let breaks = 0;
 
-    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "l3-terminated-1", streamInfo(9314),
+    handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "l3-terminated-1", streamInfo(9314, clock),
       (): void => { breaks++; }, async (): Promise<Nullable<TabReplacementResult>> => {
 
         // The page the stream was running on is gone by the time the attempt exhausts.
         fake.setClosed(true);
 
         return null;
-      }, DIVERGENT_DEPS);
+      }, makeDivergentDeps(clock));
 
-    await advance(t, MONITOR_INTERVAL * 2);
+    await advance(clock, MONITOR_INTERVAL * 2);
 
     assert.equal(breaks, 1, "the stranded stream was terminated through the breaker");
     assert.equal(relay.stops(), 1, "and the relay was released exactly once");

@@ -31,7 +31,7 @@ import { bootApp, createIntegrationContext, initializePersistence } from "../../
 import { cleanupIdleStreams, handleHLSSegment } from "../../../src/streaming/hls.ts";
 import { deleteResumeData, getResumeSegmentIndex, loadResumeState, saveResumeState } from "../../../src/streaming/hlsResume.ts";
 import { describe, test } from "node:test";
-import { endLoginMode, setBrowserAccessors, startLoginMode } from "../../../src/browser/login.ts";
+import { endLoginMode, setLoginDeps, startLoginMode } from "../../../src/browser/login.ts";
 import { getBrowserInstance, syncWindowVisibility } from "../../../src/browser/index.ts";
 import { getStream, registerStream } from "../../../src/streaming/registry.ts";
 import { setChannelStreamId, terminateStream } from "../../../src/streaming/lifecycle.ts";
@@ -201,13 +201,13 @@ describe("HLS playlist served from registry-backed state", () => {
     // The 1589811 value is the canonical regression marker - any drift in the resume contract surfaces here as a wrong sequence on the wire.
     const priorIndex = 1589811;
 
-    saveResumeState([{ channelName: "abc", initSegment: null, initVersion: 1, segmentIndex: priorIndex, trackTimestamps: new Map() }]);
-    loadResumeState();
+    saveResumeState([{ channelName: "abc", initSegment: null, initVersion: 1, segmentIndex: priorIndex, trackTimestamps: new Map() }], Date.now());
+    loadResumeState(Date.now());
 
     ctx.registerCleanup(() => { deleteResumeData("abc"); });
 
     // Read the resume index via the public accessor, mirroring registerPendingStream's snapshot. Production's "?? 0" fallback is faithfully reproduced.
-    const resumeSegmentIndex = getResumeSegmentIndex("abc") ?? 0;
+    const resumeSegmentIndex = getResumeSegmentIndex("abc", Date.now()) ?? 0;
 
     assert.equal(resumeSegmentIndex, priorIndex, "the resume map round-trip must surface the saved index unchanged");
 
@@ -489,7 +489,7 @@ describe("handlePlayStream request guards", () => {
 
     /* When login mode is active, new ad-hoc streams must be blocked so the authentication tab is not disrupted. We drive login mode active through the production
      * accessor: startLoginMode requires a connected browser and drives the window through the injected sync, neither of which the integration tier hosts, so we
-     * inject a minimal browser double through the same setBrowserAccessors port browser/index.ts wires at startup. Cleanup calls endLoginMode (clearing the
+     * inject a minimal browser double through the same setLoginDeps port browser/index.ts wires at startup. Cleanup calls endLoginMode (clearing the
      * 15-minute safety timer and resetting the module singleton) and restores the real accessors so no later test observes the double.
      */
     await using ctx = await createIntegrationContext();
@@ -507,12 +507,12 @@ describe("handlePlayStream request guards", () => {
 
     const fakeBrowser = { connected: true, newPage: async (): Promise<unknown> => fakePage } as unknown as Browser;
 
-    setBrowserAccessors({ getBrowserInstance: (): Browser => fakeBrowser, syncWindowVisibility: async (): Promise<void> => { /* No window to drive in tests. */ } });
+    setLoginDeps({ getBrowserInstance: (): Browser => fakeBrowser, syncWindowVisibility: async (): Promise<void> => { /* No window to drive in tests. */ } });
 
     ctx.registerCleanup(async () => {
 
       await endLoginMode();
-      setBrowserAccessors({ getBrowserInstance, syncWindowVisibility });
+      setLoginDeps({ getBrowserInstance, syncWindowVisibility });
     });
 
     const started = await startLoginMode("https://example.test/login");

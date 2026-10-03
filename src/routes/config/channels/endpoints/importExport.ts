@@ -8,12 +8,13 @@
 import type { Channel, StoredChannelMap } from "../../../../types/index.ts";
 import type { Express, Request, Response } from "express";
 import { LOG, generateChannelKey, parseM3U, sanitizeString, stringifySorted } from "../../../../utils/index.ts";
-import { getBuiltinProfile, getProfiles } from "../../../../config/profiles.ts";
 import { getChannelListing, getUserChannels, mutateChannels, resolveStoredChannel, validateChannelName, validateChannelUrl,
   validateImportedChannels } from "../../../../config/userChannels.ts";
 import { sendSuccess, sendValidationError } from "../../http/envelope.ts";
 import type { UserChannel } from "../../../../config/userChannels.ts";
 import { buildChannelTablePatch } from "../table.ts";
+import { getBuiltinProfile } from "../../../../config/sites.ts";
+import { getProfiles } from "../../../../config/profiles.ts";
 import { getUserProfiles } from "../../../../config/userProfiles.ts";
 import { route } from "../http/handler.ts";
 
@@ -59,6 +60,10 @@ export function registerImportExportRoutes(app: Express): void {
       return;
     }
 
+    // Capture the keys that have a row before the replacement. A channel the imported file drops is by construction absent from the post-import listing, so the
+    // union below is what lets the patch builder resolve it to a remove action...a key it cannot find in the current listing is a row that has to go.
+    const previousKeys = getChannelListing().map((entry) => entry.key);
+
     // Replace the channels map outright. Reassigning preserves the surrounding metadata fields (migrationsApplied, schemaVersion, serviceSelections,
     // tagRegistry); the framework's post-mutate normalize step requires data.channels to remain defined.
     await mutateChannels((data) => {
@@ -68,8 +73,8 @@ export function registerImportExportRoutes(app: Express): void {
 
     const channelCount = Object.keys(validationResult.channels).length;
 
-    // A bulk JSON import replaces every user channel - return a patch covering every key in the listing.
-    const allKeys = getChannelListing().map((entry) => entry.key);
+    // A bulk JSON import replaces every user channel, so the patch covers both key sets: the rows that stood before the replacement and the listing after it.
+    const allKeys = Array.from(new Set(previousKeys).union(new Set(getChannelListing().map((entry) => entry.key))));
 
     const message = "Imported " + String(channelCount) + " channel" + (channelCount === 1 ? "" : "s") + " successfully.";
 

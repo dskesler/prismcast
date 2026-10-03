@@ -15,8 +15,8 @@ import type { LogEntry } from "../utils/index.ts";
 import type { Nullable } from "../types/index.ts";
 import type { Page } from "puppeteer-core";
 import { PassThrough } from "node:stream";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
-import { makeFakeClock } from "../utils/clock.helpers.ts";
 import { subscribeToLogs } from "../utils/index.ts";
 
 /* Reads the value FFmpeg would take for a flag, so an assertion names the flag it cares about rather than an index into the vector. Returns null when the flag is
@@ -205,7 +205,7 @@ describe("presentCaptureDisplay", () => {
      * - and a hidden capture page does not merely look wrong, it never reaches a playable video at all.
      */
     const { calls, page } = makePresentationPage();
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
 
     await presentCaptureDisplay(page, clock);
 
@@ -216,7 +216,7 @@ describe("presentCaptureDisplay", () => {
 
     // The window is minimized between streams, and Chrome refuses a move out of that state that does not pass through normal.
     const { calls, page } = makePresentationPage({ windowStates: [ "minimized", "normal", "fullscreen" ] });
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
 
     await presentCaptureDisplay(page, clock);
 
@@ -227,7 +227,7 @@ describe("presentCaptureDisplay", () => {
 
     // A badly presented grab is a bad stream; a thrown error here is no stream. The fault is named in the log and the capture proceeds.
     const { calls, page } = makePresentationPage({ bringToFrontError: new Error("synthetic activation failure") });
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
 
     await assert.doesNotReject(() => presentCaptureDisplay(page, clock), "the presentation absorbs an activation failure");
     assert.deepEqual(calls, [ "setWindowBounds:fullscreen", "bringToFront" ], "the activation was attempted");

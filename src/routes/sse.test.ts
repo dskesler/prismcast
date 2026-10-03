@@ -6,9 +6,10 @@
  * contracts; tests assert them here so a regression in any branch fails at this tier rather than silently degrading the live status / log streams.
  *
  * The suite uses makeReqRes from ./express.helpers.ts to synthesize an Express Response object with mock.fn-backed setHeader / flushHeaders / write spies, and
- * mock.timers to drive the heartbeat interval deterministically without sleeping.
+ * a clock handed to the installer to drive the heartbeat cadence deterministically without sleeping.
  */
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
+import { afterEach, beforeEach, describe, test } from "node:test";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { installSseStream } from "./sse.ts";
 import { makeReqRes } from "./express.helpers.ts";
@@ -51,36 +52,40 @@ describe("installSseStream - response headers", () => {
 
 describe("installSseStream - heartbeat", () => {
 
+  let clock: TestClock;
+
   beforeEach(() => {
 
-    // We virtualize setInterval so the heartbeat cadence is deterministic. The Date API is left alone because the helper does not read the wall clock.
-    mock.timers.enable({ apis: ["setInterval"] });
+    // The installer arms the heartbeat on the clock it is handed, so a fresh one per row makes the cadence deterministic and leaves no platform timer behind.
+    clock = new TestClock();
   });
 
   afterEach(() => {
 
-    mock.timers.reset();
+    assert.equal(clock.pending, 0, "no row leaves a heartbeat armed on its clock");
   });
 
   test("writes the heartbeat frame every 30 seconds with the documented literal bytes", () => {
 
     const { res, write } = makeReqRes();
 
-    installSseStream(res);
+    const sse = installSseStream(res, clock);
 
     // No heartbeat at install-time - the first frame only fires after the interval elapses.
     assert.equal(write.mock.callCount(), 0);
 
-    mock.timers.tick(HEARTBEAT_INTERVAL_MS);
+    clock.advance(HEARTBEAT_INTERVAL_MS);
 
     assert.equal(write.mock.callCount(), 1, "heartbeat fires after the 30s interval");
     assert.deepEqual(write.mock.calls[0]?.arguments, [HEARTBEAT_FRAME], "writes the documented event/data literal frame");
 
     // Cadence: subsequent ticks fire on the same period.
-    mock.timers.tick(HEARTBEAT_INTERVAL_MS);
+    clock.advance(HEARTBEAT_INTERVAL_MS);
 
     assert.equal(write.mock.callCount(), 2, "heartbeat fires on every subsequent 30s tick");
     assert.deepEqual(write.mock.calls[1]?.arguments, [HEARTBEAT_FRAME]);
+
+    sse.close();
   });
 
   test("does not fire the heartbeat early (boundary at 29_999ms)", () => {
@@ -89,24 +94,23 @@ describe("installSseStream - heartbeat", () => {
     // setInterval to setTimeout or starts the timer with a smaller initial delay.
     const { res, write } = makeReqRes();
 
-    installSseStream(res);
+    const sse = installSseStream(res, clock);
 
-    mock.timers.tick(HEARTBEAT_INTERVAL_MS - 1);
+    clock.advance(HEARTBEAT_INTERVAL_MS - 1);
 
     assert.equal(write.mock.callCount(), 0, "no heartbeat at 29_999ms");
+
+    sse.close();
   });
 });
 
 describe("installSseStream - close()", () => {
 
+  let clock: TestClock;
+
   beforeEach(() => {
 
-    mock.timers.enable({ apis: ["setInterval"] });
-  });
-
-  afterEach(() => {
-
-    mock.timers.reset();
+    clock = new TestClock();
   });
 
   test("clears the heartbeat interval - subsequent ticks do not produce writes", () => {
@@ -116,16 +120,18 @@ describe("installSseStream - close()", () => {
     // interval and assert the write count is unchanged. This mirrors the eventual real-world use - a client disconnects, the route's req.on("close") handler
     // calls sse.close(), and the heartbeat must stop forever.
     const { res, write } = makeReqRes();
-    const sse = installSseStream(res);
+    const sse = installSseStream(res, clock);
 
-    mock.timers.tick(HEARTBEAT_INTERVAL_MS);
+    clock.advance(HEARTBEAT_INTERVAL_MS);
 
     assert.equal(write.mock.callCount(), 1, "first heartbeat fired");
 
     sse.close();
 
-    // Advance well past two more interval boundaries. Without clearInterval, the spy would record additional writes here.
-    mock.timers.tick(HEARTBEAT_INTERVAL_MS * 3);
+    assert.equal(clock.pending, 0, "the close disposed the heartbeat rather than leaving it armed");
+
+    // Advance well past two more interval boundaries. A heartbeat that survived the close would record additional writes here.
+    clock.advance(HEARTBEAT_INTERVAL_MS * 3);
 
     assert.equal(write.mock.callCount(), 1, "no further heartbeats after close()");
   });
@@ -133,10 +139,10 @@ describe("installSseStream - close()", () => {
   test("close() can be called more than once - a double-call does not throw", () => {
 
     // Defensive: req.on("close") may fire multiple times in pathological proxy scenarios, and a future consumer might call sse.close() defensively in addition
-    // to the route's own teardown. clearInterval on an already-cleared id is a no-op in Node, so the helper is safe to call more than once for free; this test
-    // asserts that contract so a future "track whether we already closed" guard isn't accidentally introduced, breaking callers.
+    // to the route's own teardown. Disposing a handle a second time is a no-op by the port's contract, so the helper is safe to call more than once for free;
+    // this test asserts that contract so a future "track whether we already closed" guard isn't accidentally introduced, breaking callers.
     const { res } = makeReqRes();
-    const sse = installSseStream(res);
+    const sse = installSseStream(res, clock);
 
     assert.doesNotThrow(() => {
 

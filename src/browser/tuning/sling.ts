@@ -3,7 +3,7 @@
  * sling.ts: Sling TV guide grid channel selection strategy with binary search and row caching.
  */
 import type { ChannelSelectionProfile, ChannelSelectorResult, ClickTarget, DiscoveredChannel, Nullable, ProviderModule } from "../../types/index.ts";
-import { LOG, chromeFetch, delay, formatError } from "../../utils/index.ts";
+import { LOG, chromeFetch, delay, formatError, pollUntil, startTimer } from "../../utils/index.ts";
 import { logAvailableChannels, normalizeChannelName } from "./shared.ts";
 import { CONFIG } from "../../config/index.ts";
 import type { GridProbeResult } from "./gridSearch.ts";
@@ -597,33 +597,22 @@ async function slingGridStrategy(page: Page, profile: ChannelSelectionProfile): 
     return { guideUnavailable: true, reason: "Sling TV guide grid did not load.", success: false };
   }
 
-  // API fast path with frontier-based polling. The channel cache populates progressively as paginated grid API responses arrive in alphabetical order during page
-  // load. Rather than checking the cache once (missing late-alphabet channels whose API page hasn't arrived yet), poll until any of the following conditions
-  // is met: the target channel's GUID appears in the cache, the cache frontier (alphabetically latest entry) passes the target's position (confirming the
-  // channel is not in the lineup), or the maximum wait time is exceeded. This ensures the cache is fully populated for all subsequent tunes - a one-time
-  // cost that eliminates binary search for the rest of the session.
-  const pollStart = Date.now();
+  /* API fast path with frontier-based polling, stated through the project's poll policy. The channel cache populates progressively as paginated grid API responses
+   * arrive in alphabetical order during page load. Rather than checking the cache once (missing late-alphabet channels whose API page hasn't arrived yet), poll
+   * until any of the following conditions is met: the target channel's GUID appears in the cache, the cache frontier (alphabetically latest entry) passes the
+   * target's position (confirming the channel is not in the lineup), or the ceiling elapses. This ensures the cache is fully populated for all subsequent tunes -
+   * a one-time cost that eliminates binary search for the rest of the session.
+   */
+  const elapsed = startTimer();
+  const frontierPoll = await pollUntil({ cadenceMs: FRONTIER_POLL_INTERVAL, ceilingMs: FRONTIER_MAX_WAIT,
+    read: async (): Promise<{ found: boolean; frontier: Nullable<string> }> => ({ found: findChannelGuid(normalizedName) !== null, frontier: getCacheFrontier() }),
+    until: (state): boolean => state.found || ((state.frontier !== null) && (state.frontier > normalizedName)) });
 
-  while((Date.now() - pollStart) < FRONTIER_MAX_WAIT) {
+  // Report a frontier that passed the target's alphabetical position: the API page covering the target's range has already been processed, so the channel is not
+  // in the lineup and no further polling would have helped.
+  if(!frontierPoll.value.found && (frontierPoll.value.frontier !== null) && (frontierPoll.value.frontier > normalizedName)) {
 
-    if(findChannelGuid(normalizedName)) {
-
-      break;
-    }
-
-    // Check if the cache frontier has passed the target's alphabetical position. If the latest cache key sorts after the target, the API page covering
-    // the target's range has already been processed - the channel is not in the lineup and further polling won't help.
-    const frontier = getCacheFrontier();
-
-    if(frontier && (frontier > normalizedName)) {
-
-      LOG.debug("tuning:sling", "Cache frontier \"%s\" passed target \"%s\". Channel not in Sling lineup.", frontier, normalizedName);
-
-      break;
-    }
-
-    // eslint-disable-next-line no-await-in-loop
-    await delay(FRONTIER_POLL_INTERVAL);
+    LOG.debug("tuning:sling", "Cache frontier \"%s\" passed target \"%s\". Channel not in Sling lineup.", frontierPoll.value.frontier, normalizedName);
   }
 
   // After polling, attempt the full resolve pipeline: GUID lookup -> asset_id fetch -> player URL construction.
@@ -631,7 +620,7 @@ async function slingGridStrategy(page: Page, profile: ChannelSelectionProfile): 
 
   if(playerUrl) {
 
-    LOG.debug("tuning:sling", "Sling API fast path for %s (%sms): %s.", channelName, Date.now() - pollStart, playerUrl);
+    LOG.debug("tuning:sling", "Sling API fast path for %s (%sms): %s.", channelName, elapsed(), playerUrl);
 
     try {
 
@@ -645,7 +634,7 @@ async function slingGridStrategy(page: Page, profile: ChannelSelectionProfile): 
   }
 
   LOG.debug("tuning:sling", "Sling binary search fallback for %s after %sms polling (channel cache: %s, base URL: %s).",
-    channelName, Date.now() - pollStart, slingCache.map.size, slingPlaybackInfoBase ? "yes" : "no");
+    channelName, elapsed(), slingCache.map.size, slingPlaybackInfoBase ? "yes" : "no");
 
   // Phase 2: Read grid metadata. The .guide-cell element is the scroll host for the virtualized channel list. We measure the row height dynamically from a rendered
   // row element and read the time header offset from the first row's top position within the scroll container.

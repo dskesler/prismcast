@@ -7,12 +7,14 @@ import type { MediaContainer, Nullable } from "../types/index.ts";
 import type { MediaFeed, PipelineShape, ProbeCacheIdentity } from "./probe.ts";
 import { clearProbeCache, probeManifest } from "./probe.ts";
 import type { CaptureCodec } from "../streaming/codec.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { ManifestInterceptionResult } from "../browser/manifestInterceptor.ts";
 import type { NativeProxy } from "./proxy.ts";
 import type { Page } from "puppeteer-core";
 import { createNativeProxy } from "./proxy.ts";
 import { fetchDecryptionKey } from "./decrypt.ts";
 import { parseTokenExpiry } from "./tokenExpiry.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* This module orchestrates the native streaming decision. After the browser navigates to a channel and video playback begins, we check whether the service's HLS
  * stream can be consumed directly in Node (bypassing screen capture). The decision flow is:
@@ -69,50 +71,54 @@ const INTERCEPTION_AWAIT_TIMEOUT = 5000;
 export interface AttemptNativeStreamingOptions {
 
   // The channel name for logging and cache keys.
-  channelName: string;
+  readonly channelName: string;
+
+  // The clock the interception bound, the token-refresh arms, the proxy, and the probe's cache stamps read. The streaming boundary passes none and the whole
+  // chain takes the system clock.
+  readonly clock?: Clock;
 
   // The manifest interception promise from the CDP listener installed before navigation.
-  interceptionPromise: Promise<Nullable<ManifestInterceptionResult>>;
+  readonly interceptionPromise: Promise<Nullable<ManifestInterceptionResult>>;
 
   // When true, the requesting client is an MPEG-TS consumer. Channels with separate audio renditions are not viable for MPEG-TS clients because the independent
   // video and audio MPEG-TS segments have incompatible PAT/PMT tables from ad splicing. These channels fall back to capture mode for MPEG-TS but use native
   // streaming for HLS clients.
-  mpegTsClient?: boolean;
+  readonly mpegTsClient?: boolean;
 
   // Callback invoked on native proxy errors for recovery orchestration.
-  onError: (error: string) => void;
+  readonly onError: (error: string) => void;
 
   // Callback invoked when a token refresh binds a fresh feed, carrying the quality facts that rebind may have changed. Optional because recording them is a
   // streaming-layer concern the native layer only relays: the layer that owns the registry entry supplies the closure that writes it.
-  onFeedApplied?: (metadata: RefreshedFeedMetadata) => void;
+  readonly onFeedApplied?: (metadata: RefreshedFeedMetadata) => void;
 
   // The browser page (kept alive for token refresh).
-  page: Page;
+  readonly page: Page;
 
   // The preroll codec variant for composite playlist construction.
-  prerollCodec?: CaptureCodec;
+  readonly prerollCodec?: CaptureCodec;
 
   // Number of preroll segments preceding real content. When non-zero, the proxy starts segment numbering after the preroll range to reserve the index space. The
   // composite playlist reads the base URL dynamically from the stream's HLS state.
-  prerollSegmentCount?: number;
+  readonly prerollSegmentCount?: number;
 
   // The probe-cache identity this stream resolves under, built by the stream setup path and carried through the native chain unchanged. Every probe on this
   // stream - the tune-time one here and each token refresh after it - reads and writes the cache under this one identity.
-  probeIdentity: ProbeCacheIdentity;
+  readonly probeIdentity: ProbeCacheIdentity;
 
   // Re-establishes the stream's channel on the supplied page and returns the resulting manifest interception. The streaming layer supplies it, closed over the
   // stream's own tune facts; it re-runs that tune under the stream's log context, so the interception handed back was adjudicated and verified by exactly the
   // semantics the original tune used. Null means the channel could not be re-established, whatever the cause.
-  reestablishManifest: (page: Page) => Promise<Nullable<ManifestInterceptionResult>>;
+  readonly reestablishManifest: (page: Page) => Promise<Nullable<ManifestInterceptionResult>>;
 
   // Numeric stream ID for segment storage.
-  streamId: number;
+  readonly streamId: number;
 
   // String stream ID for logging.
-  streamIdStr: string;
+  readonly streamIdStr: string;
 
   // The channel URL for page reload during token refresh.
-  url: string;
+  readonly url: string;
 }
 
 /**
@@ -168,8 +174,9 @@ export async function attemptNativeStreaming(options: AttemptNativeStreamingOpti
 
   const { channelName, interceptionPromise, mpegTsClient, onError, onFeedApplied, page, probeIdentity, reestablishManifest, streamId, streamIdStr,
     url } = options;
+  const clock = options.clock ?? systemClock;
 
-  const elapsed = startTimer();
+  const elapsed = startTimer(clock);
 
   LOG.debug("native:coordinator", "Attempting native streaming for %s.", channelName);
 
@@ -180,7 +187,7 @@ export async function attemptNativeStreaming(options: AttemptNativeStreamingOpti
 
   try {
 
-    interception = await boundedWait(interceptionPromise, INTERCEPTION_AWAIT_TIMEOUT);
+    interception = await boundedWait(interceptionPromise, INTERCEPTION_AWAIT_TIMEOUT, { clock });
   } catch(error) {
 
     LOG.debug("native:coordinator", "Manifest interception error for %s: %s.", channelName, formatError(error));
@@ -202,7 +209,7 @@ export async function attemptNativeStreaming(options: AttemptNativeStreamingOpti
    * service that fronts its player with a per-session bumper that master describes the bumper rather than the channel. Declining lands on the null path below,
    * where capture serves the channel the relay could not.
    */
-  const mediaFeed = await probeManifest(interception.manifestUrl, probeIdentity, { rejectStaticPlaylists: true });
+  const mediaFeed = await probeManifest(interception.manifestUrl, probeIdentity, { clock, rejectStaticPlaylists: true });
 
   if(!mediaFeed) {
 
@@ -246,7 +253,7 @@ export async function attemptNativeStreaming(options: AttemptNativeStreamingOpti
 
   if((mediaFeed.encryption === "aes128") && mediaFeed.keyUrl) {
 
-    prefetchedKey = await fetchDecryptionKey(mediaFeed.keyUrl);
+    prefetchedKey = await fetchDecryptionKey(mediaFeed.keyUrl, { clock });
 
     if(!prefetchedKey) {
 
@@ -269,6 +276,7 @@ export async function attemptNativeStreaming(options: AttemptNativeStreamingOpti
 
     audioVariantUrl: mediaFeed.audioVariantUrl,
     channelName,
+    clock,
     container: mediaFeed.container,
     encryption: mediaFeed.encryption,
     keyUrl: mediaFeed.keyUrl,
@@ -286,6 +294,7 @@ export async function attemptNativeStreaming(options: AttemptNativeStreamingOpti
   scheduleTokenRefresh({
 
     channelName,
+    clock,
     masterUrl: interception.manifestUrl,
     onFeedApplied,
     page,
@@ -310,32 +319,36 @@ export async function attemptNativeStreaming(options: AttemptNativeStreamingOpti
  */
 interface TokenRefreshOptions {
 
-  channelName: string;
-  masterUrl: string;
+  readonly channelName: string;
+
+  // The clock the refresh arms on and reads its boundary against, carried from the attempt that opened the chain.
+  readonly clock: Clock;
+
+  readonly masterUrl: string;
 
   // Callback the refresh invokes when it binds a fresh feed, carried through every reschedule so a stream's quality reporting survives the whole chain of
   // refreshes rather than only the first.
-  onFeedApplied?: (metadata: RefreshedFeedMetadata) => void;
+  readonly onFeedApplied?: (metadata: RefreshedFeedMetadata) => void;
 
-  page: Page;
+  readonly page: Page;
 
   // The stream's probe-cache identity, carried so every refresh probes under the identity the tune established rather than one derived from the rotating
   // manifest URL it is refreshing.
-  probeIdentity: ProbeCacheIdentity;
+  readonly probeIdentity: ProbeCacheIdentity;
 
-  proxy: NativeProxy;
+  readonly proxy: NativeProxy;
 
   // Re-establishes the stream's channel on the supplied page and returns the resulting manifest interception. The streaming layer supplies it, closed over the
   // stream's own tune facts; it re-runs that tune under the stream's log context, so the interception handed back was adjudicated and verified by exactly the
   // semantics the original tune used. Null means the channel could not be re-established, whatever the cause.
-  reestablishManifest: (page: Page) => Promise<Nullable<ManifestInterceptionResult>>;
+  readonly reestablishManifest: (page: Page) => Promise<Nullable<ManifestInterceptionResult>>;
 
-  streamIdStr: string;
-  url: string;
+  readonly streamIdStr: string;
+  readonly url: string;
 
   // The variant URL the proxy is actually polling. Its token rotates independently of the master URL and may expire first, so the refresh boundary is the earlier
   // of the two. When the master URL carries no expiry token, the variant URL still sets the boundary; when neither does, no refresh is scheduled.
-  variantUrl: string;
+  readonly variantUrl: string;
 }
 
 /**
@@ -382,7 +395,7 @@ function computeRefreshBoundary(masterUrl: string, variantUrl: string): Nullable
  */
 function scheduleTokenRefresh(options: TokenRefreshOptions): void {
 
-  const { channelName, masterUrl, onFeedApplied, page, probeIdentity, proxy, reestablishManifest, streamIdStr, url, variantUrl } = options;
+  const { channelName, clock, masterUrl, onFeedApplied, page, probeIdentity, proxy, reestablishManifest, streamIdStr, url, variantUrl } = options;
 
   const boundary = computeRefreshBoundary(masterUrl, variantUrl);
 
@@ -393,7 +406,7 @@ function scheduleTokenRefresh(options: TokenRefreshOptions): void {
     return;
   }
 
-  const timeUntilExpiry = boundary - Date.now();
+  const timeUntilExpiry = boundary - clock.now();
 
   // Outside the margin we lead the boundary by TOKEN_REFRESH_MARGIN; inside it we aim straight at the boundary so the direct fetch fails into a page reload exactly
   // once. The floor of MIN_REFRESH_DELAY keeps a past-due or imminent boundary from thrashing, and the ceiling of MAX_TIMER_DELAY_MS keeps a distant one inside
@@ -406,9 +419,9 @@ function scheduleTokenRefresh(options: TokenRefreshOptions): void {
 
   // Store the timer handle on the proxy so it can be cancelled if the proxy is stopped before the timer fires. Pass the master URL so the refresh can attempt a
   // direct fetch before falling back to a page reload.
-  const timer = setTimeout(() => {
+  const timer = clock.schedule(() => {
 
-    void refreshNativeManifest({ channelName, masterUrl, onFeedApplied, page, probeIdentity, proxy, reestablishManifest, streamIdStr, url });
+    void refreshNativeManifest({ channelName, clock, masterUrl, onFeedApplied, page, probeIdentity, proxy, reestablishManifest, streamIdStr, url });
   }, refreshIn);
 
   proxy.setTokenRefreshTimer(timer);
@@ -419,30 +432,33 @@ function scheduleTokenRefresh(options: TokenRefreshOptions): void {
  */
 interface ManifestRefreshOptions {
 
-  channelName: string;
+  readonly channelName: string;
+
+  // The clock every deadline this refresh arms runs on, and the instant its probes stamp the cache with.
+  readonly clock: Clock;
 
   // The master manifest URL a direct fetch re-fetches. Omitted by the monitor's failure-triggered recovery, which knows no live master and goes straight to the
   // page reload.
-  masterUrl?: string;
+  readonly masterUrl?: string;
 
   // Callback invoked when this refresh binds a fresh feed, carrying the quality facts the rebind may have changed.
-  onFeedApplied?: (metadata: RefreshedFeedMetadata) => void;
+  readonly onFeedApplied?: (metadata: RefreshedFeedMetadata) => void;
 
-  page: Page;
+  readonly page: Page;
 
   // The stream's probe-cache identity, carried so every refresh probes under the identity the tune established rather than one derived from the rotating
   // manifest URL it is refreshing.
-  probeIdentity: ProbeCacheIdentity;
+  readonly probeIdentity: ProbeCacheIdentity;
 
-  proxy: NativeProxy;
+  readonly proxy: NativeProxy;
 
   // Re-establishes the stream's channel on the supplied page and returns the resulting manifest interception. The streaming layer supplies it, closed over the
   // stream's own tune facts; it re-runs that tune under the stream's log context, so the interception handed back was adjudicated and verified by exactly the
   // semantics the original tune used. Null means the channel could not be re-established, whatever the cause.
-  reestablishManifest: (page: Page) => Promise<Nullable<ManifestInterceptionResult>>;
+  readonly reestablishManifest: (page: Page) => Promise<Nullable<ManifestInterceptionResult>>;
 
-  streamIdStr: string;
-  url: string;
+  readonly streamIdStr: string;
+  readonly url: string;
 }
 
 /**
@@ -514,7 +530,7 @@ export async function refreshNativeManifest(options: ManifestRefreshOptions): Pr
 
       streamLog.warn("The token refresh for %s did not complete. Retrying in %s seconds.", channelName, Math.round(retryIn / 1000));
 
-      proxy.setTokenRefreshTimer(setTimeout(() => {
+      proxy.setTokenRefreshTimer(options.clock.schedule(() => {
 
         void refreshNativeManifest(options);
       }, retryIn));
@@ -556,14 +572,14 @@ export async function refreshNativeManifest(options: ManifestRefreshOptions): Pr
  */
 async function runManifestRefresh(options: ManifestRefreshOptions, streamLog: ReturnType<typeof LOG.withStreamId>): Promise<boolean> {
 
-  const { channelName, masterUrl, page, probeIdentity, proxy, reestablishManifest } = options;
+  const { channelName, clock, masterUrl, page, probeIdentity, proxy, reestablishManifest } = options;
 
   if(proxy.isStopped()) {
 
     return false;
   }
 
-  const refreshElapsed = startTimer();
+  const refreshElapsed = startTimer(clock);
 
   streamLog.debug("native:token", "Starting manifest refresh for %s.", channelName);
 
@@ -571,7 +587,7 @@ async function runManifestRefresh(options: ManifestRefreshOptions, streamLog: Re
   // master URL's own CDN auth token hasn't expired. When it does expire, probeManifest returns null (403) and we fall through to the page reload strategy.
   if(masterUrl) {
 
-    const directResult = await tryDirectManifestRefresh(masterUrl, proxy.getPipelineShape(), probeIdentity, streamLog);
+    const directResult = await tryDirectManifestRefresh(masterUrl, proxy.getPipelineShape(), probeIdentity, clock, streamLog);
 
     if(directResult) {
 
@@ -633,7 +649,7 @@ async function runManifestRefresh(options: ManifestRefreshOptions, streamLog: Re
 
     // Probe the new manifest to get the updated variant URL. The interceptor has already released its observer by the time the promise resolves, so a probe
     // failure here only requires giving up on this refresh attempt - no session bookkeeping to unwind.
-    const refreshedFeed = await probeManifest(newInterception.manifestUrl, probeIdentity, { pipelineShape: proxy.getPipelineShape() });
+    const refreshedFeed = await probeManifest(newInterception.manifestUrl, probeIdentity, { clock, pipelineShape: proxy.getPipelineShape() });
 
     if(!refreshedFeed) {
 
@@ -685,7 +701,7 @@ async function runManifestRefresh(options: ManifestRefreshOptions, streamLog: Re
 function applyRefreshedFeed(feed: MediaFeed, masterUrl: string, options: ManifestRefreshOptions,
   streamLog: ReturnType<typeof LOG.withStreamId>): boolean {
 
-  const { channelName, onFeedApplied, page, probeIdentity, proxy, reestablishManifest, streamIdStr, url } = options;
+  const { channelName, clock, onFeedApplied, page, probeIdentity, proxy, reestablishManifest, streamIdStr, url } = options;
 
   /* A separate-audio pipeline polls two manifests, so it must be handed both URLs or neither: a video URL swapped without its audio would leave the two tracks
    * on different CDN sessions. Selection admits only candidates whose audio topology matches this pipeline's, so an accepted feed arriving here without a
@@ -728,6 +744,7 @@ function applyRefreshedFeed(feed: MediaFeed, masterUrl: string, options: Manifes
   scheduleTokenRefresh({
 
     channelName,
+    clock,
     masterUrl,
     onFeedApplied,
     page,
@@ -750,13 +767,14 @@ function applyRefreshedFeed(feed: MediaFeed, masterUrl: string, options: Manifes
  * @param pipelineShape - The running proxy's compatibility envelope, which the probe selects within.
  * @param probeIdentity - The stream's probe-cache identity. The master URL passing through here carries session tokens that rotate on every refresh, so it is
  *                        never what the cache is keyed or stamped by; the stream's own identity is.
+ * @param clock - The chain's clock, supplying the probe's stamp and the instant the remaining token lifetime is measured against.
  * @param streamLog - The stream-scoped logger.
  * @returns A MediaFeed with a fresh variant URL, or null on failure.
  */
-async function tryDirectManifestRefresh(masterUrl: string, pipelineShape: PipelineShape, probeIdentity: ProbeCacheIdentity,
+async function tryDirectManifestRefresh(masterUrl: string, pipelineShape: PipelineShape, probeIdentity: ProbeCacheIdentity, clock: Clock,
   streamLog: ReturnType<typeof LOG.withStreamId>): Promise<Nullable<MediaFeed>> {
 
-  const mediaFeed = await probeManifest(masterUrl, probeIdentity, { pipelineShape });
+  const mediaFeed = await probeManifest(masterUrl, probeIdentity, { clock, pipelineShape });
 
   // A null feed is the only refusal to read here. A constrained probe hands back nothing the running pipeline cannot absorb - a mismatched encryption kind,
   // container, or audio topology comes back as null - so the admission question is answered before this line, in the one place that can answer it completely.
@@ -772,7 +790,7 @@ async function tryDirectManifestRefresh(masterUrl: string, pipelineShape: Pipeli
 
   if(variantExpiry) {
 
-    const remaining = variantExpiry - Date.now();
+    const remaining = variantExpiry - clock.now();
 
     if(remaining < MIN_USABLE_TOKEN_LIFETIME) {
 

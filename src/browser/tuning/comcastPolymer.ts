@@ -3,7 +3,7 @@
  * comcastPolymer.ts: Shared Comcast Polymer SPA factory for providers built on the TV-APP platform (Xfinity Stream, Cox Contour TV).
  */
 import type { ChannelSelectionProfile, ChannelSelectionStrategy, ChannelSelectorResult, DiscoveredChannel, Nullable, ProviderModule } from "../../types/index.ts";
-import { LOG, delay, formatError } from "../../utils/index.ts";
+import { LOG, delay, formatError, pollUntil } from "../../utils/index.ts";
 import { installOncePerPage, logAvailableChannels } from "./shared.ts";
 import { CONFIG } from "../../config/index.ts";
 import type { Page } from "puppeteer-core";
@@ -777,16 +777,14 @@ export function createComcastPolymerProvider(config: ComcastPolymerProviderConfi
       return { reason: config.label + " channel lineup did not load within timeout.", success: false };
     }
 
-    // Poll for Node-side cache population. The channelmap API response is intercepted by setupChannelmapInterception (called by resolveDirectUrl before we got
-    // here). We need the Node-side cache for findChannel's three-tier matching. The page check ends the wait the moment the page is gone: a closed page can never
-    // deliver that interception, so polling out the remaining clock only delays the failure this tune is already headed for. The empty-cache path below reports it.
-    const deadline = Date.now() + timeout;
-
-    while((channelCache.map.size === 0) && !page.isClosed() && (Date.now() < deadline)) {
-
-      // eslint-disable-next-line no-await-in-loop
-      await delay(CACHE_POLL_INTERVAL);
-    }
+    /* Poll for Node-side cache population through the project's poll policy: read the cache on a cadence under the tune's budget and stop the moment it fills. The
+     * channelmap API response is intercepted by setupChannelmapInterception (called by resolveDirectUrl before we got here), and we need the Node-side cache for
+     * findChannel's three-tier matching. The page check ends the wait the moment the page is gone: a closed page can never deliver that interception, so polling
+     * out the remaining clock only delays the failure this tune is already headed for. The outcome is deliberately unread, because the cache is the truth: the
+     * empty-cache path below reports the lineup whichever way the poll ended.
+     */
+    await pollUntil({ cadenceMs: CACHE_POLL_INTERVAL, ceilingMs: timeout,
+      read: async (): Promise<boolean> => (channelCache.map.size > 0) || page.isClosed(), until: (done: boolean): boolean => done });
 
     if(channelCache.map.size === 0) {
 
@@ -895,16 +893,13 @@ export function createComcastPolymerProvider(config: ComcastPolymerProviderConfi
       return [];
     }
 
-    // Poll for cache population. The page check ends the wait the moment the page is gone: a closed page can never deliver the channelmap interception, so polling
-    // out the remaining clock would only postpone this walk's settlement - and a refresh that cancelled this walk by closing its page waits on that settlement
-    // before it clears the caches. The empty-cache path below handles the early exit.
-    const deadline = Date.now() + CONFIG.streaming.videoTimeout;
-
-    while((channelCache.map.size === 0) && !page.isClosed() && (Date.now() < deadline)) {
-
-      // eslint-disable-next-line no-await-in-loop
-      await delay(CACHE_POLL_INTERVAL);
-    }
+    /* Poll for cache population through the project's poll policy: read the cache on a cadence under the walk's ceiling and stop the moment it fills. The page
+     * check ends the wait the moment the page is gone: a closed page can never deliver the channelmap interception, so polling out the remaining clock would only
+     * postpone this walk's settlement - and a refresh that cancelled this walk by closing its page waits on that settlement before it clears the caches. The
+     * outcome is deliberately unread, because the cache is the truth: the empty-cache path below reports the lineup whichever way the poll ended.
+     */
+    await pollUntil({ cadenceMs: CACHE_POLL_INTERVAL, ceilingMs: CONFIG.streaming.videoTimeout,
+      read: async (): Promise<boolean> => (channelCache.map.size > 0) || page.isClosed(), until: (done: boolean): boolean => done });
 
     if(channelCache.map.size === 0) {
 

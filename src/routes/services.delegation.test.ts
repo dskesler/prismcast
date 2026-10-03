@@ -31,6 +31,7 @@ import assert from "node:assert/strict";
 import { closePuppeteerStreamWss } from "../testing.helpers.ts";
 import express from "express";
 import { setupServicesEndpoint } from "./services.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 // The slug the injected getProviderBySlug resolves to the stub provider. getCachedChannels returns null so the route skips its warm-cache short-circuit and reaches
 // the discovery path, and validatePrecache returns false so the real recordDiscoveryOutcome takes its no-op clear branch (the domain is never flagged) rather than
@@ -118,6 +119,7 @@ const stubBrowser = { newPage: async (): Promise<Page> => makeStubPage() } as un
  */
 const stubPrecachingDeps: PrecachingDeps = {
 
+  clock: systemClock,
   createDiscoveryPage: async (browser: Browser): Promise<Page> => browser.newPage(),
   emulateLayoutSurface: async (): Promise<{ height: number; width: number }> => ({ height: 1080, width: 1920 }),
   getCurrentBrowser: async (): Promise<Browser> => stubBrowser,

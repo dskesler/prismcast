@@ -9,22 +9,28 @@
  *
  * The same injection point carries two further surfaces: the lineup write the discovery-outcome recorder performs, observed rather than executed, and the
  * empty-walk retry the guarded session owns, whose rows drive a stub page that records what it was asked to do and a provider whose successive walks are scripted.
+ *
+ * It carries the clock as well. Every timer the scheduler arms - the startup cycle, the deferred re-attempt, and each walk's deadline - runs on deps.clock, so a
+ * row drives the whole schedule by advancing one TestClock and reads what was armed off that clock's ledger. The health store's debounced flush runs on a clock of
+ * its own, established in each describe, so it arms nothing on the platform and nothing on the ledger these rows read.
  */
 import type { Browser, Page } from "puppeteer-core";
 import type { DiscoveredChannel, Nullable, ProviderModule } from "../types/index.ts";
 import { DiscoveryWalkTimeoutError, precacheService, revalidateDomainAuth, startPrecaching, stopPrecaching, withProviderGuidePage } from "./precaching.ts";
 import { LOG, extractDomain } from "../utils/index.ts";
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
-import { clearLoginState, setBrowserAccessors, startLoginMode } from "./login.ts";
+import { TestClock, settle } from "homebridge-plugin-utils/testing";
+import { afterEach, beforeEach, describe, test } from "node:test";
+import { clearLoginState, setLoginDeps, startLoginMode } from "./login.ts";
 import { getDomainAuthState, markDomainAuthRequired } from "../config/health.ts";
 import type { BlockedPageClassification } from "./blockedPage.ts";
 import { CONFIG } from "../config/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { PersistedLineupChannel } from "../config/providerLineups.ts";
 import type { PrecachingDeps } from "./precaching.ts";
 import type { StartOverlayHandlingOptions } from "./consent.ts";
-import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { setImmediate as immediate } from "node:timers/promises";
+import { useHealthStoreOnClock } from "../config/health.helpers.ts";
 
 // Mutable state the deps stubs read, so each test can shape the provider registry and browser behavior without re-registering stubs.
 let mockGuideUrls: Record<string, string> = {};
@@ -61,46 +67,61 @@ const persistedLineups: { channels: PersistedLineupChannel[]; slug: string }[] =
  * overlayHandlingCalls and logging its launch into pageEvents so the guide-page tests can assert the discovery phase and its abort timing; emulateLayoutSurface
  * logs itself into the same record and answers with a fixed surface, so the walk's declaration is observable in the page-operation order. Typed as the
  * production port so the doubles cannot drift. The health and login modules stay real.
+ *
+ * The set is built by a factory rather than written as a literal because every describe rebuilds it around a fresh clock in its beforeEach: the scheduler's
+ * timers and each walk's deadline arm on deps.clock, so a row that drives a schedule needs its own clock and a ledger no earlier row has written to.
  */
-const deps: PrecachingDeps = {
+function makeDeps(rowClock: Clock): PrecachingDeps {
 
-  createDiscoveryPage: async (browser: Browser): Promise<Page> => {
+  return {
 
-    discoveryPageCreations.push(browser);
+    clock: rowClock,
+    createDiscoveryPage: async (browser: Browser): Promise<Page> => {
 
-    return browser.newPage();
-  },
-  emulateLayoutSurface: async (): Promise<{ height: number; width: number }> => {
+      discoveryPageCreations.push(browser);
 
-    pageEvents.push("layout");
+      return browser.newPage();
+    },
+    emulateLayoutSurface: async (): Promise<{ height: number; width: number }> => {
 
-    return { height: 1080, width: 1920 };
-  },
-  getCurrentBrowser: async (): Promise<Browser> => stubBrowser,
-  getPersistedLineup: (): null => null,
-  getProviderBySlug: (slug: string): ProviderModule | undefined => mockProviders[slug],
-  getProvidersForDomain: (domain: string): ProviderModule[] => Object.entries(mockGuideUrls)
-    .filter(([ , guideUrl ]) => extractDomain(guideUrl) === domain).flatMap(([slug]) => mockProviders[slug] ?? []),
-  isGracefulShutdown: (): boolean => false,
-  persistProviderLineup: async (slug: string, channels: PersistedLineupChannel[]): Promise<void> => {
+      pageEvents.push("layout");
 
-    persistedLineups.push({ channels, slug });
-  },
-  registerManagedPage: (_page: Page, options?: { inFlight?: boolean }): void => {
+      return { height: 1080, width: 1920 };
+    },
+    getCurrentBrowser: async (): Promise<Browser> => stubBrowser,
+    getPersistedLineup: (): null => null,
+    getProviderBySlug: (slug: string): ProviderModule | undefined => mockProviders[slug],
+    getProvidersForDomain: (domain: string): ProviderModule[] => Object.entries(mockGuideUrls)
+      .filter(([ , guideUrl ]) => extractDomain(guideUrl) === domain).flatMap(([slug]) => mockProviders[slug] ?? []),
+    isGracefulShutdown: (): boolean => false,
+    persistProviderLineup: async (slug: string, channels: PersistedLineupChannel[]): Promise<void> => {
 
-    registrations.push(options ?? {});
-  },
-  startOverlayHandling: async (_page: Page, _profile: unknown, options: StartOverlayHandlingOptions): Promise<void> => {
+      persistedLineups.push({ channels, slug });
+    },
+    registerManagedPage: (_page: Page, options?: { inFlight?: boolean }): void => {
 
-    pageEvents.push("poll:" + options.phase);
-    overlayHandlingCalls.push(options);
-  },
-  syncWindowVisibility: async (): Promise<void> => {
+      registrations.push(options ?? {});
+    },
+    startOverlayHandling: async (_page: Page, _profile: unknown, options: StartOverlayHandlingOptions): Promise<void> => {
 
-    windowSyncCalls++;
-  },
-  unregisterManagedPage: (): void => { /* Stub pages need no bookkeeping. */ }
-};
+      pageEvents.push("poll:" + options.phase);
+      overlayHandlingCalls.push(options);
+    },
+    syncWindowVisibility: async (): Promise<void> => {
+
+      windowSyncCalls++;
+    },
+    unregisterManagedPage: (): void => { /* Stub pages need no bookkeeping. */ }
+  };
+}
+
+// The clock every timer the scheduler arms runs on, and the dependency set built around it. Each describe's beforeEach replaces both, so one row's ledger
+// never colors the next.
+let clock = new TestClock();
+let deps: PrecachingDeps = makeDeps(clock);
+
+// The teardown for the health store establishment each describe below holds, assigned by that describe's setup.
+let disposeHealthStore: () => Promise<void>;
 
 // Builds a stub Page satisfying the surface the guarded guide-page session touches. The evaluate stub reports "no consent overlay / no containers" so empty
 // discoveries classify unknown; the revalidation happy paths return non-empty discoveries and never reach classification. Every page operation pushes to pageEvents
@@ -149,30 +170,31 @@ function makeLoginPageStub(): Page {
   } as unknown as Page;
 }
 
+// The scheduler's startup delay and its deferred re-attempt delay, mirroring PRECACHE_DELAY and PRECACHE_RETRY_DELAY in precaching.ts. The module keeps both
+// constants to itself, so the rows here name the same values and go red against a schedule that moves without them.
+const PRECACHE_DELAY = 5000;
+const PRECACHE_RETRY_DELAY = 300000;
+
 /* The ceiling the session holds a single discovery walk to, mirroring DISCOVERY_WALK_TIMEOUT in precaching.ts. The module keeps that constant to itself, so the
  * rows here name the same value and go red against a budget that moves without them.
  */
 const WALK_BUDGET = 60000;
 
-/**
- * Lets every continuation the module queued run to completion, so a row reads settled state rather than a schedule still unwinding. setImmediate is untouched by
- * every timer stand-in this file installs, so each hop is a real macrotask boundary taken after the microtask queue has drained.
+/* The macrotask boundaries a row crosses before it reads settled state, so every continuation the module queued has run rather than a schedule still
+ * unwinding. setImmediate is untouched by every timer stand-in this file installs, so each turn is a real macrotask boundary taken after the microtask
+ * queue has drained.
  */
-async function settle(): Promise<void> {
-
-  for(let hop = 0; hop < 10; hop++) {
-
-    // eslint-disable-next-line no-await-in-loop
-    await immediate();
-  }
-}
+const SETTLE_TURNS = 10;
 
 describe("revalidateDomainAuth", () => {
 
   let originalServices: string[];
 
-  beforeEach(() => {
+  beforeEach(async () => {
 
+    // A fresh clock per row, with the dependency set rebuilt around it, so a schedule this row arms is read on a ledger no earlier row wrote to.
+    clock = new TestClock();
+    deps = makeDeps(clock);
     originalServices = CONFIG.channels.precacheServices;
     CONFIG.channels.precacheServices = [];
 
@@ -183,16 +205,17 @@ describe("revalidateDomainAuth", () => {
 
     clearLoginState();
 
-    // Suppress the health flush debounce timer and the precache scheduling timer so nothing fires against a real data directory after the test ends.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    // The health store's flush debounce arms on the clock this establishment supplies, so the one global timer these rows would otherwise leave to the platform
+    // is virtual and nothing writes to a real data directory after the test ends. The clock is separate from the scheduler's so this arm never colors that ledger.
+    disposeHealthStore = await useHealthStoreOnClock(new TestClock());
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
     stopPrecaching();
     clearLoginState();
     CONFIG.channels.precacheServices = originalServices;
-    mock.timers.reset();
+    await disposeHealthStore();
   });
 
   test("is a no-op when the domain is not flagged needs-sign-in", async (t) => {
@@ -213,7 +236,7 @@ describe("revalidateDomainAuth", () => {
     /* Traced path: the isLoginModeActive() guard. The wizard's sequential sign-in flow re-enters login mode immediately after ending it; revalidating mid-wizard
      * would open a discovery page under the user. The final Done fires the observer with login mode inactive, so deferring loses nothing.
      */
-    setBrowserAccessors({
+    setLoginDeps({
 
       getBrowserInstance: (): Nullable<Browser> => ({ connected: true, newPage: async (): Promise<Page> => makeLoginPageStub() } as unknown as Browser),
       syncWindowVisibility: async (): Promise<void> => { /* Not measured here. */ }
@@ -353,19 +376,25 @@ describe("revalidateDomainAuth", () => {
 
 describe("precacheService - window sync on discovery-page cleanup", () => {
 
-  beforeEach(() => {
+  beforeEach(async () => {
 
+    // A fresh clock per row, with the dependency set rebuilt around it, so a schedule this row arms is read on a ledger no earlier row wrote to.
+    clock = new TestClock();
+    deps = makeDeps(clock);
     windowSyncCalls = 0;
     stubBrowser = { newPage: async (): Promise<Page> => makeStubPage() } as unknown as Browser;
 
     clearLoginState();
-    mock.timers.enable({ apis: ["setTimeout"] });
+
+    // The health store's flush debounce arms on the clock this establishment supplies, so the one global timer these rows would otherwise leave to the platform
+    // is virtual and nothing writes to a real data directory after the test ends. The clock is separate from the scheduler's so this arm never colors that ledger.
+    disposeHealthStore = await useHealthStoreOnClock(new TestClock());
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
     clearLoginState();
-    mock.timers.reset();
+    await disposeHealthStore();
   });
 
   /* Both login states are exercised at this call site because the call is unconditional: precacheService decides nothing about the window, it asks the policy, and
@@ -374,7 +403,7 @@ describe("precacheService - window sync on discovery-page cleanup", () => {
    */
   test("asks for a window sync even while login mode is active", async () => {
 
-    setBrowserAccessors({
+    setLoginDeps({
 
       getBrowserInstance: (): Nullable<Browser> => ({ connected: true, newPage: async (): Promise<Page> => makeLoginPageStub() } as unknown as Browser),
       syncWindowVisibility: async (): Promise<void> => { /* login.ts's own sync path is not under test. */ }
@@ -400,44 +429,50 @@ describe("startPrecaching - graceful-shutdown guard", () => {
 
   let originalServices: string[];
 
-  beforeEach(() => {
+  beforeEach(async () => {
 
+    // A fresh clock per row, with the dependency set rebuilt around it, so a schedule this row arms is read on a ledger no earlier row wrote to.
+    clock = new TestClock();
+    deps = makeDeps(clock);
     originalServices = CONFIG.channels.precacheServices;
     stubBrowser = { newPage: async (): Promise<Page> => makeStubPage() } as unknown as Browser;
 
     // Ensure no prior test left the single-flight guard set, so the positive-control schedule below is not swallowed by the already-in-progress branch.
     stopPrecaching();
     clearLoginState();
-    mock.timers.enable({ apis: ["setTimeout"] });
+
+    // The health store's flush debounce arms on the clock this establishment supplies, so the one global timer these rows would otherwise leave to the platform
+    // is virtual and nothing writes to a real data directory after the test ends. The clock is separate from the scheduler's so this arm never colors that ledger.
+    disposeHealthStore = await useHealthStoreOnClock(new TestClock());
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
     stopPrecaching();
     clearLoginState();
     CONFIG.channels.precacheServices = originalServices;
-    mock.timers.reset();
+    await disposeHealthStore();
   });
 
-  test("schedules no timer during graceful shutdown even with configured precache services", (t) => {
+  test("schedules no timer during graceful shutdown even with configured precache services", () => {
 
     /* Traced path: the isGracefulShutdown() guard between the empty-services check and the precacheInProgress flag. launchBrowser() can be reached during teardown;
-     * without this guard the scheduled cycle would fire after the browser is closed and relaunch Chrome. We spy setTimeout so a queued cycle is directly observable,
-     * then prove the guard is the sole gate by scheduling normally the moment it is lifted.
+     * without this guard the scheduled cycle would fire after the browser is closed and relaunch Chrome. The row's own clock is the instrument: a queued cycle
+     * shows up on it directly, and the guard is proven the sole gate by scheduling normally the moment it is lifted.
      */
-    const scheduled = t.mock.method(globalThis, "setTimeout", (): ReturnType<typeof setTimeout> => 0 as unknown as ReturnType<typeof setTimeout>);
     const shutdownDeps: PrecachingDeps = { ...deps, isGracefulShutdown: (): boolean => true };
 
     CONFIG.channels.precacheServices = ["stub-revalidate"];
 
     startPrecaching(shutdownDeps);
 
-    assert.equal(scheduled.mock.calls.length, 0, "no precache cycle is scheduled while shutting down");
+    assert.equal(clock.pending, 0, "no precache cycle is scheduled while shutting down");
 
-    // Lift only the shutdown guard: the identical call now schedules exactly one cycle, proving the guard was the sole gate keeping the timer off the queue.
+    // Lift only the shutdown guard: the identical call now schedules exactly one cycle, proving the guard was the sole gate keeping the timer off the clock.
     startPrecaching(deps);
 
-    assert.equal(scheduled.mock.calls.length, 1, "the same configuration schedules a cycle once shutdown clears");
+    assert.equal(clock.pending, 1, "the same configuration schedules a cycle once shutdown clears");
+    assert.deepEqual(clock.requested, [PRECACHE_DELAY], "and arms it at the scheduler's own startup delay");
   });
 });
 
@@ -459,78 +494,48 @@ describe("the deferred discovery re-attempt", () => {
   // Which providers report a cached lineup at the moment they are asked, standing in for a lineup that arrived between the cycle and the re-attempt.
   let cachedSlugs = new Set<string>();
 
-  // Every timer the module scheduled but has not had fired or cancelled, keyed by the handle the capture below gave it.
-  let timers = new Map<object, { callback: () => void; delayMs: number }>();
-
   let originalServices: string[];
 
-  beforeEach(() => {
+  beforeEach(async () => {
 
+    // A fresh clock per row, with the dependency set rebuilt around it, so a schedule this row arms is read on a ledger no earlier row wrote to.
+    clock = new TestClock();
+    deps = makeDeps(clock);
     originalServices = CONFIG.channels.precacheServices;
     attempts = {};
     cachedSlugs = new Set();
     discoveryPageCreations = [];
     registrations = [];
-    timers = new Map();
     walks = {};
     walkResults = {};
     stubBrowser = { newPage: async (): Promise<Page> => makeStubPage() } as unknown as Browser;
 
     stopPrecaching();
     clearLoginState();
+
+    // The health store's flush debounce arms on the clock this establishment supplies, so the one global timer these rows would otherwise leave to the platform
+    // is virtual and nothing writes to a real data directory after the test ends. The clock is separate from the scheduler's so this arm never colors that ledger.
+    disposeHealthStore = await useHealthStoreOnClock(new TestClock());
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
     stopPrecaching();
     clearLoginState();
     CONFIG.channels.precacheServices = originalServices;
+    await disposeHealthStore();
   });
 
-  /* Captures the module's scheduling instead of running it, which is how this file drives schedules: a captured timer is fired by the row that means to fire it,
-   * and a cancelled one is removed the way clearTimeout removes a real one. Capture needs no timer enable/reset pair of its own, so unlike a virtual clock it
-   * cannot be disturbed by whatever timer state another suite in this process has installed. node:test restores both methods when the row ends.
-   * @param t - The row's test context, which owns the restoration.
-   */
-  function captureTimers(t: TestContext): void {
-
-    t.mock.method(globalThis, "setTimeout", (callback: () => void, delayMs?: number): unknown => {
-
-      /* Node answers setTimeout with a Timeout object, and the walk deadline unrefs the handle it is given, so the capture answers with an object carrying that
-       * method rather than a bare number. The object is its own identity, which is what the clearTimeout below looks the entry up by.
-       */
-      const handle = { unref: (): void => { /* A captured handle holds no reference to the event loop. */ } };
-
-      timers.set(handle, { callback, delayMs: delayMs ?? 0 });
-
-      return handle;
-    });
-
-    t.mock.method(globalThis, "clearTimeout", (handle?: unknown): void => {
-
-      timers.delete(handle as object);
-    });
-  }
-
   /**
-   * Fires every captured timer scheduled for the given delay, then drains. A delay nothing was scheduled for fires nothing, which is exactly what a row asserting
-   * a cancellation is looking for.
-   * @param delayMs - The delay whose timers to fire.
+   * Advances the row's clock by the given delay and drains, which fires whatever the scheduler had armed to come due there. The scheduler holds at most one
+   * pending item at a time, so a delay nothing was scheduled for fires nothing - exactly what a row asserting a cancellation is looking for.
+   * @param delayMs - The delay to advance the clock by.
    */
   async function fire(delayMs: number): Promise<void> {
 
-    for(const [ handle, timer ] of Array.from(timers)) {
+    clock.advance(delayMs);
 
-      if(timer.delayMs !== delayMs) {
-
-        continue;
-      }
-
-      timers.delete(handle);
-      timer.callback();
-    }
-
-    await settle();
+    await settle(SETTLE_TURNS);
   }
 
   /* Builds a provider whose walks return whatever walkResults holds for its slug and whose cache clear counts the precacheService invocation that performed it.
@@ -561,7 +566,7 @@ describe("the deferred discovery re-attempt", () => {
     } as unknown as ProviderModule;
   }
 
-  test("re-attempts only the services the cycle left empty", async (t) => {
+  test("re-attempts only the services the cycle left empty", async () => {
 
     /* The feature in one row: a boot where one provider's lazy content never appeared inside its walk. The service that came back with a lineup is not touched
      * again - re-walking it would cost a heavy SPA load for an answer already in hand - and the empty one gets exactly one more attempt.
@@ -570,90 +575,90 @@ describe("the deferred discovery re-attempt", () => {
     walkResults = { "deferred-full": ONE_CHANNEL };
     CONFIG.channels.precacheServices = [ "deferred-empty", "deferred-full" ];
 
-    captureTimers(t);
     startPrecaching(deps);
 
-    await fire(5000);
+    await fire(PRECACHE_DELAY);
 
     assert.deepEqual(attempts, { "deferred-empty": 1, "deferred-full": 1 }, "the cycle attempted both services once");
+    assert.equal(clock.pending, 1, "the empty service earned a re-attempt, armed on the injected clock");
+    assert.deepEqual(clock.requested, [ PRECACHE_DELAY, WALK_BUDGET, WALK_BUDGET, PRECACHE_RETRY_DELAY ],
+      "the cycle's startup delay, one walk deadline per service, then the re-attempt's own longer delay");
 
     // The empty service's lineup shows up on the re-attempt, which is the outcome the delay is betting on.
     walkResults = { "deferred-empty": ONE_CHANNEL, "deferred-full": ONE_CHANNEL };
 
-    await fire(300000);
+    await fire(PRECACHE_RETRY_DELAY);
 
     assert.deepEqual(attempts, { "deferred-empty": 2, "deferred-full": 1 }, "only the empty service was re-attempted");
   });
 
-  test("skips a service whose lineup arrived in the interval", async (t) => {
+  test("skips a service whose lineup arrived in the interval", async () => {
 
     // Five minutes is long enough for a full cycle after a browser relaunch, or for a user to hit the discovery endpoint. Either fills the cache, and the pass has
     // nothing left to do for that service.
     mockProviders = { "deferred-empty": deferredProvider("deferred-empty") };
     CONFIG.channels.precacheServices = ["deferred-empty"];
 
-    captureTimers(t);
     startPrecaching(deps);
 
-    await fire(5000);
+    await fire(PRECACHE_DELAY);
 
     assert.deepEqual(attempts, { "deferred-empty": 1 }, "the cycle attempted the service once");
 
     cachedSlugs = new Set(["deferred-empty"]);
 
-    await fire(300000);
+    await fire(PRECACHE_RETRY_DELAY);
 
     assert.deepEqual(attempts, { "deferred-empty": 1 }, "a service that already has a lineup is not walked again");
   });
 
-  test("stopPrecaching cancels the pending pass, and the deferred walk never executes", async (t) => {
+  test("stopPrecaching cancels the pending pass, and the deferred walk never executes", async () => {
 
     // The shutdown guarantee, asserted by outcome: advance well past the delay and find that nothing ran. A cancellation that only dropped a reference would let
     // the timer fire into a closed browser and relaunch Chrome after teardown.
     mockProviders = { "deferred-empty": deferredProvider("deferred-empty") };
     CONFIG.channels.precacheServices = ["deferred-empty"];
 
-    captureTimers(t);
     startPrecaching(deps);
 
-    await fire(5000);
+    await fire(PRECACHE_DELAY);
 
     stopPrecaching();
 
-    await fire(300000);
+    assert.equal(clock.pending, 0, "the stop drained the pending pass off the clock");
+
+    await fire(PRECACHE_RETRY_DELAY);
 
     assert.deepEqual(attempts, { "deferred-empty": 1 }, "the cancelled pass never walked");
   });
 
-  test("a fresh cycle supersedes the pending pass", async (t) => {
+  test("a fresh cycle supersedes the pending pass", async () => {
 
     // A browser relaunch schedules a full cycle over every configured service, the empty ones included. Letting the deferred pass survive alongside it would put
     // two passes over the same guides in contention for one browser.
     mockProviders = { "deferred-empty": deferredProvider("deferred-empty") };
     CONFIG.channels.precacheServices = ["deferred-empty"];
 
-    captureTimers(t);
     startPrecaching(deps);
 
-    await fire(5000);
+    await fire(PRECACHE_DELAY);
 
     assert.deepEqual(attempts, { "deferred-empty": 1 }, "the first cycle ran");
 
     walkResults = { "deferred-empty": ONE_CHANNEL };
 
-    captureTimers(t);
     startPrecaching(deps);
 
-    await fire(5000);
+    await fire(PRECACHE_DELAY);
 
     assert.deepEqual(attempts, { "deferred-empty": 2 }, "the fresh cycle ran its own attempt");
 
-    await fire(300000);
+    await fire(PRECACHE_RETRY_DELAY);
 
     assert.deepEqual(attempts, { "deferred-empty": 2 }, "the superseded pass never fired afterwards");
   });
 
-  test("runs nothing once a graceful shutdown has begun", async (t) => {
+  test("runs nothing once a graceful shutdown has begun", async () => {
 
     // The per-service check inside the pass, and the one at its entry. Both exist because the pass opens discovery pages, and getCurrentBrowser relaunches the
     // Chrome that teardown just closed.
@@ -664,21 +669,20 @@ describe("the deferred discovery re-attempt", () => {
     mockProviders = { "deferred-empty": deferredProvider("deferred-empty") };
     CONFIG.channels.precacheServices = ["deferred-empty"];
 
-    captureTimers(t);
     startPrecaching(shutdownDeps);
 
-    await fire(5000);
+    await fire(PRECACHE_DELAY);
 
     assert.deepEqual(attempts, { "deferred-empty": 1 }, "the cycle ran before shutdown began");
 
     shuttingDown = true;
 
-    await fire(300000);
+    await fire(PRECACHE_RETRY_DELAY);
 
     assert.deepEqual(attempts, { "deferred-empty": 1 }, "the pass opened no discovery page during teardown");
   });
 
-  test("a full-cycle request that arrives while the guard is held runs once the guard is released", async (t) => {
+  test("a full-cycle request that arrives while the guard is held runs once the guard is released", async () => {
 
     /* The dropped-cycle hand-off. A browser crash relaunch calls startPrecaching while a run still holds the guard, and that run is walking guides for a browser
      * whose caches the relaunch just cleared - so its result is worth nothing and the request must not be discarded. The assertion is the second cycle actually running,
@@ -690,10 +694,9 @@ describe("the deferred discovery re-attempt", () => {
 
     CONFIG.channels.precacheServices = ["deferred-full"];
 
-    captureTimers(t);
     startPrecaching(deps);
 
-    await fire(5000);
+    await fire(PRECACHE_DELAY);
 
     assert.deepEqual(attempts, { "deferred-full": 1 }, "the first cycle is in flight");
 
@@ -706,8 +709,8 @@ describe("the deferred discovery re-attempt", () => {
 
     gate.resolve(ONE_CHANNEL);
 
-    await settle();
-    await fire(5000);
+    await settle(SETTLE_TURNS);
+    await fire(PRECACHE_DELAY);
 
     assert.deepEqual(attempts, { "deferred-full": 2 }, "the deferred full cycle ran after the guard was released");
   });
@@ -726,10 +729,9 @@ describe("the deferred discovery re-attempt", () => {
 
     CONFIG.channels.precacheServices = ["deferred-wedged"];
 
-    captureTimers(t);
     startPrecaching(deps);
 
-    await fire(5000);
+    await fire(PRECACHE_DELAY);
 
     assert.deepEqual(attempts, { "deferred-wedged": 1 }, "the cycle attempted the service and its walk is still running");
 
@@ -750,7 +752,7 @@ describe("the deferred discovery re-attempt", () => {
     mockProviders = { "deferred-wedged": deferredProvider("deferred-wedged") };
     walkResults = { "deferred-wedged": ONE_CHANNEL };
 
-    await fire(300000);
+    await fire(PRECACHE_RETRY_DELAY);
 
     assert.deepEqual(attempts, { "deferred-wedged": 2 }, "the stopped service was re-attempted");
 
@@ -768,17 +770,16 @@ describe("the deferred discovery re-attempt", () => {
     mockProviders = { "deferred-wedged": deferredProvider("deferred-wedged") };
     CONFIG.channels.precacheServices = ["deferred-wedged"];
 
-    captureTimers(t);
     startPrecaching(deps);
 
-    await fire(5000);
+    await fire(PRECACHE_DELAY);
 
     assert.deepEqual(attempts, { "deferred-wedged": 1 }, "the cycle walked the service and found nothing, so the pass is armed");
 
     // The pass meets a walk that never answers.
     mockProviders = { "deferred-wedged": { ...deferredProvider("deferred-wedged"), discoverChannels: async (): Promise<DiscoveredChannel[]> => hang.promise } };
 
-    await fire(300000);
+    await fire(PRECACHE_RETRY_DELAY);
     await fire(WALK_BUDGET);
 
     const lapseCall = warn.mock.calls.find((call) => String(call.arguments[0]).includes("discovery walk exceeded"));
@@ -790,7 +791,7 @@ describe("the deferred discovery re-attempt", () => {
     mockProviders = { "deferred-wedged": deferredProvider("deferred-wedged") };
     walkResults = { "deferred-wedged": ONE_CHANNEL };
 
-    await fire(300000);
+    await fire(PRECACHE_RETRY_DELAY);
 
     assert.deepEqual(attempts, { "deferred-wedged": 2 }, "the lapse ended the schedule rather than restarting it");
 
@@ -826,7 +827,7 @@ describe("the deferred discovery re-attempt", () => {
      */
     async function startStubLogin(): Promise<void> {
 
-      setBrowserAccessors({
+      setLoginDeps({
 
         getBrowserInstance: (): Nullable<Browser> => ({ connected: true, newPage: async (): Promise<Page> => makeLoginPageStub() } as unknown as Browser),
         syncWindowVisibility: async (): Promise<void> => { /* login.ts's own sync path is not under test here. */ }
@@ -847,13 +848,11 @@ describe("the deferred discovery re-attempt", () => {
       mockProviders = { "deferred-login": deferredProvider("deferred-login") };
       CONFIG.channels.precacheServices = ["deferred-login"];
 
-      captureTimers(t);
-
       await startStubLogin();
 
       startPrecaching(deps);
 
-      await fire(5000);
+      await fire(PRECACHE_DELAY);
 
       assert.deepEqual(discoveryPageCreations, [], "the cycle opened no discovery window while the session was on screen");
       assert.deepEqual(walks, {}, "and ran no discovery walk");
@@ -872,13 +871,13 @@ describe("the deferred discovery re-attempt", () => {
 
       clearLoginState();
 
-      await fire(300000);
+      await fire(PRECACHE_RETRY_DELAY);
 
       assert.equal(discoveryPageCreations.length, 1, "the re-attempt opened the discovery window it deferred");
       assert.deepEqual(walks, { "deferred-login": 1 }, "and walked the service exactly once");
     });
 
-    test("a re-attempt that meets a login session re-arms every service it still owes, not just the one it stopped on", async (t) => {
+    test("a re-attempt that meets a login session re-arms every service it still owes, not just the one it stopped on", async () => {
 
       /* The re-arm has to carry the whole remainder. A pass that armed only the slug it collided with would drop every service behind it in the queue, and
        * those services would never be walked at all - so the row queues two, collides on the first, and counts the walks after the session ends.
@@ -886,10 +885,9 @@ describe("the deferred discovery re-attempt", () => {
       mockProviders = { "deferred-first": deferredProvider("deferred-first"), "deferred-second": deferredProvider("deferred-second") };
       CONFIG.channels.precacheServices = [ "deferred-first", "deferred-second" ];
 
-      captureTimers(t);
       startPrecaching(deps);
 
-      await fire(5000);
+      await fire(PRECACHE_DELAY);
 
       // Counted as precacheService invocations, exactly as the rows above count them: an empty walk gets the session's own reload-and-retry, so the walk count
       // for an empty service is two and says nothing about the schedule.
@@ -902,30 +900,29 @@ describe("the deferred discovery re-attempt", () => {
       walks = {};
       walkResults = { "deferred-first": ONE_CHANNEL, "deferred-second": ONE_CHANNEL };
 
-      await fire(300000);
+      await fire(PRECACHE_RETRY_DELAY);
 
       assert.deepEqual(discoveryPageCreations, [], "the pass opened no discovery window while the session was on screen");
       assert.deepEqual(walks, {}, "and walked nothing");
 
       clearLoginState();
 
-      await fire(300000);
+      await fire(PRECACHE_RETRY_DELAY);
 
       assert.equal(discoveryPageCreations.length, 2, "the re-armed pass opened one window per service it still owed");
       assert.deepEqual(walks, { "deferred-first": 1, "deferred-second": 1 }, "both services were walked, not only the one the pass stopped on");
     });
 
-    test("the cycle walks the service normally when no login session is on screen", async (t) => {
+    test("the cycle walks the service normally when no login session is on screen", async () => {
 
       // The guard's other side, so the row above cannot pass by the cycle being broken for every service rather than deferring for this one.
       mockProviders = { "deferred-login": deferredProvider("deferred-login") };
       walkResults = { "deferred-login": ONE_CHANNEL };
       CONFIG.channels.precacheServices = ["deferred-login"];
 
-      captureTimers(t);
       startPrecaching(deps);
 
-      await fire(5000);
+      await fire(PRECACHE_DELAY);
 
       assert.equal(discoveryPageCreations.length, 1, "the cycle opened the discovery window");
       assert.deepEqual(walks, { "deferred-login": 1 }, "and walked the service");
@@ -943,13 +940,11 @@ describe("the deferred discovery re-attempt", () => {
       CONFIG.channels.precacheServices = [ "login-filtered", "login-kept" ];
       CONFIG.channels.enabledServices = ["login-kept"];
 
-      captureTimers(t);
-
       await startStubLogin();
 
       startPrecaching(deps);
 
-      await fire(5000);
+      await fire(PRECACHE_DELAY);
 
       assert.deepEqual(discoveryPageCreations, [], "neither service opened a discovery window");
 
@@ -967,7 +962,7 @@ describe("the deferred discovery re-attempt", () => {
 
       clearLoginState();
 
-      await fire(300000);
+      await fire(PRECACHE_RETRY_DELAY);
 
       assert.deepEqual(walks, { "login-kept": 1 }, "the re-attempt walked only the service the filter allows");
     });
@@ -987,10 +982,9 @@ describe("the deferred discovery re-attempt", () => {
 
       CONFIG.channels.precacheServices = [ "pass-cached", "pass-walks", "pass-late-cached", "pass-collides" ];
 
-      captureTimers(t);
       startPrecaching(deps);
 
-      await fire(5000);
+      await fire(PRECACHE_DELAY);
 
       assert.deepEqual(attempts, { "pass-cached": 1, "pass-collides": 1, "pass-late-cached": 1, "pass-walks": 1 },
         "the cycle attempted all four and every one came back empty, so all four are owed a second pass");
@@ -1012,7 +1006,7 @@ describe("the deferred discovery re-attempt", () => {
           return ONE_CHANNEL;
         } } };
 
-      await fire(300000);
+      await fire(PRECACHE_RETRY_DELAY);
 
       const skipped = debug.mock.calls.filter((call) => String(call.arguments[1]).includes("its lineup was discovered in the meantime"))
         .map((call) => String(call.arguments[2]));
@@ -1030,7 +1024,7 @@ describe("the deferred discovery re-attempt", () => {
 
       clearLoginState();
 
-      await fire(300000);
+      await fire(PRECACHE_RETRY_DELAY);
 
       assert.deepEqual(walks, { "pass-collides": 1 }, "the re-armed pass walked exactly the remainder the session stopped it on");
     });
@@ -1064,10 +1058,9 @@ describe("the deferred discovery re-attempt", () => {
 
       CONFIG.channels.precacheServices = [ "cycle-unsettled", "cycle-deferred" ];
 
-      captureTimers(t);
       startPrecaching(deps);
 
-      await fire(5000);
+      await fire(PRECACHE_DELAY);
 
       const completionCall = info.mock.calls.find((call) => String(call.arguments[0]).includes("Channel lineup precaching complete"));
 
@@ -1088,8 +1081,11 @@ describe("runPrecacheCycle - deps threading through the internal precacheService
 
   let originalServices: string[];
 
-  beforeEach(() => {
+  beforeEach(async () => {
 
+    // A fresh clock per row, with the dependency set rebuilt around it, so a schedule this row arms is read on a ledger no earlier row wrote to.
+    clock = new TestClock();
+    deps = makeDeps(clock);
     originalServices = CONFIG.channels.precacheServices;
 
     windowSyncCalls = 0;
@@ -1099,16 +1095,21 @@ describe("runPrecacheCycle - deps threading through the internal precacheService
 
     stopPrecaching();
     clearLoginState();
+
+    // The health store's flush debounce arms on the clock this establishment supplies, so the one global timer these rows would otherwise leave to the platform
+    // is virtual and nothing writes to a real data directory after the test ends. The clock is separate from the scheduler's so this arm never colors that ledger.
+    disposeHealthStore = await useHealthStoreOnClock(new TestClock());
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
     stopPrecaching();
     clearLoginState();
     CONFIG.channels.precacheServices = originalServices;
+    await disposeHealthStore();
   });
 
-  test("threads the injected deps through to precacheService rather than falling back to defaultPrecachingDeps", async (t) => {
+  test("threads the injected deps through to precacheService rather than falling back to defaultPrecachingDeps", async () => {
 
     /* Traced path: runPrecacheCycle's per-service call site, `precacheService(provider, deps)`. precacheService's own signature defaults its second parameter to
      * defaultPrecachingDeps, so a call site that drops deps silently falls back to the module's real browser accessors instead of the cycle's injected stub - in
@@ -1118,21 +1119,11 @@ describe("runPrecacheCycle - deps threading through the internal precacheService
      * module-level `deps` object the other describe blocks share, so a regression cannot hide behind a call the shared object's own getCurrentBrowser happens to
      * satisfy.
      *
-     * We capture the cycle's scheduled setTimeout callback directly via t.mock.method (the same spy technique the graceful-shutdown-guard test above uses) and
-     * invoke it ourselves, rather than driving it through mock.timers' virtual clock - the callback fires synchronously either way, and capture-and-invoke needs
-     * no per-test enable/reset pair, so it cannot interact with whatever timer state an unrelated earlier test in this file left behind. The single configured
-     * service slug means the cycle's loop runs exactly once and terminates on its own; no re-scheduled timer or second pass follows.
+     * The cycle itself is driven off the row's own clock, which is where the scheduler arms it: advancing to the startup delay runs the callback exactly as the
+     * platform would, on a timeline no other row in this file shares. The single configured service slug means the cycle's loop runs exactly once and terminates
+     * on its own; no re-scheduled timer or second pass follows.
      */
     let getCurrentBrowserCalls = 0;
-    let scheduledCallback: (() => void) | undefined;
-
-    t.mock.method(globalThis, "setTimeout", (callback: () => void): ReturnType<typeof setTimeout> => {
-
-      scheduledCallback ??= callback;
-
-      // The walk arms a deadline of its own through this same capture, and that handle is unrefd, so the stand-in carries the method Node's Timeout would.
-      return { unref: (): void => { /* A captured handle holds no reference to the event loop. */ } } as unknown as ReturnType<typeof setTimeout>;
-    });
 
     const fakeDeps: PrecachingDeps = {
 
@@ -1149,8 +1140,9 @@ describe("runPrecacheCycle - deps threading through the internal precacheService
 
     startPrecaching(fakeDeps);
 
-    assert.ok(scheduledCallback, "startPrecaching schedules the cycle");
-    scheduledCallback();
+    assert.equal(clock.pending, 1, "startPrecaching armed the cycle on the injected clock");
+
+    clock.advance(PRECACHE_DELAY);
 
     // Bounded macrotask drain: setImmediate always fires after the entire microtask queue - including continuations queued while draining - has emptied, so two
     // hops give ample margin for precacheService's full await chain (getCurrentBrowser -> newPage -> discoverChannels -> recordDiscoveryOutcome -> page.close ->
@@ -1165,18 +1157,24 @@ describe("runPrecacheCycle - deps threading through the internal precacheService
 
 describe("precacheService - navigation and cleanup", () => {
 
-  beforeEach(() => {
+  beforeEach(async () => {
 
+    // A fresh clock per row, with the dependency set rebuilt around it, so a schedule this row arms is read on a ledger no earlier row wrote to.
+    clock = new TestClock();
+    deps = makeDeps(clock);
     windowSyncCalls = 0;
 
     clearLoginState();
-    mock.timers.enable({ apis: ["setTimeout"] });
+
+    // The health store's flush debounce arms on the clock this establishment supplies, so the one global timer these rows would otherwise leave to the platform
+    // is virtual and nothing writes to a real data directory after the test ends. The clock is separate from the scheduler's so this arm never colors that ledger.
+    disposeHealthStore = await useHealthStoreOnClock(new TestClock());
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
     clearLoginState();
-    mock.timers.reset();
+    await disposeHealthStore();
   });
 
   test("navigates to the guide URL when the provider does not handle its own navigation", async () => {
@@ -1274,19 +1272,25 @@ describe("precacheService - navigation and cleanup", () => {
  */
 describe("precacheService - the lineup write through the injection port", () => {
 
-  beforeEach(() => {
+  beforeEach(async () => {
 
+    // A fresh clock per row, with the dependency set rebuilt around it, so a schedule this row arms is read on a ledger no earlier row wrote to.
+    clock = new TestClock();
+    deps = makeDeps(clock);
     persistedLineups.length = 0;
     windowSyncCalls = 0;
 
     clearLoginState();
-    mock.timers.enable({ apis: ["setTimeout"] });
+
+    // The health store's flush debounce arms on the clock this establishment supplies, so the one global timer these rows would otherwise leave to the platform
+    // is virtual and nothing writes to a real data directory after the test ends. The clock is separate from the scheduler's so this arm never colors that ledger.
+    disposeHealthStore = await useHealthStoreOnClock(new TestClock());
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
     clearLoginState();
-    mock.timers.reset();
+    await disposeHealthStore();
   });
 
   test("a completed walk hands the provider's durable lineup to the injected write", async () => {
@@ -1334,8 +1338,11 @@ describe("precacheService - the lineup write through the injection port", () => 
 
 describe("withProviderGuidePage", () => {
 
-  beforeEach(() => {
+  beforeEach(async () => {
 
+    // A fresh clock per row, with the dependency set rebuilt around it, so a schedule this row arms is read on a ledger no earlier row wrote to.
+    clock = new TestClock();
+    deps = makeDeps(clock);
     discoveryPageCreations = [];
     newPageOptions = [];
     overlayHandlingCalls = [];
@@ -1354,13 +1361,16 @@ describe("withProviderGuidePage", () => {
     } as unknown as Browser;
 
     clearLoginState();
-    mock.timers.enable({ apis: ["setTimeout"] });
+
+    // The health store's flush debounce arms on the clock this establishment supplies, so the one global timer these rows would otherwise leave to the platform
+    // is virtual and nothing writes to a real data directory after the test ends. The clock is separate from the scheduler's so this arm never colors that ledger.
+    disposeHealthStore = await useHealthStoreOnClock(new TestClock());
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
     clearLoginState();
-    mock.timers.reset();
+    await disposeHealthStore();
   });
 
   /* Builds a stub ProviderModule for the guarded guide-page session. handlesOwnNavigation controls whether the helper drives page.goto or the provider is presumed
@@ -1406,6 +1416,7 @@ describe("withProviderGuidePage", () => {
 
     assert.ok(firstPoll, "the overlay poll was recorded");
     assert.equal(firstPoll.phase, "discovery", "the guide walk runs under the discovery phase");
+    assert.equal(firstPoll.clock, clock, "the poll runs on the scheduler's own clock rather than on a hard-coded system clock");
     assert.ok(pageEvents.indexOf("mute") < pageEvents.indexOf("goto"), "the mute override installs before navigation");
     assert.ok(pageEvents.indexOf("poll:discovery") < pageEvents.indexOf("goto"), "the discovery poll launches before navigation");
     assert.equal(signalAbortedInAfterWalk, true, "the overlay poll is aborted before afterWalk classifies the page");
@@ -1522,41 +1533,24 @@ describe("withProviderGuidePage", () => {
     assert.deepEqual(registrations, [{ inFlight: true }], "the page is registered exactly once, marked as held in flight");
   });
 
-  test("stops a walk that outlives its budget, closing its page before the rejection surfaces", async (t) => {
+  test("stops a walk that outlives its budget, closing its page before the rejection surfaces", async () => {
 
     /* The deadline has to cancel the walk, not merely stop waiting on it: a walk left running would keep driving a page the session has moved on from. Closing
-     * the page is the cancellation, so the row reads the close the instant the deadline fires - synchronously, before the rejection has had a microtask to
-     * propagate - and only then reads the typed rejection.
-     *
-     * The deadline's own timer is captured and fired by hand rather than driven through the virtual clock, which is the technique the deps-threading row above
-     * sets out: a captured callback fires synchronously either way and cannot be disturbed by whatever timer state an unrelated row in this file left behind.
-     * Capturing the delay is also what proves the budget is the one the module declares rather than some other timer.
+     * the page is the cancellation, so the row reads the close the instant the deadline fires - synchronously inside the advance, before the rejection has had a
+     * microtask to propagate - and only then reads the typed rejection. The clock's ledger is also what proves the budget is the one the module declares rather
+     * than some other timer.
      */
-    const armedDelays: number[] = [];
-    const lapses: (() => void)[] = [];
-
-    t.mock.method(globalThis, "setTimeout", (callback: () => void, delayMs?: number): unknown => {
-
-      armedDelays.push(delayMs ?? 0);
-      lapses.push(callback);
-
-      return { unref: (): void => { /* A captured handle holds no reference to the event loop. */ } };
-    });
-
     const hang = Promise.withResolvers<DiscoveredChannel[]>();
     const provider = guideProvider(true, async (): Promise<DiscoveredChannel[]> => hang.promise);
     const pending = withProviderGuidePage(provider, {}, deps);
 
-    await settle();
+    await settle(SETTLE_TURNS);
 
-    assert.deepEqual(armedDelays, [WALK_BUDGET], "the walk armed exactly one timer, at the budget the module declares");
+    assert.equal(clock.pending, 1, "the walk armed exactly one deadline on the injected clock");
+    assert.deepEqual(clock.requested, [WALK_BUDGET], "at the budget the module declares");
     assert.ok(!pageEvents.includes("close"), "the page stays open while the walk is inside its budget");
 
-    const lapse = lapses[0];
-
-    assert.ok(lapse, "the deadline's timer was captured");
-
-    lapse();
+    clock.advance(WALK_BUDGET);
 
     assert.equal(pageEvents.filter((event) => event === "close").length, 1, "the lapse itself closed the page, before the rejection could unwind the session");
 
@@ -1583,8 +1577,11 @@ describe("withProviderGuidePage - the empty-walk retry", () => {
   // What the outcome hook was handed, one entry per call. A retry that recorded twice, or recorded the wrong walk's result, shows up here.
   let recorded: { channels: DiscoveredChannel[]; classification?: BlockedPageClassification }[] = [];
 
-  beforeEach(() => {
+  beforeEach(async () => {
 
+    // A fresh clock per row, with the dependency set rebuilt around it, so a schedule this row arms is read on a ledger no earlier row wrote to.
+    clock = new TestClock();
+    deps = makeDeps(clock);
     overlayHandlingCalls = [];
     retryEvents = [];
     recorded = [];
@@ -1592,13 +1589,16 @@ describe("withProviderGuidePage - the empty-walk retry", () => {
     walks = 0;
 
     clearLoginState();
-    mock.timers.enable({ apis: ["setTimeout"] });
+
+    // The health store's flush debounce arms on the clock this establishment supplies, so the one global timer these rows would otherwise leave to the platform
+    // is virtual and nothing writes to a real data directory after the test ends. The clock is separate from the scheduler's so this arm never colors that ledger.
+    disposeHealthStore = await useHealthStoreOnClock(new TestClock());
   });
 
-  afterEach(() => {
+  afterEach(async () => {
 
     clearLoginState();
-    mock.timers.reset();
+    await disposeHealthStore();
   });
 
   /* Builds the stub page the retry rows run against. Its evaluate routes on the argument shape, mirroring the precaching.test.ts convention: a string array is the
@@ -1697,6 +1697,7 @@ describe("withProviderGuidePage - the empty-walk retry", () => {
 
     assert.equal(overlayHandlingCalls.length, 2, "one poll per walk");
     assert.deepEqual(overlayHandlingCalls.map((call) => call.phase), [ "discovery", "discovery" ], "both polls run under the discovery phase");
+    assert.deepEqual(overlayHandlingCalls.map((call) => call.clock), [ clock, clock ], "both polls run on the scheduler's own clock");
     assert.equal(overlayHandlingCalls[1]?.signal?.aborted, true, "the retry's poll is aborted once its walk completes");
   });
 
@@ -1816,21 +1817,13 @@ describe("withProviderGuidePage - the empty-walk retry", () => {
     assert.deepEqual(channels, [], "the first walk's result stands");
   });
 
-  test("gives the retry a budget of its own rather than the remainder of the first walk's", async (t) => {
+  test("gives the retry a budget of its own rather than the remainder of the first walk's", async () => {
 
     /* Each walk arms its own deadline, which is what keeps the retry bounded exactly like the first attempt: a retry sharing one budget with the walk before it
-     * would inherit whatever that walk had already spent, and on a slow guide it would be cut off before it began. The row reads the timers the session arms -
-     * one per walk, each at the full budget - and then fires the retry's own, which is the deadline that has to be the live one.
+     * would inherit whatever that walk had already spent, and on a slow guide it would be cut off before it began. The row reads the deadlines the session armed
+     * off the clock's ledger - one per walk, each at the full budget - and then fires the retry's own, which is the deadline that has to be the live one: the
+     * first walk's was disposed when that walk settled, so the next deadline the clock holds is the retry's.
      */
-    const armed: { callback: () => void; delayMs: number }[] = [];
-
-    t.mock.method(globalThis, "setTimeout", (callback: () => void, delayMs?: number): unknown => {
-
-      armed.push({ callback, delayMs: delayMs ?? 0 });
-
-      return { unref: (): void => { /* A captured handle holds no reference to the event loop. */ } };
-    });
-
     const hang = Promise.withResolvers<DiscoveredChannel[]>();
 
     stubBrowser = { newPage: async (): Promise<Page> => makeRetryPage() } as unknown as Browser;
@@ -1849,21 +1842,13 @@ describe("withProviderGuidePage - the empty-walk retry", () => {
 
     const pending = withProviderGuidePage(provider, { afterWalk }, deps);
 
-    await settle();
+    await settle(SETTLE_TURNS);
 
     assert.equal(walks, 2, "the empty first walk earned its retry");
+    assert.deepEqual(clock.requested, [ WALK_BUDGET, WALK_BUDGET ], "each walk armed a deadline of its own, both at the full budget");
+    assert.equal(clock.pending, 1, "only the retry's deadline is still live - the first walk's was disposed when that walk settled");
 
-    // The classification between the walks arms a timer of its own, so the walk deadlines are read by their budget rather than by position in the whole list.
-    const walkDeadlines = armed.filter((timer) => timer.delayMs === WALK_BUDGET);
-
-    assert.equal(walkDeadlines.length, 2, "each walk armed a deadline of its own, both at the full budget");
-
-    const retryLapse = walkDeadlines[1];
-
-    assert.ok(retryLapse, "the retry's own deadline was captured");
-
-    retryLapse.callback();
-
+    assert.ok(clock.advanceToNext(), "the clock stepped to the retry's deadline");
     assert.ok(retryEvents.includes("close"), "the retry's lapse closes the page");
 
     await assert.rejects(pending, DiscoveryWalkTimeoutError, "and the retry's lapse is what the session rejects with");

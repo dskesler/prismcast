@@ -9,15 +9,16 @@ import { createDiscoveryPage, emulateLayoutSurface, getCurrentBrowser, isGracefu
   unregisterManagedPage } from "./index.ts";
 import { getPersistedLineup, persistProviderLineup } from "../config/providerLineups.ts";
 import { getProviderBySlug, getProvidersForDomain } from "./channelSelection.ts";
+import { systemClock, waitWithSignal } from "homebridge-plugin-utils";
 import type { BlockedPageClassification } from "./blockedPage.ts";
 import { CONFIG } from "../config/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Page } from "puppeteer-core";
 import type { PersistedLineupChannel } from "../config/providerLineups.ts";
 import { classifyBlockedPage } from "./blockedPage.ts";
 import { getProfileForUrl } from "../config/profiles.ts";
 import { isLoginModeActive } from "./login.ts";
 import { startOverlayHandling } from "./consent.ts";
-import { waitWithSignal } from "homebridge-plugin-utils";
 
 /* Precaching discovers channel lineups for selected services at startup so that even the first tune benefits from cached lineup data. Each service is precached
  * sequentially - discovery opens a browser page in a window of its own and navigates to a heavy SPA, so running all services concurrently would stress CPU and
@@ -32,6 +33,9 @@ import { waitWithSignal } from "homebridge-plugin-utils";
  * mutator or the lineup store directly - it calls the recorder, which does. The page session itself is owned by withProviderGuidePage: the single guarded-page
  * primitive both the precache cycle and that endpoint walk their guides through, and the one place the empty-walk retry policy lives, so no provider carries a
  * retry of its own.
+ *
+ * Every timer and deadline this module arms - the startup cycle's delay, the deferred re-attempt, and each walk's ceiling - runs on the clock its dependencies
+ * carry, so one injected clock drives the whole schedule.
  */
 
 // Delay in milliseconds before precaching begins after browser launch. This gives the browser time to settle after initialization.
@@ -85,13 +89,15 @@ export class DiscoveryWalkTimeoutError extends Error {
 // Guard flag preventing overlapping precache cycles. Set to true before the cycle starts, cleared through releasePrecacheGuard in a finally block.
 let precacheInProgress = false;
 
-// Handle for the scheduled precache cycle, tracked so a graceful shutdown can cancel it before it fires. Null when no cycle is pending.
-let precacheTimer: Nullable<ReturnType<typeof setTimeout>> = null;
-
-/* The pending deferred re-attempt: the services still to re-walk and the timer that will do it. One value rather than two fields, so arming, cancelling, and
- * firing each move the whole thing at once - a slug list with no timer behind it, or a timer whose slugs were cleared, is not a state this can reach.
+/* What the scheduler has pending: the startup cycle, or the deferred re-attempt with the services it still owes a walk. One union rather than two fields, because
+ * the two are one concept - the work this module has scheduled - and never both at once: a full cycle cancels a pending re-attempt before it arms, and a
+ * re-attempt is only armed once a cycle has run. Holding whichever is pending together with its handle means arming, cancelling, and firing each move the whole
+ * thing at once, and "both armed" is a state the type cannot express.
  */
-let deferredRetry: Nullable<{ slugs: string[]; timer: ReturnType<typeof setTimeout> }> = null;
+type ScheduledPrecache = { readonly kind: "cycle"; readonly timer: Disposable } | { readonly kind: "deferred"; readonly slugs: string[]; readonly timer: Disposable };
+
+// The scheduler's pending work, or null when it has none.
+let scheduled: Nullable<ScheduledPrecache> = null;
 
 /* Whether a full precache cycle was requested while the single-flight guard was held. The request always comes from a browser relaunch, which cleared every
  * provider cache, so the run holding the guard is walking guides for a browser that no longer exists and its result is worth nothing - dropping the request would
@@ -100,15 +106,16 @@ let deferredRetry: Nullable<{ slugs: string[]; timer: ReturnType<typeof setTimeo
 let fullCycleRequested = false;
 
 /**
- * Cancels a pending deferred re-attempt and drops its state as one unit. A no-op when nothing is pending.
+ * Cancels a pending deferred re-attempt and drops its state as one unit. A no-op when nothing is pending, and equally a no-op when what is pending is a cycle -
+ * only the re-attempt arm is cancelled here.
  */
 function clearDeferredRetry(): void {
 
-  if(deferredRetry) {
+  if(scheduled?.kind === "deferred") {
 
-    clearTimeout(deferredRetry.timer);
+    scheduled.timer[Symbol.dispose]();
 
-    deferredRetry = null;
+    scheduled = null;
   }
 }
 
@@ -145,9 +152,13 @@ function releasePrecacheGuard(deps: PrecachingDeps): void {
  * write - and injects a failing one - and states the saved lineup the plausibility guard reads against, both at this boundary. It is kept as an in-module const,
  * NOT a separate *.context.ts adapter: browser/index.ts imports startPrecaching and precaching.ts imports these accessors, so a separate adapter file would sit
  * inside that value-import cycle, whereas the in-module const adds no new import edge.
- * This is the collaborator-injection form of the Clock port (utils/clock.ts).
+ * The interface carries the library's Clock itself as one of its members, so the scheduler's time source arrives at the same boundary as its collaborators.
  */
 export interface PrecachingDeps {
+
+  // The clock the startup delay, the deferred re-attempt, each walk's deadline, and the discovery-phase overlay polls all run on. Production wires the system
+  // clock; a test wires a virtual clock and drives the whole schedule from one advance.
+  readonly clock: Clock;
 
   readonly createDiscoveryPage: typeof createDiscoveryPage;
   readonly emulateLayoutSurface: typeof emulateLayoutSurface;
@@ -165,6 +176,7 @@ export interface PrecachingDeps {
 
 export const defaultPrecachingDeps: PrecachingDeps = {
 
+  clock: systemClock,
   createDiscoveryPage,
   emulateLayoutSurface,
   getCurrentBrowser,
@@ -181,7 +193,8 @@ export const defaultPrecachingDeps: PrecachingDeps = {
 
 /**
  * Starts the precaching cycle if services are configured. Called from launchBrowser() after the browser is ready. If no services are selected, a shutdown is in
- * progress, or a precache cycle is already in progress, returns immediately. The actual work is scheduled via setTimeout to avoid blocking browser launch.
+ * progress, or a precache cycle is already in progress, returns immediately. The actual work is scheduled on the dependencies' clock to avoid blocking browser
+ * launch.
  * @param deps - The injected browser and provider-registry dependencies; defaults to defaultPrecachingDeps.
  */
 export function startPrecaching(deps: PrecachingDeps = defaultPrecachingDeps): void {
@@ -218,11 +231,11 @@ export function startPrecaching(deps: PrecachingDeps = defaultPrecachingDeps): v
 
   // Schedule the precache cycle after a brief delay to let the browser settle. The handle is tracked so stopPrecaching() can cancel it if shutdown begins during the
   // delay window; the ref is cleared when the timer fires since it is then spent.
-  precacheTimer = setTimeout(() => {
+  scheduled = { kind: "cycle", timer: deps.clock.schedule(() => {
 
-    precacheTimer = null;
+    scheduled = null;
     void runPrecacheCycle(deps);
-  }, PRECACHE_DELAY);
+  }, PRECACHE_DELAY) };
 }
 
 /**
@@ -234,10 +247,10 @@ export function startPrecaching(deps: PrecachingDeps = defaultPrecachingDeps): v
  */
 export function stopPrecaching(): void {
 
-  if(precacheTimer) {
+  if(scheduled) {
 
-    clearTimeout(precacheTimer);
-    precacheTimer = null;
+    scheduled.timer[Symbol.dispose]();
+    scheduled = null;
   }
 
   clearDeferredRetry();
@@ -368,13 +381,14 @@ export async function recordDiscoveryOutcome(provider: ProviderModule, channels:
  * travels through untouched. Each call gets its own budget, which is what lets an empty walk's retry be bounded exactly like the first attempt.
  * @param provider - The provider whose walk to run.
  * @param page - The guide page the walk runs against, closed if the deadline lapses.
+ * @param clock - The clock the deadline arms on.
  * @returns The discovered channels (possibly empty).
  * @throws DiscoveryWalkTimeoutError when the walk outlives its budget, and whatever the walk itself rejected with otherwise.
  */
-async function walkWithDeadline(provider: ProviderModule, page: Page): Promise<DiscoveredChannel[]> {
+async function walkWithDeadline(provider: ProviderModule, page: Page, clock: Clock): Promise<DiscoveredChannel[]> {
 
   const lapse = new DiscoveryWalkTimeoutError(provider.label, DISCOVERY_WALK_TIMEOUT);
-  const deadline = timeoutSignal(DISCOVERY_WALK_TIMEOUT, lapse);
+  const deadline = timeoutSignal(DISCOVERY_WALK_TIMEOUT, { clock, reason: lapse });
 
   deadline.signal.addEventListener("abort", () => {
 
@@ -488,9 +502,9 @@ async function retryAfterEmptyWalk(options: RetryAfterEmptyWalkOptions): Promise
 
   try {
 
-    void deps.startOverlayHandling(page, profile, { phase: "discovery", signal: retryController.signal });
+    void deps.startOverlayHandling(page, profile, { clock: deps.clock, phase: "discovery", signal: retryController.signal });
 
-    return { channels: await walkWithDeadline(provider, page) };
+    return { channels: await walkWithDeadline(provider, page, deps.clock) };
   } finally {
 
     retryController.abort();
@@ -518,9 +532,10 @@ export async function withProviderGuidePage(provider: ProviderModule, options: W
   const { afterWalk, signal } = options;
   const browser = await deps.getCurrentBrowser("page");
 
-  /* The guide page is the active tab of a browser window of its own, opened in the background at the shared window's placement. A guide renders only while its
-   * document is visible, and a walk is never captured, so the page gets a window that presents it without disturbing the shared window's own state or the tab
-   * the user has selected there. The window closes with the page.
+  /* The guide page is the active tab of a browser window of its own, opened in the background at the shared window's placement and presented by the creator for
+   * the page's whole life. A guide renders only while Chrome presents its document, and a walk is never captured, so the page gets a window that never disturbs
+   * the shared window's own state or the tab the user has selected there, and a presentation that does not depend on that window being shown. The window closes
+   * with the page.
    */
   const page = await deps.createDiscoveryPage(browser);
 
@@ -579,7 +594,7 @@ export async function withProviderGuidePage(provider: ProviderModule, options: W
     // forbids the embed-gate accept - only cookie rejection and per-site modal dismissal run here.
     const { profile } = getProfileForUrl(provider.guideUrl);
 
-    void deps.startOverlayHandling(page, profile, { phase: "discovery", signal: overlayController.signal });
+    void deps.startOverlayHandling(page, profile, { clock: deps.clock, phase: "discovery", signal: overlayController.signal });
 
     // Navigate to the service's guide URL unless the provider module handles its own navigation (e.g., sets up response interception before navigating). We use
     // networkidle2 rather than load because SPA-based services (e.g., Hulu) have heavy async initialization that can prevent the load event from firing reliably.
@@ -588,7 +603,7 @@ export async function withProviderGuidePage(provider: ProviderModule, options: W
       await page.goto(provider.guideUrl, { timeout: CONFIG.streaming.navigationTimeout, waitUntil: "networkidle2" });
     }
 
-    let channels = await walkWithDeadline(provider, page);
+    let channels = await walkWithDeadline(provider, page, deps.clock);
 
     // The walk is complete. Abort the overlay poll so the page is quiet by construction before anything classifies it.
     overlayController.abort();
@@ -760,7 +775,7 @@ function armDeferredRetry(slugs: string[], deps: PrecachingDeps): void {
   LOG.debug("precache", "Scheduling one deferred discovery re-attempt for %d service%s in %d minutes.", slugs.length, (slugs.length === 1) ? "" : "s",
     PRECACHE_RETRY_DELAY / 60000);
 
-  deferredRetry = { slugs, timer: setTimeout(() => void runDeferredRetry(deps), PRECACHE_RETRY_DELAY) };
+  scheduled = { kind: "deferred", slugs, timer: deps.clock.schedule(() => void runDeferredRetry(deps), PRECACHE_RETRY_DELAY) };
 }
 
 /**
@@ -775,13 +790,18 @@ function armDeferredRetry(slugs: string[], deps: PrecachingDeps): void {
  */
 async function runDeferredRetry(deps: PrecachingDeps): Promise<void> {
 
-  const pending = deferredRetry;
+  if(scheduled?.kind !== "deferred") {
+
+    return;
+  }
+
+  const pending = scheduled;
 
   // Drop the state before acting on it. This is the only pass there will be, so a handle left standing would tell a later cancellation that something is still
   // scheduled when nothing is.
-  deferredRetry = null;
+  scheduled = null;
 
-  if(!pending || deps.isGracefulShutdown()) {
+  if(deps.isGracefulShutdown()) {
 
     return;
   }

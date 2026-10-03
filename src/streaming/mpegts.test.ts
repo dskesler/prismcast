@@ -13,8 +13,10 @@ import { makeNativeIdentity, makeRegistryEntry } from "./registry.helpers.ts";
 import { registerStream, unregisterStream } from "./registry.ts";
 import { setChannelStreamId, terminateStream } from "./lifecycle.ts";
 import { CONFIG } from "../config/index.ts";
+import { StreamSetupError } from "./setup.ts";
 import assert from "node:assert/strict";
 import { closePuppeteerStreamWssOnIdle } from "../testing.helpers.ts";
+import { handleSetupFailure } from "./hls.ts";
 import { makeReqRes } from "../routes/express.helpers.ts";
 import { storeNamedInitSegment } from "./hlsSegments.ts";
 
@@ -353,6 +355,77 @@ describe("serveMpegTsStream: container-aware branch selection", () => {
     } finally {
 
       terminateStream(entry.id, "ts-terminate-channel", "test cleanup");
+      unregisterStream(entry.id);
+    }
+  });
+});
+
+describe("serveMpegTsStream: a setup failure before the init segment", () => {
+
+  /* An MPEG-TS client can attach to an entry a playlist request registered, which is the one path onto this route where nothing has been flushed yet and a status
+   * is still available. Its wait for the initialization segment races the same termination a failed setup produces, so these rows read the same ordering the
+   * playlist route's rows do: the status is recorded on the entry, termination wakes the parked wait, and the answer is read through the reference taken before
+   * the wait. Neither row signals initialization readiness, because the scenario is a stream that never produced one.
+   */
+
+  test("the waiting client is answered with the failure's status, message, and both back-off headers", async () => {
+
+    const entry = makeRegistryEntry({ channelName: "mpegts-failure-channel" });
+
+    registerStream(entry);
+    setChannelStreamId("mpegts-failure-channel", entry.id);
+
+    try {
+
+      const { req, res, send, setHeader, status } = makeReqRes({ ip: "192.168.1.50", params: { name: "mpegts-failure-channel" } });
+      const pending = handleMpegTsStream(req, res);
+
+      // One turn of the microtask queue puts the client inside the initialization wait, which is where the failure has to find it.
+      await Promise.resolve();
+
+      handleSetupFailure(entry.id, "mpegts-failure-channel", undefined,
+        new StreamSetupError("Browser temporarily unavailable.", 503, "The capture system is recovering. Please retry shortly."));
+
+      await pending;
+
+      assert.equal(status.mock.calls[0]?.arguments[0], 503);
+      assert.equal(send.mock.calls[0]?.arguments[0], "The capture system is recovering. Please retry shortly.",
+        "the refusal's own message, not the generic starting-up text");
+      assert.ok(setHeader.mock.calls.some((call) => (call.arguments[0] === "Retry-After") && (call.arguments[1] === "10")), "the back-off interval is set");
+      assert.ok(setHeader.mock.calls.some((call) => (call.arguments[0] === "X-HDHomeRun-Error") && (call.arguments[1] === "All Tuners In Use")),
+        "and the HDHomeRun tuner-busy header with it");
+    } finally {
+
+      unregisterStream(entry.id);
+    }
+  });
+
+  test("a stream that is genuinely still starting keeps the existing retry answer", async () => {
+
+    /* The control. A termination with no recorded failure is indistinguishable from a stream still working on its first initialization, and both must keep the
+     * answer this route already gives: come back shortly. A change that answered every failed wait from the entry would fail here.
+     */
+    const entry = makeRegistryEntry({ channelName: "mpegts-starting-channel" });
+
+    registerStream(entry);
+    setChannelStreamId("mpegts-starting-channel", entry.id);
+
+    try {
+
+      const { req, res, send, setHeader, status } = makeReqRes({ ip: "192.168.1.50", params: { name: "mpegts-starting-channel" } });
+      const pending = handleMpegTsStream(req, res);
+
+      await Promise.resolve();
+
+      terminateStream(entry.id, "mpegts-starting-channel", "test termination");
+
+      await pending;
+
+      assert.equal(status.mock.calls[0]?.arguments[0], 503);
+      assert.equal(send.mock.calls[0]?.arguments[0], "Stream is starting. Please retry.");
+      assert.ok(setHeader.mock.calls.some((call) => (call.arguments[0] === "Retry-After") && (call.arguments[1] === "5")), "with this route's own retry interval");
+    } finally {
+
       unregisterStream(entry.id);
     }
   });

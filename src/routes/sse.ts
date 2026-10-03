@@ -3,7 +3,9 @@
  * sse.ts: Shared Server-Sent Events transport setup. Each SSE endpoint installs the same headers, heartbeat cadence, and close-cleanup; this helper owns
  * that boilerplate so endpoints describe only what to subscribe to and what payloads to push.
  */
+import type { Clock } from "homebridge-plugin-utils";
 import type { Response } from "express";
+import { systemClock } from "homebridge-plugin-utils";
 
 // Heartbeat cadence in milliseconds. Sent as a named heartbeat event to keep the connection alive through proxies and let clients detect staleness.
 const HEARTBEAT_INTERVAL_MS = 30000;
@@ -22,9 +24,10 @@ export interface SseStream {
  * Sets the SSE response headers, flushes them so the connection opens immediately, and starts the heartbeat. Returns helpers the caller uses to push events
  * and to clean up the heartbeat timer when the connection closes.
  * @param res - The Express response object.
+ * @param clock - The clock the heartbeat arms on; defaults to the system clock.
  * @returns An SseStream handle for sending events and tearing down.
  */
-export function installSseStream(res: Response): SseStream {
+export function installSseStream(res: Response, clock: Clock = systemClock): SseStream {
 
   // Cache-Control prevents proxies from buffering the stream; Connection: keep-alive ensures the connection stays open; Content-Type: text/event-stream is
   // the SSE protocol marker the browser EventSource needs to recognize the response.
@@ -36,11 +39,14 @@ export function installSseStream(res: Response): SseStream {
   res.flushHeaders();
 
   // Send a named heartbeat event every HEARTBEAT_INTERVAL_MS to keep the connection alive through proxies and allow clients to detect staleness.
-  const heartbeat = setInterval(() => res.write("event: heartbeat\ndata: \n\n"), HEARTBEAT_INTERVAL_MS);
+  const heartbeat = clock.schedule(() => {
+
+    res.write("event: heartbeat\ndata: \n\n");
+  }, HEARTBEAT_INTERVAL_MS, { repeat: true });
 
   return {
 
-    close: (): void => { clearInterval(heartbeat); },
+    close: (): void => { heartbeat[Symbol.dispose](); },
     sendEvent: (eventType: string | null, data: unknown): void => {
 
       if(eventType !== null) {

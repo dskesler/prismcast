@@ -78,6 +78,9 @@ const deps: CreatePageWithCaptureDeps = {
     return Object.assign(new Readable({ read: (): void => { /* Nothing is read from the stub capture. */ } }),
       { stop: async (): Promise<void> => undefined, stopped: Promise.resolve() });
   },
+
+  // What these rows read is the status code each phase's failure produces, so the verdict answers with none and no case waits on a probe.
+  awaitCaptureVerdict: async (): Promise<null> => null,
   emulateCaptureSurface: async (): Promise<{ height: number; width: number }> => ({ height: 1080, width: 1920 }),
   getCurrentBrowser: async (): Promise<Browser> => ({ newPage: async (): Promise<Page> => makeStubPage() } as unknown as Browser),
   installActivationHeal: async (): Promise<void> => { /* The activation heal is not what this path measures. */ },

@@ -9,10 +9,9 @@
  *
  * Architectural notes the implementation surfaced (worth recording so the next reader does not re-derive them):
  *
- *   1. recovery.ts is intentionally Clock-port-free. The Clock port in src/utils/clock.ts is reserved for nested async chains where mock.timers.tick cannot
- *      drain the runtime - retryOperation is the canonical case. recovery.ts uses Date.now() in shallow synchronous contexts (recordRecoveryAttempt /
- *      recordRecoverySuccess for elapsed-time accumulation) and accepts a `now` argument in checkCircuitBreaker. Both shapes are tested via mock.timers.enable
- *      and synthetic timestamps respectively - exactly the pattern the Clock-port docstring recommends as the default.
+ *   1. recovery.ts is a pure decision core and holds no clock. Every function that needs an instant takes it as a trailing `now` argument - recordRecoveryAttempt,
+ *      recordRecoverySuccess, formatRecoveryDuration, and checkCircuitBreaker alike - so the caller that owns a clock reads it and the core stays deterministic
+ *      over its inputs. The rows below supply synthetic timestamps directly, which is why no timer mocking is involved anywhere in this suite.
  *
  *   2. The "60-second sustained-healthy reset" lives in monitor.ts, not recovery.ts. The monitor observes sustained playback and then calls
  *      resetCircuitBreaker(state) as its policy decision. From recovery.ts's perspective, "reset" is just the explicit function call - the time observation
@@ -26,7 +25,7 @@
 import type { CircuitBreakerState, RecoveryMetrics } from "../../../src/streaming/recovery.ts";
 import { RECOVERY_METHODS, checkCircuitBreaker, createRecoveryMetrics, getRecoveryMethod, getTotalRecoveryAttempts, recordRecoveryAttempt,
   recordRecoverySuccess, resetCircuitBreaker } from "../../../src/streaming/recovery.ts";
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
+import { describe, test } from "node:test";
 import { CONFIG } from "../../../src/config/index.ts";
 import assert from "node:assert/strict";
 
@@ -34,16 +33,6 @@ describe("recovery state machine - escalation, accumulation, and breaker reset",
 
   // The unit suite uses 1700000000000 as its baseline; we match that so test failures across both tiers anchor on the same wall-clock for consistency.
   const baseTime = 1700000000000;
-
-  beforeEach(() => {
-
-    mock.timers.enable({ apis: ["Date"], now: baseTime });
-  });
-
-  afterEach(() => {
-
-    mock.timers.reset();
-  });
 
   function freshBreaker(): CircuitBreakerState {
 
@@ -61,34 +50,36 @@ describe("recovery state machine - escalation, accumulation, and breaker reset",
 
     // L1 attempt: lowest-cost recovery, tried first for paused/buffering issues that often clear from a play() call. After this call, current method tracks
     // play/unmute; one play/unmute attempt counted; nothing else moved.
-    recordRecoveryAttempt(metrics, getRecoveryMethod(1));
+    let now = baseTime;
+
+    recordRecoveryAttempt(metrics, getRecoveryMethod(1), now);
 
     assert.equal(metrics.currentRecoveryMethod, RECOVERY_METHODS.playUnmute, "L1 maps to play/unmute");
     assert.equal(metrics.playUnmuteAttempts, 1, "L1 attempt incremented play/unmute counter");
     assert.equal(metrics.currentRecoveryStartTime, baseTime, "L1 attempt captures start time");
 
     // 800ms passes; L1 did not restore healthy playback. The monitor escalates to L2 without recording an L1 success.
-    mock.timers.tick(800);
+    now += 800;
 
-    recordRecoveryAttempt(metrics, getRecoveryMethod(2));
+    recordRecoveryAttempt(metrics, getRecoveryMethod(2), now);
 
     assert.equal(metrics.currentRecoveryMethod, RECOVERY_METHODS.sourceReload, "escalation flips current method to source reload");
     assert.equal(metrics.sourceReloadAttempts, 1, "L2 attempt incremented source-reload counter");
     assert.equal(metrics.playUnmuteAttempts, 1, "L1's counter is unchanged by L2 escalation");
-    assert.equal(metrics.currentRecoveryStartTime, baseTime + 800, "L2 attempt captures the post-tick start time");
+    assert.equal(metrics.currentRecoveryStartTime, baseTime + 800, "L2 attempt captures the instant it was handed");
 
     // 2000ms passes; L2 also failed. Escalate to L3.
-    mock.timers.tick(2000);
+    now += 2000;
 
-    recordRecoveryAttempt(metrics, getRecoveryMethod(3));
+    recordRecoveryAttempt(metrics, getRecoveryMethod(3), now);
 
     assert.equal(metrics.currentRecoveryMethod, RECOVERY_METHODS.pageNavigation, "L3 maps to page navigation");
     assert.equal(metrics.pageNavigationAttempts, 1, "L3 attempt incremented page-navigation counter");
 
     // 1500ms passes; L3 succeeds. The monitor records a success against the page-navigation method, which clears the in-progress fields.
-    mock.timers.tick(1500);
+    now += 1500;
 
-    recordRecoverySuccess(metrics, RECOVERY_METHODS.pageNavigation);
+    recordRecoverySuccess(metrics, RECOVERY_METHODS.pageNavigation, now);
 
     assert.equal(metrics.currentRecoveryMethod, null, "success clears the in-progress method");
     assert.equal(metrics.currentRecoveryStartTime, null, "success clears the in-progress start time");
@@ -112,20 +103,22 @@ describe("recovery state machine - escalation, accumulation, and breaker reset",
      */
     const metrics: RecoveryMetrics = createRecoveryMetrics();
 
+    let now = baseTime;
+
     // Cycle 1: L1 succeeds in 600ms.
-    recordRecoveryAttempt(metrics, getRecoveryMethod(1));
-    mock.timers.tick(600);
-    recordRecoverySuccess(metrics, RECOVERY_METHODS.playUnmute);
+    recordRecoveryAttempt(metrics, getRecoveryMethod(1), now);
+    now += 600;
+    recordRecoverySuccess(metrics, RECOVERY_METHODS.playUnmute, now);
 
     // Healthy interval - 30 seconds of clean playback. Time advances; no metrics calls.
-    mock.timers.tick(30000);
+    now += 30000;
 
     // Cycle 2: L1 fails (no success), escalates to L2 which succeeds in 2000ms.
-    recordRecoveryAttempt(metrics, getRecoveryMethod(1));
-    mock.timers.tick(500);
-    recordRecoveryAttempt(metrics, getRecoveryMethod(2));
-    mock.timers.tick(2000);
-    recordRecoverySuccess(metrics, RECOVERY_METHODS.sourceReload);
+    recordRecoveryAttempt(metrics, getRecoveryMethod(1), now);
+    now += 500;
+    recordRecoveryAttempt(metrics, getRecoveryMethod(2), now);
+    now += 2000;
+    recordRecoverySuccess(metrics, RECOVERY_METHODS.sourceReload, now);
 
     // Both cycles' attempts are reflected.
     assert.equal(metrics.playUnmuteAttempts, 2, "two L1 attempts across both cycles");
@@ -171,10 +164,8 @@ describe("recovery state machine - escalation, accumulation, and breaker reset",
     assert.equal(lastResult.withinWindow, true, "the trip occurred inside the window");
     assert.equal(breaker.totalFailureCount, threshold, "breaker state count equals the threshold post-trip");
 
-    // The monitor's "60s sustained-healthy" policy fires - we simulate that by ticking time forward (only relevant for narrative completeness; the breaker's
-    // internal logic is time-agnostic) and then calling the explicit reset hook.
-    mock.timers.tick(60000);
-
+    // The monitor's "60s sustained-healthy" policy fires - the instants the rows below supply carry that 60-second gap (only relevant for narrative
+    // completeness; the breaker's internal logic is time-agnostic) and then the explicit reset hook is called.
     resetCircuitBreaker(breaker);
 
     assert.equal(breaker.firstFailureTime, null, "post-reset window start is cleared");
@@ -205,9 +196,8 @@ describe("recovery state machine - escalation, accumulation, and breaker reset",
     assert.equal(breaker.totalFailureCount, 2, "two failures recorded in the breaker before any recovery success");
 
     // A recovery cycle now succeeds: L1 attempt, then L1 success.
-    recordRecoveryAttempt(metrics, getRecoveryMethod(1));
-    mock.timers.tick(750);
-    recordRecoverySuccess(metrics, RECOVERY_METHODS.playUnmute);
+    recordRecoveryAttempt(metrics, getRecoveryMethod(1), baseTime);
+    recordRecoverySuccess(metrics, RECOVERY_METHODS.playUnmute, baseTime + 750);
 
     assert.equal(metrics.playUnmuteSuccesses, 1, "metrics reflect the recovery success");
 

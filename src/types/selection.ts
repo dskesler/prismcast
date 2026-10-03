@@ -55,6 +55,11 @@ export interface ChannelSelectorResult {
 export type ChannelStrategyHandler = (page: Page, profile: ChannelSelectionProfile) => Promise<ChannelSelectorResult>;
 
 /**
+ * A strategy's own route onto a URL, taking the place of the plain document load for every navigation and reload of a profile on that strategy.
+ */
+export type StrategyNavigator = (page: Page, url: string) => Promise<void>;
+
+/**
  * The complete contract for a channel selection strategy. Each provider file exports a single object implementing this interface. The coordinator accesses all
  * provider behavior through these hooks - no strategy-specific imports or hardcoded strategy name checks outside the registry.
  */
@@ -75,6 +80,13 @@ export interface ChannelStrategyEntry {
    * Removes a cached watch URL after it failed to produce a working stream. Called by the coordinator when a cached direct navigation fails.
    */
   invalidateDirectUrl?: (channelSelector: string) => void;
+
+  /**
+   * Puts the page on a URL for this strategy, in place of the plain document load. A provider whose guide is not always reachable by requesting its URL
+   * directly declares this and owns the route in; the navigation and reload functions in browser/video.ts dispatch to it for every profile on this strategy,
+   * so the tune path, the re-establishment path, and the recovery route all enter the same way. Undefined for every strategy whose pages load by URL.
+   */
+  navigate?: StrategyNavigator;
 
   /**
    * Returns a watch URL for direct navigation, bypassing guide page loading. Implementations may perform async work such as fetching current asset IDs from

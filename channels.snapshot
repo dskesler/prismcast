@@ -1,0 +1,61 @@
+{
+  "abc": {
+    "channelSelector": "ABC",
+    "stationId": "20456",
+    "url": "https://www.hulu.com/live"
+  },
+  "cbs": {
+    "stationId": "20454"
+  },
+  "cw": {
+    "channelSelector": "CW",
+    "stationId": "20455",
+    "url": "https://www.hulu.com/live"
+  },
+  "discovery": {
+    "tags": [
+      "documentary",
+      "fooz"
+    ]
+  },
+  "flighty": {
+    "name": "Flighty",
+    "profile": "staticPage",
+    "url": "https://flighty.com/airports/tv"
+  },
+  "fox": {
+    "stationId": "20361"
+  },
+  "fox-foxone": {
+    "channelSelector": "WFLD"
+  },
+  "france24": {
+    "hdhrEnabled": false
+  },
+  "france24fr": {
+    "hdhrEnabled": false
+  },
+  "natgeop": {
+    "hdhrEnabled": false
+  },
+  "nbc": {
+    "channelSelector": "WMAQ",
+    "name": "NBC 5",
+    "stationId": "20452",
+    "url": "https://www.hulu.com/live"
+  },
+  "pbs": {
+    "hdhrEnabled": false,
+    "stationId": "30415"
+  },
+  "schemaVersion": 2,
+  "serviceSelections": {
+    "cbs": "cbs-paramountplus",
+    "cmt": "cmt-hulu",
+    "fbc": "fbc-foxone",
+    "fnc": "fnc-foxone"
+  },
+  "tennis2": {
+    "hdhrEnabled": false
+  }
+}

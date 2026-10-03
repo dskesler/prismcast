@@ -8,6 +8,7 @@ import { EvaluateAbortError, EvaluateTimeoutError, evaluateWithAbort, getAbortCo
   unregisterAbortController } from "./evaluate.ts";
 import { afterEach, describe, test } from "node:test";
 import type { Page } from "puppeteer-core";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
 import { runWithStreamContext } from "./streamContext.ts";
@@ -150,13 +151,24 @@ describe("evaluateWithAbort timeout", () => {
 
   test("rejects with EvaluateTimeoutError when the inner evaluate never resolves", async () => {
 
-    // The inner evaluate hangs forever; the timeout fires and surfaces our custom error.
+    /* The inner evaluate hangs forever, so only the bound can end the wait. The bound is a minute long - a length no real-time wait could reach inside this
+     * suite's budget - so a bound left on the system clock fails the row outright rather than passing it late, and the assertion below it reads the arm
+     * synchronously, before any time is crossed at all.
+     */
+    const clock = new TestClock();
     const page = makeFakePage(() => new Promise(() => { /* never resolves */ }));
+    const pending = evaluateWithAbort(page, () => "value", undefined, { clock, timeoutMs: 60000 });
+
+    assert.equal(clock.pending, 1, "the bound is armed on the injected clock before the wrapper's first await");
+
+    clock.advance(60000);
 
     await assert.rejects(
-      () => evaluateWithAbort(page, () => "value", undefined, 5),
+      () => pending,
       (err: Error) => err instanceof EvaluateTimeoutError
     );
+
+    assert.equal(clock.pending, 0, "and the bound was cancelled once the wait settled");
   });
 
   test("propagates errors thrown by the inner evaluate verbatim (not wrapped in timeout)", async () => {
@@ -165,7 +177,7 @@ describe("evaluateWithAbort timeout", () => {
     const page = makeFakePage(() => Promise.reject(new Error("inner failure")));
 
     await assert.rejects(
-      () => evaluateWithAbort(page, () => "value", undefined, 1000),
+      () => evaluateWithAbort(page, () => "value", undefined, { timeoutMs: 1000 }),
       /inner failure/
     );
   });
@@ -208,7 +220,7 @@ describe("evaluateWithAbort with stream context", () => {
 
       // The wrapper builds its composed signal synchronously, so by the time the call returns its promise the wait is live and the stream signal has seen
       // whatever registration it is ever going to see. Reading the count here is the during-the-wait half of the guarantee.
-      const pending = evaluateWithAbort(page, () => "v", undefined, 5000);
+      const pending = evaluateWithAbort(page, () => "v", undefined, { timeoutMs: 5000 });
 
       assert.equal(getEventListeners(controller.signal, "abort").length, 0, "no abort listener lands on the stream signal while a wait is live");
 
@@ -244,7 +256,7 @@ describe("evaluateWithAbort with stream context", () => {
       });
 
       await assert.rejects(
-        () => evaluateWithAbort(page, () => "v", undefined, 5000),
+        () => evaluateWithAbort(page, () => "v", undefined, { timeoutMs: 5000 }),
         (err: Error) => err instanceof EvaluateAbortError
       );
     });
@@ -259,7 +271,7 @@ describe("evaluateWithAbort with stream context", () => {
       const page = makeFakePage(() => new Promise(() => { /* hangs */ }));
 
       await assert.rejects(
-        () => evaluateWithAbort(page, () => "v", undefined, 5),
+        () => evaluateWithAbort(page, () => "v", undefined, { timeoutMs: 5 }),
         (err: Error) => err instanceof EvaluateTimeoutError
       );
     });
@@ -307,7 +319,7 @@ describe("evaluateWithAbort with stream context", () => {
 
       const page = makeFakePage(() => new Promise(() => { /* hangs */ }));
 
-      const pending = evaluateWithAbort(page, () => "v", undefined, 5);
+      const pending = evaluateWithAbort(page, () => "v", undefined, { timeoutMs: 5 });
 
       assert.equal(getEventListeners(controller.signal, "abort").length, 0, "no abort listener on the stream signal while the bound is counting down");
 
@@ -333,7 +345,7 @@ describe("evaluateWithAbort outside any stream context", () => {
     const page = makeFakePage(() => new Promise(() => { /* hangs */ }));
 
     await assert.rejects(
-      () => evaluateWithAbort(page, () => "v", undefined, 5),
+      () => evaluateWithAbort(page, () => "v", undefined, { timeoutMs: 5 }),
       (err: Error) => err instanceof EvaluateTimeoutError
     );
   });

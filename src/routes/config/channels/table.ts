@@ -5,13 +5,14 @@
 import type { ChannelListingEntry, CustomizableField } from "../../../types/index.ts";
 import { ICON_BOLT, ICON_COPY, ICON_DELETE, ICON_DISABLE, ICON_EDIT, ICON_ENABLE, ICON_FILTER, ICON_HEALTH, ICON_LINK, ICON_LOGIN, ICON_MANAGE,
   ICON_REVERT, ICON_TRANSFER } from "../../icons.ts";
-import { compareChannelSort, getAllServiceTags, getAuthDomainForChannel, getChannelServiceLabel, getChannelServiceTags, getChannelSortKey,
-  getEnabledServices, getPredefinedDomainMap, getServiceGroup, hasMultipleServices, isChannelAvailableByService, isServiceTagEnabled,
-  resolvePredefinedVariant, resolveServiceKey } from "../../../config/services.ts";
+import { compareChannelSort, getChannelSortKey } from "../../../config/channelSort.ts";
 import { escapeHtml, formatTimeAgo } from "../../../utils/index.ts";
 import { getActiveTagVocabulary, getChannelCustomizations, getChannelEffectiveTags, getChannelListing, getChannelLogo, getChannelsParseErrorMessage,
   getEffectiveHdhrEnabled, getPredefinedScopeCounts, getTagRegistry, getUserChannelsFilePath, hasChannelsParseError, isPredefinedChannel,
   isPredefinedChannelDisabled, isUserChannel, isVisibleChannel, tagsMatch } from "../../../config/userChannels.ts";
+import { getAllServiceTags, getAuthDomainForChannel, getChannelServiceLabel, getChannelServiceTags, getEnabledServices, getPredefinedDomainMap,
+  getServiceGroup, hasMultipleServices, isChannelAvailableByService, isServiceTagEnabled, resolvePredefinedVariant,
+  resolveServiceKey } from "../../../config/services.ts";
 import { getCachedProviderChannels, getProviderDomainMap, getProviderGuideUrls, getProviderModuleInfo } from "../../../browser/channelSelection.ts";
 import { getChannelHealth, getDomainAuthState } from "../../../config/health.ts";
 import { getProfileForChannel, getProfiles } from "../../../config/profiles.ts";

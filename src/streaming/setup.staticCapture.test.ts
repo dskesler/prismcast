@@ -89,6 +89,9 @@ const deps: CreatePageWithCaptureDeps = {
 
     return Object.assign(new PassThrough(), { stop: async (): Promise<void> => undefined, stopped: Promise.resolve() });
   },
+
+  // The acquisition these rows record always succeeds, so no verdict is ever asked for; the stub answers with none.
+  awaitCaptureVerdict: async (): Promise<null> => null,
   emulateCaptureSurface: async (page: Page): Promise<{ height: number; width: number }> => {
 
     depsCalls.push("emulateCaptureSurface");

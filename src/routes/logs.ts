@@ -6,10 +6,12 @@ import type { Express, Request, Response } from "express";
 import { isConsoleLogging, subscribeToLogs } from "../utils/index.ts";
 import { sendErrorResponse, sendValidationError } from "./config/http/envelope.ts";
 import { CONFIG } from "../config/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import fs from "node:fs";
 import { getLogFilePath } from "../config/paths.ts";
 import { installSseStream } from "./sse.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 const { promises: fsPromises } = fs;
 
@@ -225,8 +227,9 @@ async function readLogEntries(lines: number, levelFilter: Nullable<LogLevelFilte
 /**
  * Creates the logs endpoint for viewing application log entries.
  * @param app - The Express application.
+ * @param clock - The clock the log stream's heartbeat arms on. The route aggregator omits it and takes the system clock.
  */
-export function setupLogsEndpoint(app: Express): void {
+export function setupLogsEndpoint(app: Express, clock: Clock = systemClock): void {
 
   app.get("/logs", async (req: Request, res: Response): Promise<void> => {
 
@@ -276,7 +279,7 @@ export function setupLogsEndpoint(app: Express): void {
     }
 
     const filterLevel = isLogLevelFilter(level) ? level : null;
-    const sse = installSseStream(res);
+    const sse = installSseStream(res, clock);
 
     // Subscribe to log entries and forward them as unnamed SSE data events; the heartbeat is owned by installSseStream.
     const unsubscribe = subscribeToLogs((entry) => {

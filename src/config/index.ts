@@ -48,8 +48,8 @@ export type CliOverrides = Record<string, unknown>;
 
 /* ConfigStore is the disk-persistence boundary config/index.ts composes on: the read-load and write-back operations backed by the file store. It is injected as a
  * default parameter on the persistence-facing functions so a test can substitute an in-memory store in the same place - no loader mock - while production uses
- * the real defaultConfigStore. mergeConfiguration and the normalization helpers stay direct because they are pure and touch no disk. This mirrors the Clock port
- * (utils/clock.ts): a typed interface plus a module-const default, consumed through a defaulted parameter.
+ * the real defaultConfigStore. mergeConfiguration and the normalization helpers stay direct because they are pure and touch no disk. This mirrors the library's
+ * Clock port: a typed interface plus a module-const default, consumed through a defaulted parameter.
  */
 export interface ConfigStore {
 

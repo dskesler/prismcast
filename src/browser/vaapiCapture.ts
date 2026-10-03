@@ -3,16 +3,17 @@
  * vaapiCapture.ts: Hardware-accelerated VAAPI capture for PrismCast.
  */
 import type { AcquireCaptureStreamContext, CaptureStream, CaptureStreamOptions } from "./tabCapture.ts";
-import { LOG, formatError, realClock, resolveFFmpegPath, startTimer } from "../utils/index.ts";
+import { LOG, formatError, resolveFFmpegPath, startTimer } from "../utils/index.ts";
 import { fullscreenWindow, readWindowPlacement } from "./cdp.ts";
 import { CAPTURE_SOURCE_UNAVAILABLE_MESSAGE } from "../types/index.ts";
 import { CONFIG } from "../config/index.ts";
 import type { ChildProcess } from "node:child_process";
-import type { Clock } from "../utils/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import type { Page } from "puppeteer-core";
 import { PassThrough } from "node:stream";
 import { spawn } from "node:child_process";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* This module is the second implementation of the capture contract that tabCapture.ts defines, and it exists because the first one cannot reach the GPU.
  *
@@ -197,9 +198,9 @@ export async function fitSurfaceToDisplay(page: Page): Promise<boolean> {
  * Neither step is allowed to fail the capture. A grab against a badly presented display is a bad stream where a thrown error is no stream, and both primitives
  * report their own faults.
  * @param page - The capture page, which becomes the front tab of the full screen window.
- * @param clock - Clock driving the full screen confirmation. Defaults to realClock; tests inject a fake.
+ * @param clock - Clock driving the full screen confirmation. Defaults to systemClock; tests inject a fake.
  */
-export async function presentCaptureDisplay(page: Page, clock: Clock = realClock): Promise<void> {
+export async function presentCaptureDisplay(page: Page, clock: Clock = systemClock): Promise<void> {
 
   await fullscreenWindow(page, clock);
 
@@ -247,14 +248,14 @@ export function attachCaptureRetirement(stream: PassThrough, page: Pick<Page, "o
  * The returned stream satisfies the same contract acquireCaptureStream returns, so a caller holding one cannot tell which backend produced it.
  * @param page - The page being captured. Unused beyond its identity: this backend grabs the display the page is presented on rather than the page itself.
  * @param options - What the capture is asked for.
- * @param context - The clock and the caller's abort signal. Defaults to the real clock with no signal.
+ * @param context - The clock. Defaults to the system clock.
  * @returns The started capture.
  * @throws When FFmpeg cannot be resolved or the caller abandoned the acquisition.
  */
 export async function acquireVaapiCaptureStream(page: Page, options: CaptureStreamOptions,
   context: AcquireCaptureStreamContext = {}): Promise<CaptureStream> {
 
-  const { clock = realClock, signal } = context;
+  const { clock = systemClock } = context;
   const acquisitionElapsed = startTimer(clock);
 
   /* The grab and the remux can need different binaries. Channels DVR bundles an FFmpeg carrying h264_vaapi but no x11grab, and that build is the one the resolver
@@ -283,7 +284,7 @@ export async function acquireVaapiCaptureStream(page: Page, options: CaptureStre
   const stream = new PassThrough();
   const stopped = Promise.withResolvers<undefined>();
 
-  let graceTimer: Nullable<NodeJS.Timeout> = null;
+  let graceTimer: Nullable<Disposable> = null;
   let stopRequested = false;
 
   /* Settles the capture exactly once, whatever ended it: a clean exit, a crash, or a stop we asked for. The stopped promise never rejects - a caller bounds it
@@ -293,7 +294,7 @@ export async function acquireVaapiCaptureStream(page: Page, options: CaptureStre
 
     if(graceTimer) {
 
-      clearTimeout(graceTimer);
+      graceTimer[Symbol.dispose]();
       graceTimer = null;
     }
 
@@ -358,7 +359,7 @@ export async function acquireVaapiCaptureStream(page: Page, options: CaptureStre
        */
       child.stdout?.resume();
 
-      graceTimer = setTimeout(() => child.kill("SIGKILL"), VAAPI_STOP_GRACE_MS);
+      graceTimer = clock.schedule(() => child.kill("SIGKILL"), VAAPI_STOP_GRACE_MS);
     }
 
     await stopped.promise;
@@ -368,14 +369,6 @@ export async function acquireVaapiCaptureStream(page: Page, options: CaptureStre
    * handed, and a dying page announces itself. Registered here, after stop() exists, because both paths call it.
    */
   attachCaptureRetirement(stream, page, stop);
-
-  // The caller gave up while the child was starting. Retire it here rather than handing back a capture nobody is waiting for.
-  if(signal?.aborted) {
-
-    await stop();
-
-    throw new Error(CAPTURE_SOURCE_UNAVAILABLE_MESSAGE);
-  }
 
   LOG.debug("browser:capture", "VAAPI capture started: %dx%d at %dfps from %s in %ss.", options.videoConstraints.mandatory.maxWidth,
     options.videoConstraints.mandatory.maxHeight, options.videoConstraints.mandatory.maxFrameRate, display, acquisitionElapsed().toFixed(1));

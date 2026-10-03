@@ -6,10 +6,14 @@ import type { ChannelSelectionProfile, ChannelSelectorResult, ClickTarget, Disco
 import { LOG, delay, evaluateWithAbort, formatError } from "../../utils/index.ts";
 import { installOrReplaceOnNewDocument, logAvailableChannels, normalizeChannelName, scrollAndClick } from "./shared.ts";
 import { CONFIG } from "../../config/index.ts";
+import type { DocumentLoadOptions } from "../navigation.ts";
 import type { GridProbeResult } from "./gridSearch.ts";
 import type { Page } from "puppeteer-core";
+import { clickSelectorByCoordinate } from "../consent.ts";
 import { createProviderChannelCache } from "./cache.ts";
+import { loadDocument } from "../navigation.ts";
 import { searchVirtualizedGrid } from "./gridSearch.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 // Unified channel cache entry combining discovery metadata, tuning data, and guide grid scroll positions. Populated from two sources: (1) details and listing API
 // responses intercepted during page load (provides uuid, programs, displayName), and (2) guide grid DOM reads during binary search or discovery linear scan
@@ -52,6 +56,29 @@ const huluPagesWithListeners = new WeakSet<Page>();
 // grid's Channels tab click triggers full API expansion, and the interceptor captures UUID+EAB from those expanded responses.
 const HULU_LIVE_URL = "https://www.hulu.com/live";
 
+// The home hub the live guide is entered from when a direct load of the guide fails at Hulu's edge. Its header carries the Live link, which routes to the guide
+// inside the page rather than requesting the guide's URL, and that in-page route is the one the site itself takes.
+const HULU_HUB_URL = "https://www.hulu.com/hub/home";
+
+// The header's Live link. It carries no test id, so its route is what identifies it; the first match in document order is the header's.
+const HULU_LIVE_NAV_SELECTOR = "a[href=\"/live\"]";
+
+// The guide's path the Live link routes to: what the hub entry waits for the main frame to reach before handing the page back.
+const HULU_LIVE_PATH = "/live";
+
+// How every Hulu document load waits. The guide is a heavy single-page application whose load event is unreliable, so the wait is for network idle; the
+// provider profile below declares the same preference from this one statement.
+const HULU_DOCUMENT_LOAD: DocumentLoadOptions = { waitForNetworkIdle: true };
+
+/* Whether the most recent direct load of the live guide failed at Hulu's edge. The failed status is the whole signal - it arrives in a second or two where the
+ * guide's missing Channels tab would cost the video timeout - and a tune reads this rather than repeating an attempt discovery has already seen fail. It
+ * describes Hulu's server, not this browser session, which is why it is not among the caches a relaunch or a precache clears: every discovery walk re-tests the
+ * direct load and rewrites it, and a tune that attempts the direct load rewrites it too, so it is never older than the last precache. A session whose precache
+ * filter excludes Hulu has no re-test and keeps the hub route until the next start, which is a working route at a cost of about two seconds per tune. The
+ * transitions are what get logged, once each way.
+ */
+let directGuideEntryBroken = false;
+
 // Partial type for Hulu's guide details API response. Each item represents a scheduled program and includes channel_info with the channel's UUID and display name.
 // Multiple items may share the same channel_info (different programs on the same channel).
 interface HuluDetailsItem {
@@ -70,7 +97,7 @@ interface HuluDetailsResponse {
 
 // Partial type for a single program in Hulu's guide listing API response. Each program has an EAB ID and an airing window used to determine which program is
 // currently live on a given channel.
-interface HuluListingProgram {
+export interface HuluListingProgram {
 
   airingEnd: string;
   airingStart: string;
@@ -187,11 +214,10 @@ function populateHuluChannelCache(items: HuluDetailsItem[]): void {
  * Finds the currently-airing EAB from a program schedule array. Searches the programs for one whose airing window brackets the current time. Returns null if the
  * array is empty or no program is currently airing (stale data or program boundary gap).
  * @param programs - Array of programs with EAB IDs and airing times.
+ * @param now - The instant the airing windows are compared against.
  * @returns The currently-airing EAB string, or null if no match.
  */
-function findCurrentEabFromPrograms(programs: HuluListingProgram[]): Nullable<string> {
-
-  const now = Date.now();
+export function findCurrentEabFromPrograms(programs: HuluListingProgram[], now: number): Nullable<string> {
 
   for(const program of programs) {
 
@@ -748,7 +774,7 @@ async function tryFastPathTune(page: Page, entry: Nullable<HuluChannelEntry>, ch
   // is the primary mechanism for local affiliates (where the interceptor can't self-resolve by name) and a secondary mechanism for exact-match channels.
   if(entry?.uuid && entry.programs) {
 
-    const currentEab = findCurrentEabFromPrograms(entry.programs);
+    const currentEab = findCurrentEabFromPrograms(entry.programs, systemClock.now());
 
     if(currentEab) {
 
@@ -917,6 +943,136 @@ async function handleProfileSelectorIfPresent(page: Page): Promise<void> {
 }
 
 /**
+ * Records what a direct load of the live guide answered, and announces the two transitions. A tune reads the memo rather than repeating an attempt discovery has
+ * already seen fail, so the value written here is what decides whether the next tune spends an attempt on the direct URL. Only a change of state is logged: a
+ * fallback that is already in force has nothing new to report, and a line per tune would bury the two moments that matter.
+ * @param failedStatus - The HTTP status the direct load answered with, or null when it answered successfully.
+ */
+function recordDirectGuideEntry(failedStatus: Nullable<number>): void {
+
+  const broken = failedStatus !== null;
+
+  if(broken === directGuideEntryBroken) {
+
+    return;
+  }
+
+  directGuideEntryBroken = broken;
+
+  if(broken) {
+
+    LOG.info("Hulu's live guide is unavailable by direct navigation (HTTP %s). Entering it through hulu.com until it recovers.", failedStatus);
+
+    return;
+  }
+
+  LOG.info("Hulu's live guide is reachable by direct navigation again.");
+}
+
+/**
+ * Clicks the home hub's Live link at the link's own coordinates, and fails when the hub laid out no link to click. The visible wait has just passed, so a link
+ * that cannot be located is a layout race rather than a hub without a Live link. The failure is not a TimeoutError, so the route's catch carries it back as it
+ * stands instead of rewording it as a route that did not land.
+ * @param page - The Puppeteer page object.
+ */
+async function clickLiveLink(page: Page): Promise<void> {
+
+  const clicked = await clickSelectorByCoordinate(page, HULU_LIVE_NAV_SELECTOR);
+
+  if(!clicked) {
+
+    throw new Error("Hulu's home hub laid out no Live link to click.");
+  }
+}
+
+/**
+ * Enters the live guide the way a viewer does: load the home hub, then click the Live link in its header and wait for the application to route to the guide. The link
+ * routes inside the single-page application rather than requesting the guide's URL, which is what makes this route work while a direct request for that URL does
+ * not. The document the route renders is the same one the direct load would have produced, so the Channels tab wait and everything after it run unchanged.
+ *
+ * Errors propagate. A hub that will not route is a failed navigation, and the callers' own retry and failure handling own what happens next.
+ * @param page - The Puppeteer page object.
+ */
+async function enterHuluGuideThroughHub(page: Page): Promise<void> {
+
+  await loadDocument(page, HULU_HUB_URL, HULU_DOCUMENT_LOAD);
+
+  // The "Who's Watching?" picker can front the hub exactly as it fronts the guide, and it would swallow the Live link click.
+  await handleProfileSelectorIfPresent(page);
+
+  // We wait for the link to become VISIBLE rather than merely present, for the same reason the Channels tab wait does: the header renders before it is
+  // interactive, and clicking it early dispatches an event the application ignores. The click goes through the real pointer chain, so the page receives the
+  // pointer's arrival (the move, the press, the release) and the user activation a trusted click grants. Hulu's live page reveals its guide chrome on pointer
+  // activity, and a DOM click carries none of that: the route lands and the guide never renders (measured 2026-09-13). The helper hit-tests the point before
+  // it dispatches, falling back to the in-page click only when another element covers the link.
+  await page.waitForSelector(HULU_LIVE_NAV_SELECTOR, { timeout: CONFIG.streaming.navigationTimeout, visible: true });
+
+  /* The route is awaited on the navigation signal the application's own history push raises: Chrome reports the main frame's new URL over the protocol and
+   * Puppeteer raises its frame-navigated event on it, so the wait needs nothing from inside the page - a condition polled from within the document is never
+   * evaluated in a document Chrome is not painting, and neither the discovery window nor a tune's tab is always one it is (measured 2026-09-13). The frame
+   * wait rather than the navigation wait, because the navigation wait also requires the frame's lifecycle events and Hulu's documents never fire the load
+   * event, while one of the hub's child frames never reports DOMContentLoaded either. The wait is armed before the click so a route that lands first is never
+   * missed, and the route names its own timeout: the wait's wording says nothing about which wait lapsed, and the capture-fault classifier on this failure
+   * path matches the wording of a lapsed wait, which a page-level wait must never supply.
+   */
+  try {
+
+    await Promise.all([
+      page.waitForFrame((frame) => (frame === page.mainFrame()) && (new URL(frame.url()).pathname === HULU_LIVE_PATH),
+        { timeout: CONFIG.streaming.navigationTimeout }),
+      clickLiveLink(page)
+    ]);
+  } catch(error) {
+
+    if(error && ((error as Error).name === "TimeoutError")) {
+
+      throw new Error("Hulu's home hub did not route to the live guide within " + String(CONFIG.streaming.navigationTimeout) + "ms.", { cause: error });
+    }
+
+    throw error;
+  }
+}
+
+/**
+ * The one way into the live guide, used by discovery and by every tune. It tries the direct URL first and judges it on the document's own status, which is the
+ * definitive signal and arrives in a second or two where a missing Channels tab would cost the whole video timeout. A failed status falls through to the hub
+ * route inside the same attempt, so the tune that discovered the failure still tunes, at a cost of about two seconds. A tune that already knows the direct load
+ * is failing skips it and goes straight to the hub, spending nothing on an attempt that has just been seen to fail.
+ *
+ * Discovery asks for the re-test, which is what returns the direct route the moment Hulu fixes their side: every precache walk tries the direct URL regardless of
+ * what the last one found.
+ * @param page - The Puppeteer page object.
+ * @param url - The guide URL to enter.
+ * @param options - Whether to try the direct load even when the last attempt failed, which is discovery's re-test.
+ */
+async function enterHuluGuide(page: Page, url: string, options: { retestDirect?: boolean } = {}): Promise<void> {
+
+  if(options.retestDirect || !directGuideEntryBroken) {
+
+    const response = await loadDocument(page, url, HULU_DOCUMENT_LOAD);
+
+    /* A tolerated navigation timeout says nothing about Hulu's edge - the request may well have been answered and only some background call left the page short
+     * of idle - so the memo is left as it stands and the page is handed back as it loaded, exactly as every other site's timeout is.
+     */
+    if(!response) {
+
+      return;
+    }
+
+    if(response.ok()) {
+
+      recordDirectGuideEntry(null);
+
+      return;
+    }
+
+    recordDirectGuideEntry(response.status());
+  }
+
+  await enterHuluGuideThroughHub(page);
+}
+
+/**
  * Guide grid strategy: finds a channel in a virtualized, alphabetically sorted channel grid by scrolling the page to the target row using binary search, then
  * clicking the on-now program cell to open the playback overlay. This strategy works for sites like Hulu Live TV where the channel guide is rendered as a
  * virtualized list - only ~13 of ~124 rows exist in the DOM at any time, positioned absolutely within a tall spacer div. The virtualizer renders rows based on
@@ -954,14 +1110,15 @@ async function guideGridStrategy(page: Page, profile: ChannelSelectionProfile): 
 
   // Ensure the guide is open and on the correct tab. We wait for the tab button to become VISIBLE (not just present in the DOM) because the guide overlay may exist
   // in the DOM structure while still hidden during page initialization or animation. Clicking a hidden button dispatches a DOM event but has no visual effect - the
-  // guide remains hidden and the virtualizer never populates rows. We use $eval for the click because overlapping elements (spinners, overlays) can intercept
-  // Puppeteer's coordinate-based mouse events.
+  // guide remains hidden and the virtualizer never populates rows. The click is dispatched as a real pointer chain at the tab's own coordinates, which is what
+  // React's handlers on Hulu's application answer to, and the helper hit-tests the point first, so a spinner or an overlay covering the tab is reached by the
+  // in-page click instead.
   if(listSelector) {
 
     try {
 
       await page.waitForSelector(listSelector, { timeout: CONFIG.streaming.videoTimeout, visible: true });
-      await page.$eval(listSelector, (el) => { (el as HTMLElement).click(); });
+      await clickSelectorByCoordinate(page, listSelector);
 
       // Brief delay for the tab switch animation and virtualizer initialization.
       await delay(300);
@@ -996,7 +1153,7 @@ async function guideGridStrategy(page: Page, profile: ChannelSelectionProfile): 
         try {
 
           // eslint-disable-next-line no-await-in-loop
-          await page.$eval(listSelector, (el) => { (el as HTMLElement).click(); });
+          await clickSelectorByCoordinate(page, listSelector);
 
           // eslint-disable-next-line no-await-in-loop
           await delay(500);
@@ -1380,7 +1537,7 @@ async function resolveHuluDirectUrl(channelSelector: string, page: Page): Promis
   // Look up the currently-airing EAB for the target channel (if UUID and programs are known). On warm cache (both UUID and EAB available), the interceptor has
   // both at install time and swaps immediately. On cold cache (no UUID), we return null below so the guide grid runs - the Channels tab click triggers full API
   // expansion.
-  const cachedEab = (cachedEntry?.programs) ? findCurrentEabFromPrograms(cachedEntry.programs) : null;
+  const cachedEab = (cachedEntry?.programs) ? findCurrentEabFromPrograms(cachedEntry.programs, systemClock.now()) : null;
   const isWarmCache = Boolean(cachedUuid && cachedEab);
 
   if(isWarmCache) {
@@ -1420,7 +1577,7 @@ async function resolveHuluDirectUrl(channelSelector: string, page: Page): Promis
 
     if(entry.programs) {
 
-      const currentEab = findCurrentEabFromPrograms(entry.programs);
+      const currentEab = findCurrentEabFromPrograms(entry.programs, systemClock.now());
 
       if(currentEab) {
 
@@ -1988,10 +2145,10 @@ function invalidateHuluDirectUrl(channelSelector: string): void {
 
 /**
  * Discovers all channels from Hulu Live TV by clicking the Channels tab to trigger full API expansion and performing a complete linear scan through the
- * virtualized guide grid. This function navigates to the Hulu live page itself. Detects local affiliates using the same CALL_SIGN_PATTERN and position-based
- * inference logic as the tuning strategy. Affiliates get the network name as their selector; non-affiliates get their display name. Enriches unified cache
- * entries with affiliate metadata for subsequent getCachedChannels derivation.
- * @param page - The Puppeteer page object; this function navigates it to the Hulu live page.
+ * virtualized guide grid. This function enters the live guide itself, re-testing the direct load on every walk. Detects local affiliates using the same
+ * CALL_SIGN_PATTERN and position-based inference logic as the tuning strategy. Affiliates get the network name as their selector; non-affiliates get their
+ * display name. Enriches unified cache entries with affiliate metadata for subsequent getCachedChannels derivation.
+ * @param page - The Puppeteer page object; this function enters the Hulu live guide on it.
  * @returns Array of discovered channels with affiliate detection and selector mapping.
  */
 async function discoverHuluChannels(page: Page): Promise<DiscoveredChannel[]> {
@@ -2011,7 +2168,7 @@ async function discoverHuluChannels(page: Page): Promise<DiscoveredChannel[]> {
 
   try {
 
-    await page.goto(HULU_LIVE_URL, { timeout: CONFIG.streaming.navigationTimeout, waitUntil: "networkidle2" });
+    await enterHuluGuide(page, HULU_LIVE_URL, { retestDirect: true });
   } catch {
 
     return [];
@@ -2021,13 +2178,15 @@ async function discoverHuluChannels(page: Page): Promise<DiscoveredChannel[]> {
   await handleProfileSelectorIfPresent(page);
 
   // Click the Channels tab to reveal the channel list and trigger full API expansion. Matches the tuning path's retry logic - if guide rows don't appear after
-  // the first tab click, retry once with a longer delay in case the first click fired during a transitional state before the guide was fully interactive.
+  // the first tab click, retry once with a longer delay in case the first click fired during a transitional state before the guide was fully interactive. The
+  // click is the same real pointer chain the tuning path dispatches, at the tab's own coordinates and hit-tested before it lands, with the in-page click
+  // reaching the tab when something covers it.
   const listSelector = "#CHANNELS";
 
   try {
 
     await page.waitForSelector(listSelector, { timeout: CONFIG.streaming.videoTimeout, visible: true });
-    await page.$eval(listSelector, (el) => { (el as HTMLElement).click(); });
+    await clickSelectorByCoordinate(page, listSelector);
     await delay(300);
   } catch {
 
@@ -2055,7 +2214,7 @@ async function discoverHuluChannels(page: Page): Promise<DiscoveredChannel[]> {
         try {
 
           // eslint-disable-next-line no-await-in-loop
-          await page.$eval(listSelector, (el) => { (el as HTMLElement).click(); });
+          await clickSelectorByCoordinate(page, listSelector);
 
           // eslint-disable-next-line no-await-in-loop
           await delay(500);
@@ -2189,9 +2348,9 @@ export const huluProvider: ProviderModule = {
   // calls the JavaScript fullscreen API the watch page's player exposes, and fullscreenSelector clicks the player's own maximize control, whose aria-label Hulu
   // writes in uppercase...the attribute match carries the "i" flag so it reads case-insensitively. The click does more than repeat what the API call asks for: it
   // also takes the player out of its mini-player layout, whose sizing logic would otherwise overwrite the width the capture styling sets. Requires
-  // selectReadyVideo because the page may have multiple video elements (ads, previews, main content). Uses waitForNetworkIdle because Hulu's SPA has heavy async
-  // initialization that often prevents the load event from firing within the retryOperation timeout; the graceful networkidle2 fallback in navigateToPage()
-  // allows execution to continue to channel selection even when background requests are still pending.
+  // selectReadyVideo because the page may have multiple video elements (ads, previews, main content). Every Hulu document load goes through the module's own
+  // guide entry above, which waits for network idle because the SPA's heavy asynchronous initialization often prevents the load event from firing within the
+  // navigation timeout, and tolerates that timeout so execution continues to channel selection even when background requests are still pending.
   profile: {
 
     category: "multiChannel",
@@ -2202,7 +2361,7 @@ export const huluProvider: ProviderModule = {
     selectReadyVideo: true,
     summary: "Hulu Live TV (guide grid, needs selector)",
     useRequestFullscreen: true,
-    waitForNetworkIdle: true
+    waitForNetworkIdle: HULU_DOCUMENT_LOAD.waitForNetworkIdle
   },
   profileName: "huluLive",
   slug: "hulu",
@@ -2211,6 +2370,7 @@ export const huluProvider: ProviderModule = {
     clearCache: clearHuluCache,
     execute: guideGridStrategy,
     invalidateDirectUrl: invalidateHuluDirectUrl,
+    navigate: enterHuluGuide,
     resolveDirectUrl: resolveHuluDirectUrl
   },
   strategyName: "guideGrid"

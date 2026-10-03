@@ -59,9 +59,10 @@ export type BrowserLifecycle =
 
 /**
  * The injected dependencies. `launch` performs the real, gated launch - it must resolve only with a capture-ready browser and reject otherwise (the adapter runs
- * the readiness gate inside it). `now` is the time source (realClock.now in production, a fake in tests). `policy` bounds the governor; it is a getter, read fresh
- * at each governor decision, so the adapter can source the bounds from live configuration and an operator's change takes effect without reconstructing the
- * supervisor. `onStateChange` is an optional observer the adapter uses to log transitions and raise the loud degraded alarm; the supervisor itself stays log-free.
+ * the readiness gate inside it). `now` is the time source (the system clock's `now` in production, a fake in tests). `policy` bounds the governor; it is a
+ * getter, read fresh at each governor decision, so the adapter can source the bounds from live configuration and an operator's change takes effect without
+ * reconstructing the supervisor. `onStateChange` is an optional observer the adapter uses to log transitions and raise the loud degraded alarm; the supervisor
+ * itself stays log-free.
  */
 export interface BrowserSupervisorPorts {
 

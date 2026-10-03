@@ -71,7 +71,7 @@ describe("createInitialStreamStatus", () => {
 
   test("populates required fields from options and defaults the rest", () => {
 
-    const startTime = new Date("2026-01-15T20:00:00.000Z");
+    const startTime = Date.parse("2026-01-15T20:00:00.000Z");
 
     const status = createInitialStreamStatus({
 
@@ -87,7 +87,7 @@ describe("createInitialStreamStatus", () => {
     assert.equal(status.channel, "abc");
     assert.equal(status.serviceName, "ABC");
     assert.equal(status.url, "https://abc.test/live");
-    assert.equal(status.startTime, startTime.toISOString(), "startTime serialized to ISO");
+    assert.equal(status.startTime, new Date(startTime).toISOString(), "startTime serialized to ISO");
     assert.equal(status.health, "healthy", "default health is healthy");
     assert.equal(status.streamingMode, "capture", "default streaming mode is capture");
     assert.equal(status.captureCodec, null, "default codec is null");
@@ -106,7 +106,7 @@ describe("createInitialStreamStatus", () => {
       logoUrl: "https://logos.test/espn.png",
       numericStreamId: 7,
       serviceName: "ESPN",
-      startTime: new Date(0),
+      startTime: 0,
       streamingMode: "native",
       url: "https://espn.test"
     });
@@ -126,7 +126,7 @@ describe("createInitialStreamStatus", () => {
       channelName: null,
       numericStreamId: 1,
       serviceName: "Custom URL",
-      startTime: new Date(),
+      startTime: Date.now(),
       url: "https://example.test"
     });
 

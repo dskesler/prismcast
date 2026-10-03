@@ -2,11 +2,12 @@
  *
  * consent.ts: Automatic consent-overlay and interstitial handling for externally navigated pages in PrismCast.
  */
-import { LOG, delay, realClock } from "../utils/index.ts";
+import { LOG, pollUntil } from "../utils/index.ts";
 import { CONFIG } from "../config/index.ts";
-import type { Clock } from "../utils/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Page } from "puppeteer-core";
 import type { ResolvedSiteProfile } from "../types/index.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* This module is the single source of truth for getting consent overlays and interstitials out of the way on any page PrismCast navigates on the viewer's behalf -
  * a tune's channel-selection walk and video wait, a discovery or precache walk, a static capture. Each distinct overlay class is handled with its own correct
@@ -233,8 +234,8 @@ interface AutoDismissDetail {
  */
 interface OverlayHandlingBaseOptions {
 
-  // The clock used for the poll deadline and the inter-tick sleep. Defaults to realClock (performance.now()-based). Tests inject a fake clock so the poll's schedule
-  // is deterministic without real timers.
+  // The clock used for the poll deadline and the inter-tick sleep. Defaults to the system clock. Tests inject a virtual clock so the poll's schedule is
+  // deterministic without real timers.
   readonly clock?: Clock;
 
   // Aborts the poll early. The caller signals this once its phase settles so the poll stops interacting with a page that is already done.
@@ -273,9 +274,12 @@ interface OverlayPollState {
 }
 
 /**
- * Options for runOverlayTick(): the phase's policy, the mutable per-poll state, and the caller's abort signal.
+ * Options for runOverlayTick(): the tick's clock, the phase's policy, the mutable per-poll state, and the caller's abort signal.
  */
 interface OverlayTickOptions {
+
+  // The clock the tick's settle sleeps run on - the same clock as the poll's cadence, so one virtual timeline drives a tick's click physics and the poll around it.
+  readonly clock: Clock;
 
   // The acting phase's policy - which actions this tick may take.
   readonly policy: PhasePolicy;
@@ -367,9 +371,11 @@ export function locateSelectorCoordinate(sel: string): { x: number; y: number } 
  * element is absent, has zero layout size, or is covered and the in-page click finds nothing, so callers can keep polling.
  * @param page - The Puppeteer page.
  * @param selector - The CSS selector for the element to click.
+ * @param clock - The clock the settle before the dispatch sleeps on - the poll's clock, so one timeline drives the click physics and the cadence around it.
+ *   Defaults to the system clock, so a caller outside a poll, such as a provider route clicking its own guide, passes nothing.
  * @returns True if the element was found and clicked.
  */
-async function clickSelectorByCoordinate(page: Page, selector: string): Promise<boolean> {
+export async function clickSelectorByCoordinate(page: Page, selector: string, clock: Clock = systemClock): Promise<boolean> {
 
   const target = await page.evaluate(locateSelectorCoordinate, selector);
 
@@ -379,8 +385,8 @@ async function clickSelectorByCoordinate(page: Page, selector: string): Promise<
   }
 
   // Brief settle delay after scrolling, mirroring the shared scrollAndClick helper, before dispatching the real pointer-event chain. This paces real page physics
-  // inside an action and is exercised only when a click actually dispatches, so it stays on delay() rather than the injected poll clock.
-  await delay(SCROLL_SETTLE_DELAY);
+  // inside an action and is exercised only when a click actually dispatches. It runs on the poll's clock, so a test drives it with the cadence.
+  await clock.delay(SCROLL_SETTLE_DELAY);
 
   /* The hit test sits between the settle and the dispatch because it has to read the layout the click will land on: the resolver measured its coordinates before the
    * scroll settled, and once capture is established the video and its ancestors are lifted above the rest of the page, so a banner that appears afterwards sits
@@ -625,7 +631,7 @@ export async function consentOverlayPresent(page: Page): Promise<boolean> {
  */
 async function runOverlayTick(page: Page, profile: ResolvedSiteProfile, options: OverlayTickOptions): Promise<OverlayTickResult> {
 
-  const { policy, signal, state } = options;
+  const { clock, policy, signal, state } = options;
 
   try {
 
@@ -640,7 +646,7 @@ async function runOverlayTick(page: Page, profile: ResolvedSiteProfile, options:
         }
 
         // eslint-disable-next-line no-await-in-loop
-        const rejected = await clickSelectorByCoordinate(page, vendor.reject);
+        const rejected = await clickSelectorByCoordinate(page, vendor.reject, clock);
 
         if(rejected) {
 
@@ -665,9 +671,9 @@ async function runOverlayTick(page: Page, profile: ResolvedSiteProfile, options:
 
       if(gate) {
 
-        // The settle after locateEmbedGate's scroll paces real page physics inside an action, exercised only when an accept actually dispatches - so it stays on
-        // delay() rather than the injected poll clock, exactly like the coordinate-click settle.
-        await delay(SCROLL_SETTLE_DELAY);
+        // The settle after locateEmbedGate's scroll paces real page physics inside an action and is exercised only when an accept actually dispatches. It runs on
+        // the poll's clock, so one virtual timeline drives a tick's click physics and the cadence around it.
+        await clock.delay(SCROLL_SETTLE_DELAY);
         await page.mouse.click(gate.x, gate.y);
 
         logAutoDismiss("embed-gate", { label: gate.label });
@@ -734,15 +740,16 @@ async function runOverlayTick(page: Page, profile: ResolvedSiteProfile, options:
  * modals on any externally navigated page. The phase declares which of those actions are safe and how long the poll may run; the caller's abort signal stops it as
  * soon as its phase settles.
  *
- * When an embedded-player consent gate is accepted (only reachable in the videoWait phase), onEmbedGateAccepted() is invoked and the poll stops, because the gate's
- * acceptance only takes effect on a fresh load - the caller abandons the in-flight wait and reloads.
+ * The handling is one call to the poll policy: a tick is the read, a tick result other than "continue" satisfies the predicate, and the window and the abort are
+ * the policy's to enforce. When an embedded-player consent gate is accepted (only reachable in the videoWait phase), onEmbedGateAccepted() is invoked and the poll
+ * stops, because the gate's acceptance only takes effect on a fresh load - the caller abandons the in-flight wait and reloads.
  * @param page - The Puppeteer page.
  * @param profile - The resolved site profile.
  * @param options - The phase, an optional clock and abort signal, and (videoWait only) the embed-gate callback. See StartOverlayHandlingOptions.
  */
 export async function startOverlayHandling(page: Page, profile: ResolvedSiteProfile, options: StartOverlayHandlingOptions): Promise<void> {
 
-  const { clock = realClock, phase, signal } = options;
+  const { clock = systemClock, phase, signal } = options;
 
   // Capture the gate callback once, while the union is narrowed: only the videoWait arm carries it. Every other phase forbids the accept, so the tick never returns
   // "gate" for them and this stays undefined.
@@ -750,49 +757,17 @@ export async function startOverlayHandling(page: Page, profile: ResolvedSiteProf
   const policy = PHASE_POLICY[phase];
   const state: OverlayPollState = { dismissSelector: "armed", handledVendors: new Set<string>() };
 
-  /* Resolve the poll window from the phase's policy: a fixed millisecond budget, the profile-derived video-wait window for the phases whose timing tracks the wait,
-   * or an infinite deadline for a phase whose only terminator is its caller's abort. One time origin end to end (clock.now() for both the deadline and the loop
-   * condition), because realClock.now() is performance.now()-based - a half-migration that mixed it with Date.now() would invert the loop condition and zero-tick
-   * every poll. An infinite deadline is safe because the loop still checks the signal on entry and after every sleep, so the abort ends it within one tick.
+  /* The phase's window is the poll's ceiling: a fixed millisecond budget, the profile-derived video-wait window for the phases whose timing tracks the wait, or an
+   * infinite ceiling for a phase whose only terminator is its caller's abort - a ceiling the policy never reaches, so the signal is what ends the poll. The signal
+   * is checked before every tick and ends a cadence sleep from inside it, and the tick checks it between its own action groups. A "gate" tick signals the caller
+   * and a "stop" tick ends the poll; an aborted outcome needs no branch of its own, because the caller has already stopped caring about the answer.
    */
-  const deadline = clock.now() + resolveWindow(policy.window, profile);
+  const outcome = await pollUntil({ cadenceMs: OVERLAY_POLL_INTERVAL, ceilingMs: resolveWindow(policy.window, profile), clock,
+    read: (): Promise<OverlayTickResult> => runOverlayTick(page, profile, { clock, policy, signal, state }), signal,
+    until: (result: OverlayTickResult): boolean => result !== "continue" });
 
-  let firstCheck = true;
+  if((outcome.status === "satisfied") && (outcome.value === "gate")) {
 
-  while(clock.now() < deadline) {
-
-    if(signal?.aborted) {
-
-      return;
-    }
-
-    // The first check is immediate; subsequent checks are spaced by the poll interval.
-    if(!firstCheck) {
-
-      // eslint-disable-next-line no-await-in-loop
-      await clock.sleep(OVERLAY_POLL_INTERVAL);
-
-      if(signal?.aborted) {
-
-        return;
-      }
-    }
-
-    firstCheck = false;
-
-    // eslint-disable-next-line no-await-in-loop
-    const result = await runOverlayTick(page, profile, { policy, signal, state });
-
-    if(result === "gate") {
-
-      onGate?.();
-
-      return;
-    }
-
-    if(result === "stop") {
-
-      return;
-    }
+    onGate?.();
   }
 }

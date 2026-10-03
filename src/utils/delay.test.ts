@@ -1,83 +1,76 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * delay.test.ts: Unit tests for the wait policies in delay.ts (timeoutSignal, waitWithTimeout, boundedWait, delay, pollUntil). The four promise-shaped
- * policies use real setTimeout: the timing-only checks on timeoutSignal drive mock.timers, whose synchronous tick is enough because an abort is delivered
- * synchronously from the timer callback, while the policies that await a promise use small real-time delays (1-30ms) instead, because a synchronous tick
- * cannot drain the microtask chain an awaited wait settles through. pollUntil takes a Clock, so its rows drive a fake one and read the schedule directly.
+ * delay.test.ts: Unit tests for the wait policies in delay.ts (timeoutSignal, waitWithTimeout, boundedWait, delay, pollUntil). Every policy takes its clock
+ * through its options, so the rows that assert a schedule drive one TestClock and read what the policy registered on it - the bound's deadline, the cadences,
+ * and the count still pending after settlement - rather than waiting real time out. Each policy also keeps a row that supplies no clock at all, so the
+ * destructuring default reaching systemClock is proven rather than assumed.
  */
+import type { PollOutcome, PollSettled } from "./delay.ts";
+import { TestClock, advanceThroughSchedule, drainClock, settle } from "homebridge-plugin-utils/testing";
 import { boundedWait, delay, pollUntil, timeoutSignal, waitWithTimeout } from "./delay.ts";
-import { describe, mock, test } from "node:test";
-import { makeAdvancingClock, makeFakeClock } from "./clock.helpers.ts";
+import { describe, test } from "node:test";
+import type { Clock } from "homebridge-plugin-utils";
 import assert from "node:assert/strict";
+
+// Answers an AbortSignal-or-undefined without letting the compiler narrow it, so the overload row exercises the optional-signal shape rather than the
+// signal-less one.
+function maybeSignal(): AbortSignal | undefined {
+
+  return undefined;
+}
 
 describe("timeoutSignal", () => {
 
-  test("stays quiet until the duration elapses, then aborts carrying the supplied error", () => {
+  test("stays quiet until the clock reaches the duration, then aborts carrying the supplied error", () => {
 
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
+    const reason = new Error("bespoke lapse");
+    const timeout = timeoutSignal(1000, { clock, reason });
 
-    try {
+    assert.equal(clock.pending, 1, "the bound is registered on the injected clock");
+    assert.equal(clock.nextDeadline, 1000, "the bound comes due at the duration it was given");
 
-      const reason = new Error("bespoke lapse");
-      const timeout = timeoutSignal(1000, reason);
+    clock.advance(999);
 
-      mock.timers.tick(999);
+    assert.equal(timeout.signal.aborted, false, "one millisecond short of the duration the signal is still quiet");
 
-      assert.equal(timeout.signal.aborted, false, "one tick short of the duration the signal is still quiet");
+    clock.advance(1);
 
-      mock.timers.tick(1);
-
-      assert.equal(timeout.signal.aborted, true, "the signal aborts once the duration elapses");
-      assert.equal(timeout.signal.reason, reason, "the abort reason is the caller's own error object, by reference");
-
-      timeout.cancel();
-    } finally {
-
-      mock.timers.reset();
-    }
+    assert.equal(timeout.signal.aborted, true, "the signal aborts once the clock reaches the duration");
+    assert.equal(timeout.signal.reason, reason, "the abort reason is the caller's own error object, by reference");
+    assert.equal(clock.pending, 0, "the one-shot leaves the timeline when it fires");
   });
 
   test("aborts with a default error naming the duration when no reason is supplied", () => {
 
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock();
+    const timeout = timeoutSignal(250, { clock });
 
-    try {
+    assert.equal(clock.pending, 1, "the bound is registered on the injected clock");
 
-      const timeout = timeoutSignal(250);
+    clock.advance(250);
 
-      mock.timers.tick(250);
-
-      assert.match((timeout.signal.reason as Error).message, /Operation timed out after 250ms\./, "the default reason names the duration");
-
-      timeout.cancel();
-    } finally {
-
-      mock.timers.reset();
-    }
+    assert.match((timeout.signal.reason as Error).message, /Operation timed out after 250ms\./, "the default reason names the duration");
   });
 
-  test("a cancelled handle never aborts, even well past its duration", () => {
+  test("a cancelled handle leaves nothing registered and never aborts, even well past its duration", () => {
 
-    // Negative test: cancel() has to clear the underlying timer outright, not merely leave nobody watching it.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    // Negative test: cancel() has to dispose the clock's one-shot outright, not merely leave nobody watching it.
+    const clock = new TestClock();
+    const timeout = timeoutSignal(1000, { clock });
 
-    try {
+    timeout.cancel();
 
-      const timeout = timeoutSignal(1000);
+    assert.equal(clock.pending, 0, "the cancelled bound is off the timeline");
 
-      timeout.cancel();
-      mock.timers.tick(5000);
+    clock.advance(5000);
 
-      assert.equal(timeout.signal.aborted, false, "a cancelled handle stays quiet past its own duration");
-    } finally {
-
-      mock.timers.reset();
-    }
+    assert.equal(timeout.signal.aborted, false, "a cancelled handle stays quiet past its own duration");
   });
 
   test("cancel() is safe to call more than once", () => {
 
-    // clearTimeout silently does nothing on an already-cleared or already-fired timer, so a consumer that cancels defensively cannot break.
+    // Disposing an already-disposed handle finds nothing left to cancel, so a consumer that cancels defensively cannot break.
     const timeout = timeoutSignal(50000);
 
     assert.doesNotThrow(() => {
@@ -88,38 +81,18 @@ describe("timeoutSignal", () => {
     });
   });
 
-  test("unrefs the timer it creates", () => {
+  test("runs on the system clock when no clock is supplied", async () => {
 
-    // A dropped unref is invisible from outside the handle - the signal behaves identically either way - so we capture the timer this call creates by wrapping
-    // the global for its duration and ask the handle itself. Without the unref, a bound still counting down would hold an otherwise-empty loop open.
-    const realSetTimeout = globalThis.setTimeout;
+    // The default is the real thing, so a short bound with nothing injected actually fires on the platform timers - which is what proves the destructuring
+    // default reaches systemClock rather than some inert stand-in.
+    const timeout = timeoutSignal(5);
 
-    let unrefCount = 0;
+    await delay(30);
 
-    globalThis.setTimeout = ((callback: (...callbackArgs: unknown[]) => void, ms?: number): ReturnType<typeof setTimeout> => {
+    assert.equal(timeout.signal.aborted, true, "the default bound fired on real time");
+    assert.match((timeout.signal.reason as Error).message, /Operation timed out after 5ms\./, "the default reason names the duration");
 
-      const handle = realSetTimeout(callback, ms);
-      const realUnref = handle.unref.bind(handle);
-
-      handle.unref = (): ReturnType<typeof setTimeout> => {
-
-        unrefCount++;
-
-        return realUnref();
-      };
-
-      return handle;
-    }) as unknown as typeof globalThis.setTimeout;
-
-    try {
-
-      timeoutSignal(50000).cancel();
-    } finally {
-
-      globalThis.setTimeout = realSetTimeout;
-    }
-
-    assert.equal(unrefCount, 1, "the created timer is unref'd exactly once");
+    timeout.cancel();
   });
 
   test("returns a handle exposing both cancel and signal", () => {
@@ -141,6 +114,19 @@ describe("waitWithTimeout", () => {
     const result = await waitWithTimeout(fast, 100);
 
     assert.equal(result, "fast-value", "the resolved value should come from the inner promise");
+  });
+
+  test("returns the promise's value on an injected clock and leaves the bound cancelled", async () => {
+
+    // The bound is registered on the injected clock and disposed in the finally, so a policy that leaked its handle would show here as a still-pending entry.
+    const clock = new TestClock();
+    const result = await waitWithTimeout(Promise.resolve("virtual-value"), 50000, { clock });
+
+    assert.equal(result, "virtual-value", "the resolved value should come from the inner promise");
+
+    await settle();
+
+    assert.equal(clock.pending, 0, "the bound was disposed at settlement rather than left on the timeline");
   });
 
   test("rejects with the default timeout error when the bound lapses", async () => {
@@ -167,8 +153,26 @@ describe("waitWithTimeout", () => {
     const timeoutError = new CustomTimeoutError();
     const { promise: never } = Promise.withResolvers<string>();
 
-    await assert.rejects(() => waitWithTimeout(never, 5, timeoutError), (error: unknown) => error === timeoutError,
+    await assert.rejects(() => waitWithTimeout(never, 5, { reason: timeoutError }), (error: unknown) => error === timeoutError,
       "the supplied error object itself is thrown, by reference");
+  });
+
+  test("rejects with the exact reason object when the injected clock advances past the bound", async () => {
+
+    const clock = new TestClock();
+    const reason = new Error("virtual lapse");
+    const { promise: never } = Promise.withResolvers<string>();
+    const bounded = waitWithTimeout(never, 1000, { clock, reason });
+
+    // The expectation is attached before the clock is driven, so the rejection the advance releases is observed rather than unhandled.
+    const rejection = assert.rejects(bounded, (error: unknown) => error === reason, "the supplied error object itself is thrown, by reference");
+
+    assert.equal(clock.nextDeadline, 1000, "the bound is armed at the duration the caller asked for");
+
+    clock.advance(1000);
+
+    await rejection;
+    assert.equal(clock.pending, 0, "nothing stays registered once the lapse has settled");
   });
 
   test("propagates the promise's own rejection (not a timeout)", async () => {
@@ -248,30 +252,33 @@ describe("boundedWait", () => {
     assert.equal(result, "value", "the promise's value comes back unchanged");
   });
 
-  test("returns null when the bound lapses before the promise settles", async () => {
+  test("returns the promise's value on an injected clock and leaves the bound cancelled", async () => {
 
-    /* The bound has to use this project's own timeout signal, which is built on the global setTimeout a fake clock can virtualize, rather than on a timer the
-     * platform owns internally. A large bound is what tells those two wirings apart: mock.timers fires the virtualized timer on the tick, so the correct wiring
-     * settles here and now, while a bound built on a platform-internal timer would still be a real sixty seconds away and would lose to the short sentinel below.
+    const clock = new TestClock();
+    const result = await boundedWait(Promise.resolve("virtual-value"), 50000, { clock });
+
+    assert.equal(result, "virtual-value", "the promise's value comes back unchanged");
+
+    await settle();
+
+    assert.equal(clock.pending, 0, "the bound was disposed at settlement rather than left on the timeline");
+  });
+
+  test("returns null when the injected clock advances past the bound", async () => {
+
+    /* The lapse is what the value-shaped policy exists to express, and it binds on the clock the caller injected rather than on real time: a policy that reached
+     * for the system clock instead would leave this row waiting out a full minute and failing on the runner's own timeout.
      */
+    const clock = new TestClock();
     const { promise: never } = Promise.withResolvers<string>();
+    const lapsing = boundedWait(never, 60000, { clock });
 
-    mock.timers.enable({ apis: ["setTimeout"] });
+    assert.equal(clock.nextDeadline, 60000, "the bound is armed at the duration the caller asked for");
 
-    const pending = boundedWait(never, 60000);
+    clock.advance(60000);
 
-    try {
-
-      mock.timers.tick(60000);
-    } finally {
-
-      mock.timers.reset();
-    }
-
-    const stillPending = Symbol("still-pending");
-    const settled = await Promise.race([ pending, new Promise((resolve) => { setTimeout(() => { resolve(stillPending); }, 50); }) ]);
-
-    assert.equal(settled, null, "the lapsed bound settles null on the tick rather than staying pending");
+    assert.equal(await lapsing, null, "the lapsed bound settles null rather than staying pending");
+    assert.equal(clock.pending, 0, "nothing stays registered once the lapse has settled");
   });
 
   test("propagates a rejection that arrives inside the bound", async () => {
@@ -349,11 +356,11 @@ describe("delay", () => {
 
     // We pick a small value to stay under budget. Slack is one-sided: real wall time can run a touch slower than requested due to runner overhead, but it
     // cannot run faster than setTimeout's clock.
-    const start = performance.now();
+    const start = Date.now();
 
     await delay(10);
 
-    const elapsed = performance.now() - start;
+    const elapsed = Date.now() - start;
 
     assert.ok(elapsed >= 8, "elapsed should be at least 8ms (one-sided slack): " + String(elapsed));
   });
@@ -369,7 +376,7 @@ describe("delay", () => {
 
   test("handles a 0ms delay by yielding to the event loop", async () => {
 
-    // Boundary: a 0ms delay still goes through setTimeout, which means at least one task-queue tick before resolution.
+    // Boundary: a 0ms delay still goes through the platform timer, which means at least one task-queue tick before resolution.
     let synchronouslySet = false;
     const promise = delay(0);
 
@@ -387,9 +394,9 @@ describe("pollUntil", () => {
   test("reads once and sleeps never when the first read already satisfies", async () => {
 
     /* The whole reason this shape beats a fixed delay: a signal that is already true costs one round trip. A sleep scheduled ahead of the first read would show
-     * up here as a recorded duration.
+     * up here as a registered wait.
      */
-    const { clock, sleeps } = makeFakeClock();
+    const clock = new TestClock();
 
     let reads = 0;
 
@@ -400,22 +407,22 @@ describe("pollUntil", () => {
       return "normal";
     }, until: (state: string): boolean => state === "normal" });
 
-    assert.equal(outcome.lapsed, false, "a satisfied read is not a lapse");
+    assert.equal(outcome.status, "satisfied", "a satisfied read is not a lapse");
     assert.equal(outcome.reads, 1, "exactly one read");
     assert.equal(outcome.value, "normal", "the outcome carries the satisfying value");
     assert.equal(reads, 1, "the read ran exactly once");
-    assert.deepEqual(sleeps, [], "no sleep is scheduled before or after a first read that satisfies");
+    assert.deepEqual(clock.requested, [], "no sleep is registered before or after a first read that satisfies");
   });
 
   test("sleeps the cadence between reads until one satisfies", async () => {
 
     // The cadence is what separates consecutive reads, so a poll that satisfies on its third read has slept exactly twice, each time for the cadence.
-    const { clock, sleeps } = makeFakeClock();
+    const clock = new TestClock();
     const answers = [ "minimized", "minimized", "normal" ];
 
     let reads = 0;
 
-    const outcome = await pollUntil({ cadenceMs: 25, ceilingMs: 1000, clock, read: async (): Promise<string> => {
+    const running = pollUntil({ cadenceMs: 25, ceilingMs: 1000, clock, read: async (): Promise<string> => {
 
       const answer = answers[reads] ?? "normal";
 
@@ -424,10 +431,18 @@ describe("pollUntil", () => {
       return answer;
     }, until: (state: string): boolean => state === "normal" });
 
-    assert.equal(outcome.lapsed, false, "the third read satisfied inside the ceiling");
+    await settle();
+    assert.equal(clock.pending, 1, "the first cadence is parked on the clock");
+
+    await advanceThroughSchedule(clock, [ 25, 25 ]);
+
+    const outcome = await running;
+
+    assert.equal(outcome.status, "satisfied", "the third read satisfied inside the ceiling");
     assert.equal(outcome.reads, 3, "three reads");
     assert.equal(outcome.value, "normal", "the outcome carries the satisfying value");
-    assert.deepEqual(sleeps, [ 25, 25 ], "one cadence sleep between each pair of reads, and none after the satisfying one");
+    assert.deepEqual(clock.requested, [ 25, 25 ], "one cadence sleep between each pair of reads, and none after the satisfying one");
+    assert.equal(clock.pending, 0, "nothing stays registered after the satisfying read");
   });
 
   test("lapses at the ceiling and reports the last value read", async () => {
@@ -437,34 +452,42 @@ describe("pollUntil", () => {
      */
     const cadenceMs = 25;
     const ceilingMs = 100;
-    const { clock, sleeps } = makeAdvancingClock();
+    const clock = new TestClock();
 
     let reads = 0;
 
-    const outcome = await pollUntil({ cadenceMs, ceilingMs, clock, read: async (): Promise<string> => {
+    const running = pollUntil({ cadenceMs, ceilingMs, clock, read: async (): Promise<string> => {
 
       reads++;
 
       return "minimized-" + String(reads);
     }, until: (state: string): boolean => state === "normal" });
 
-    assert.equal(outcome.lapsed, true, "no read satisfied before the ceiling elapsed");
+    await settle();
+    assert.equal(clock.pending, 1, "the first cadence is parked on the clock");
+
+    const steps = await drainClock(clock);
+    const outcome = await running;
+
+    assert.equal(outcome.status, "lapsed", "no read satisfied before the ceiling elapsed");
     assert.equal(outcome.reads, Math.floor(ceilingMs / cadenceMs) + 1, "the ceiling affords one read plus one per cadence");
-    assert.equal(reads, Math.floor(ceilingMs / cadenceMs) + 1, "the read ran exactly that many times");
+    assert.equal(reads, outcome.reads, "the read ran exactly that many times");
     assert.equal(outcome.value, "minimized-" + String(outcome.reads), "the outcome carries the last value read, not a satisfying one");
-    assert.equal(sleeps.length, outcome.reads - 1, "one cadence sleep between each pair of reads");
+    assert.equal(clock.requested.length, outcome.reads - 1, "one cadence sleep between each pair of reads");
+    assert.equal(steps, outcome.reads - 1, "the drain stepped exactly the cadences the poll registered");
+    assert.equal(clock.now(), (outcome.reads - 1) * cadenceMs, "virtual time advanced by exactly the cadences the poll released");
   });
 
   test("propagates a read's rejection and stops polling there", async () => {
 
     // Negative test: what a failed read means belongs to the caller. Swallowing it would report a lapse where there was a fault, and would keep asking a source
     // that has already failed.
-    const { clock, sleeps } = makeFakeClock();
+    const clock = new TestClock();
     const failure = new Error("the window state could not be read");
 
     let reads = 0;
 
-    await assert.rejects(pollUntil({ cadenceMs: 25, ceilingMs: 1000, clock, read: async (): Promise<string> => {
+    const running = pollUntil({ cadenceMs: 25, ceilingMs: 1000, clock, read: async (): Promise<string> => {
 
       reads++;
 
@@ -474,16 +497,25 @@ describe("pollUntil", () => {
       }
 
       return "minimized";
-    }, until: (state: string): boolean => state === "normal" }), (error: unknown) => error === failure, "the caller's own error object propagates by reference");
+    }, until: (state: string): boolean => state === "normal" });
+
+    // The expectation is attached before the clock is driven, so the rejection the drive releases is observed rather than unhandled.
+    const rejection = assert.rejects(running, (error: unknown) => error === failure, "the caller's own error object propagates by reference");
+
+    await settle();
+    assert.equal(clock.pending, 1, "the one cadence before the throwing read is parked on the clock");
+
+    await drainClock(clock);
+    await rejection;
 
     assert.equal(reads, 2, "the poll stopped at the throwing read");
-    assert.deepEqual(sleeps, [25], "only the one cadence sleep that preceded the throwing read");
+    assert.deepEqual(clock.requested, [25], "only the one cadence sleep that preceded the throwing read");
   });
 
   test("a zero ceiling still performs exactly one read", async () => {
 
     // Boundary: the ceiling is checked after a read, never before one, so the cheapest possible poll is still a real question asked of the source.
-    const { clock, sleeps } = makeFakeClock();
+    const clock = new TestClock();
 
     let reads = 0;
 
@@ -494,9 +526,181 @@ describe("pollUntil", () => {
       return "minimized";
     }, until: (state: string): boolean => state === "normal" });
 
-    assert.equal(outcome.lapsed, true, "an unsatisfied read under a zero ceiling lapses");
+    assert.equal(outcome.status, "lapsed", "an unsatisfied read under a zero ceiling lapses");
     assert.equal(outcome.reads, 1, "exactly one read");
     assert.equal(reads, 1, "the read ran exactly once");
-    assert.deepEqual(sleeps, [], "no cadence sleep is scheduled when the ceiling has already elapsed");
+    assert.deepEqual(clock.requested, [], "no cadence sleep is registered when the ceiling has already elapsed");
+  });
+
+  test("runs on the system clock when no clock is supplied", async () => {
+
+    // The default reaches systemClock: a two-read poll on a short cadence settles on real time with no clock injected at all.
+    let reads = 0;
+
+    const outcome = await pollUntil({ cadenceMs: 5, ceilingMs: 1000, read: async (): Promise<number> => ++reads,
+      until: (value: number): boolean => value >= 2 });
+
+    assert.equal(outcome.status, "satisfied", "the second read satisfied inside the ceiling");
+    assert.equal(outcome.reads, 2, "two reads, with one cadence between them");
+  });
+
+  test("an already-aborted signal ends the poll before any read", async () => {
+
+    // The entry checkpoint runs before the first read, so a caller that has already stopped caring never reaches the source at all.
+    const clock = new TestClock();
+    const controller = new AbortController();
+
+    let reads = 0;
+
+    controller.abort();
+
+    const outcome = await pollUntil({ cadenceMs: 25, ceilingMs: 1000, clock, read: async (): Promise<string> => {
+
+      reads++;
+
+      return "minimized";
+    }, signal: controller.signal, until: (state: string): boolean => state === "normal" });
+
+    assert.equal(outcome.status, "aborted", "the poll reports the abort");
+    assert.equal(outcome.reads, 0, "no read ran");
+    assert.equal(reads, 0, "the read function was never called");
+    assert.deepEqual(clock.requested, [], "no sleep was registered");
+  });
+
+  test("an abort during the cadence sleep ends the poll inside the sleep", async () => {
+
+    // The signal is carried into the sleep, so the abort ends the poll where it lands rather than after the cadence has run out.
+    const clock = new TestClock();
+    const controller = new AbortController();
+
+    let reads = 0;
+
+    const running = pollUntil({ cadenceMs: 25, ceilingMs: 1000, clock, read: async (): Promise<string> => {
+
+      reads++;
+
+      return "minimized";
+    }, signal: controller.signal, until: (state: string): boolean => state === "normal" });
+
+    await settle();
+    assert.equal(clock.pending, 1, "the first cadence is parked on the clock");
+
+    controller.abort();
+    await settle();
+
+    const outcome = await running;
+
+    assert.equal(outcome.status, "aborted", "the abort ended the poll inside the sleep");
+    assert.equal(outcome.reads, 1, "the one read before the sleep is counted");
+    assert.equal(clock.pending, 0, "the aborted sleep left the clock");
+
+    clock.advance(1000);
+    await settle();
+    assert.equal(reads, 1, "no read ran after the abort, however far the clock moves");
+  });
+
+  test("an abort that lands during the read is reported before any sleep is registered", async () => {
+
+    // The checkpoint after the read is what keeps an abort from being swallowed into a cadence: the read aborts the controller from inside and then returns an
+    // unsatisfying value, and the poll reports the abort rather than sleeping on it.
+    const clock = new TestClock();
+    const controller = new AbortController();
+
+    let reads = 0;
+
+    const outcome = await pollUntil({ cadenceMs: 25, ceilingMs: 1000, clock, read: async (): Promise<string> => {
+
+      reads++;
+      controller.abort();
+
+      return "minimized";
+    }, signal: controller.signal, until: (state: string): boolean => state === "normal" });
+
+    assert.equal(outcome.status, "aborted", "the checkpoint before the sleep caught the abort");
+    assert.equal(outcome.reads, 1, "the read that aborted is counted");
+    assert.equal(reads, 1, "the read ran exactly once");
+    assert.deepEqual(clock.requested, [], "no cadence sleep was ever registered");
+  });
+
+  test("an abort that lands during a read at the ceiling is reported as aborted, not lapsed", async () => {
+
+    // Both terminal conditions arrive on one read: the clock reaches the ceiling while the read runs and the signal aborts before the read returns. The caller's
+    // own stop wins, because a lapse would hand back a value the caller has already stopped caring about.
+    const clock = new TestClock();
+    const controller = new AbortController();
+
+    const outcome = await pollUntil({ cadenceMs: 25, ceilingMs: 100, clock, read: async (): Promise<string> => {
+
+      clock.advance(100);
+      controller.abort();
+
+      return "minimized";
+    }, signal: controller.signal, until: (state: string): boolean => state === "normal" });
+
+    assert.equal(outcome.status, "aborted", "the abort wins over the lapse");
+    assert.equal(outcome.reads, 1, "the read that aborted is counted");
+    assert.deepEqual(clock.requested, [], "no cadence sleep was ever registered");
+  });
+
+  test("a clock whose sleep fails for a reason other than the signal propagates that failure", async () => {
+
+    // Negative test: the policy identifies its own abort by the signal it holds, never by the shape of the rejection. A clock that cannot sleep is a fault the
+    // caller must see, and reporting it as an abort would hide that fault behind an outcome exactly as swallowing a read's rejection would.
+    const failure = new Error("the clock could not sleep");
+    const clock = new TestClock();
+    const controller = new AbortController();
+    const broken: Clock = {
+
+      delay: async (): Promise<void> => { throw failure; },
+      now: (): number => clock.now(),
+      schedule: (callback: () => void, ms: number, init?: { repeat?: boolean }): Disposable => clock.schedule(callback, ms, init),
+      timeout: (ms: number): AbortSignal => clock.timeout(ms)
+    };
+
+    await assert.rejects(pollUntil({ cadenceMs: 25, ceilingMs: 1000, clock: broken, read: async (): Promise<string> => "minimized", signal: controller.signal,
+      until: (state: string): boolean => state === "normal" }), (error: unknown) => error === failure, "the clock's own failure propagates by reference");
+
+    assert.equal(controller.signal.aborted, false, "the signal never aborted, so the rejection was not the poll's abort");
+  });
+
+  test("an abort on the system clock ends the sleep promptly rather than at the cadence's end", async () => {
+
+    const controller = new AbortController();
+    const startedAt = process.hrtime.bigint();
+
+    setTimeout(() => { controller.abort(); }, 5);
+
+    const outcome = await pollUntil({ cadenceMs: 500, ceilingMs: 5000, read: async (): Promise<string> => "minimized", signal: controller.signal,
+      until: (state: string): boolean => state === "normal" });
+
+    const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1000000;
+
+    assert.equal(outcome.status, "aborted", "the abort ended the poll");
+    assert.ok(elapsedMs < 250, "the poll ended well inside the 500 ms cadence: " + String(elapsedMs) + " ms");
+  });
+
+  test("the overloads type a signal-less call to the settled shapes and an optional-signal call to the full outcome", async () => {
+
+    // The two bindings' declared types are the assertion the typecheck makes: a caller with no signal reads the value without narrowing, and a caller holding an
+    // optional signal has to narrow past the aborted arm before it can.
+    const clock = new TestClock();
+
+    // The optional signal comes from a call, so the binding keeps the union type: a constant initialized to a literal undefined would narrow to undefined and
+    // match the signal-less overload, which is the wrong thing to prove.
+    const optional = maybeSignal();
+    const settled: PollSettled<string> = await pollUntil({ cadenceMs: 25, ceilingMs: 0, clock, read: async (): Promise<string> => "normal",
+      until: (state: string): boolean => state === "normal" });
+
+    assert.equal(settled.value, "normal");
+
+    const outcome: PollOutcome<string> = await pollUntil({ cadenceMs: 25, ceilingMs: 0, clock, read: async (): Promise<string> => "normal", signal: optional,
+      until: (state: string): boolean => state === "normal" });
+
+    if(outcome.status !== "aborted") {
+
+      assert.equal(outcome.value, "normal");
+    }
+
+    assert.equal(outcome.status, "satisfied");
   });
 });

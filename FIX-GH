@@ -1,0 +1,51 @@
+⏺ What's left when you're ready                                                                                                                                          
+                                                                                                                                                                         
+  Required: the push (3 commands)                                                                                                                                        
+   
+  git push --force-with-lease origin main                                                                                                                                
+  git push origin :refs/tags/v1.9.0                                                                                                                                    
+  git push origin v1.9.0                                                                                                                                                 
+                                                                                                                                                                       
+  That's it. Run them in order, in this repo.                                                                                                                            
+   
+  Pre-push, on GitHub                                                                                                                                                    
+                                                                                                                                                                       
+  Branch protection on main. If you have rules requiring linear history, signed commits, status checks, or blocking force-pushes, the first command will fail. Quick     
+  check before pushing: GitHub repo settings → Branches → check rules on main. If force-push is blocked, temporarily disable that rule, push, re-enable. Couple of
+  clicks.                                                                                                                                                                
+                                                                                                                                                                       
+  If you've never set up branch protection on this repo, this is moot.                                                                                                   
+   
+  After the push                                                                                                                                                         
+                                                                                                                                                                       
+  Other local clones (your other machines). Any clone that fetched between Apr 10 and now has the old chain. To bring them in line:                                      
+   
+  git fetch origin                                                                                                                                                       
+  git reset --hard origin/main                                                                                                                                           
+  git tag -d v1.9.0
+  git fetch origin tag v1.9.0                                                                                                                                            
+                                                                                                                                                                       
+  GitHub release. GitHub auto-regenerates the v1.9.0 release tarball from the new tag tree. Nothing to do — it just happens. If you manually attached files to the v1.9.0
+   release page, those persist.
+                                                                                                                                                                         
+  Separate decision: cut v1.9.1?                                                                                                                                         
+   
+  The history rewrite cleans source. The published binaries at v1.9.0 are immutable in their respective registries:                                                      
+                                                                                                                                                                       
+  - npm prismcast@1.9.0 — past the 72-hour unpublish window. Cannot recall.                                                                                              
+  - ghcr.io prismcast:1.9.0 — could republish, but anyone who already pulled has the old digest.                                                                       
+  - Homebrew tap formula — auto-picks up the fix from the regenerated GitHub tarball on next brew upgrade.                                                               
+                                                                                                                                                                         
+  If you want the leak gone from artifacts users actually install, cut a v1.9.1 with the fix and treat v1.9.0 as superseded. If you're OK with the artifact leak         
+  persisting (the source is clean, the issue is cosmetic for downstream users since the comment never affected behavior), do nothing. Your call.                         
+                                                                                                                                                                         
+  Optional local hygiene (any time, not blocking the push)                                                                                                               
+   
+  git branch -D worktree-agent-aa104962 worktree-agent-aa6d0068    # if you don't need them                                                                              
+  git gc --prune=now                                                # collects the dangling stash + the refs/original target                                             
+                                                                                                                                                                         
+  What's unaffected                                                                                                                                                      
+                                                                                                                                                                         
+  Your WIP modifications to Changelog.md, package-lock.json, package.json are still in the working tree, exactly where they were before this work started. Untouched.    
+  Whatever you were doing with them, pick back up where you left off.
+

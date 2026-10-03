@@ -1,14 +1,15 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * hlsSegments.ts: HLS segment storage functions for PrismCast. The wait-for-readiness helpers (waitForPlaylist, waitForInitSegment) route their timeout race
- * through the Clock port (see utils/clock.ts) so tests can deterministically simulate "promise resolves before timeout" vs "timeout fires before promise"
- * without depending on real timers - the race is exactly the pattern Node's synchronous mock.timers.tick cannot drive reliably.
+ * hlsSegments.ts: HLS segment storage functions for PrismCast. The store's startup timing lines and the wait-for-readiness helpers (waitForPlaylist,
+ * waitForInitSegment) read time through the library's Clock port so tests can deterministically simulate "promise resolves before timeout" vs "timeout fires
+ * before promise" on a virtual timeline rather than against real timers.
  */
 import type { InitSegmentTrack, StreamRegistryEntry } from "./registry.ts";
-import { LOG, realClock } from "../utils/index.ts";
+import { LOG, waitWithTimeout } from "../utils/index.ts";
 import { cancelPrerollTimer, getStream } from "./registry.ts";
 import { CONFIG } from "../config/index.ts";
-import type { Clock } from "../utils/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* This module provides functions for storing and retrieving HLS segments, playlists, and init segments. All data is stored in the stream registry's HLSState, which is
  * the single source of truth for stream data. Key responsibilities:
@@ -231,8 +232,9 @@ export function getVideoPlaylist(streamId: number): string | undefined {
  * retained for the entire stream lifetime (not subject to rotation).
  * @param streamId - The numeric stream ID.
  * @param data - The init segment binary data.
+ * @param now - The instant of the store, for the startup timing line; defaults to the system clock's reading.
  */
-export function storeInitSegment(streamId: number, data: Buffer): void {
+export function storeInitSegment(streamId: number, data: Buffer, now: number = systemClock.now()): void {
 
   const stream = getStream(streamId);
 
@@ -252,7 +254,7 @@ export function storeInitSegment(streamId: number, data: Buffer): void {
 
   if(isFirstInit) {
 
-    signalFirstInit(stream);
+    signalFirstInit(stream, now);
   }
 }
 
@@ -261,12 +263,13 @@ export function storeInitSegment(streamId: number, data: Buffer): void {
  * that measures it - has one implementation regardless of which storage shape produced the first init.
  *
  * @param stream - The stream registry entry whose readiness to signal.
+ * @param now - The instant of the store, which the startup timing line measures against the stream's start.
  */
-function signalFirstInit(stream: StreamRegistryEntry): void {
+function signalFirstInit(stream: StreamRegistryEntry, now: number): void {
 
   stream.hls.signalInitSegmentReady();
 
-  const elapsed = ((Date.now() - stream.startTime.getTime()) / 1000).toFixed(3);
+  const elapsed = ((now - stream.startTime) / 1000).toFixed(3);
 
   LOG.debug("timing:startup", "Init segment ready in %ss.", elapsed);
 }
@@ -314,8 +317,9 @@ export function getInitSegment(streamId: number): Buffer | undefined {
  * @param track - The track this init belongs to.
  * @param filename - The name the init is served under.
  * @param data - The init segment binary data.
+ * @param now - The instant of the store, for the startup timing line; defaults to the system clock's reading.
  */
-export function storeNamedInitSegment(streamId: number, track: InitSegmentTrack, filename: string, data: Buffer): void {
+export function storeNamedInitSegment(streamId: number, track: InitSegmentTrack, filename: string, data: Buffer, now: number = systemClock.now()): void {
 
   const stream = getStream(streamId);
 
@@ -348,7 +352,7 @@ export function storeNamedInitSegment(streamId: number, track: InitSegmentTrack,
 
   if(isFirstVideoInit) {
 
-    signalFirstInit(stream);
+    signalFirstInit(stream, now);
   }
 }
 
@@ -466,8 +470,9 @@ export function clearNativeInitState(streamId: number): void {
  * Updates the playlist content for a stream. If this is the first playlist, signals that the stream is ready.
  * @param streamId - The numeric stream ID.
  * @param content - The m3u8 playlist content.
+ * @param now - The instant of the store, for the startup timing line; defaults to the system clock's reading.
  */
-export function updatePlaylist(streamId: number, content: string): void {
+export function updatePlaylist(streamId: number, content: string, now: number = systemClock.now()): void {
 
   const stream = getStream(streamId);
 
@@ -492,7 +497,7 @@ export function updatePlaylist(streamId: number, content: string): void {
     // flowing, uselessly seeding preroll state. For streams where the timer already fired (preroll is active), this is a no-op - the timer handle is already null.
     cancelPrerollTimer(stream.hls);
 
-    const elapsed = ((Date.now() - stream.startTime.getTime()) / 1000).toFixed(3);
+    const elapsed = ((now - stream.startTime) / 1000).toFixed(3);
 
     LOG.debug("streaming:preroll", "Live playlist ready for stream %d.", streamId);
     LOG.debug("timing:startup", "First playlist ready in %ss.", elapsed);
@@ -514,10 +519,10 @@ export function getPlaylist(streamId: number): string | undefined {
  * Waits for the first playlist to be available for a stream.
  * @param streamId - The numeric stream ID.
  * @param timeout - Maximum time to wait in milliseconds.
- * @param clock - Clock used for the timeout race. Defaults to realClock; tests inject a fake to drive the race deterministically.
+ * @param clock - Clock used for the timeout race. Defaults to the system clock; tests inject a virtual clock to drive the race deterministically.
  * @returns True if playlist is ready, false if timeout or stream not found.
  */
-export async function waitForPlaylist(streamId: number, timeout: number, clock: Clock = realClock): Promise<boolean> {
+export async function waitForPlaylist(streamId: number, timeout: number, clock: Clock = systemClock): Promise<boolean> {
 
   return waitForReady(streamId, async (stream) => stream.hls.playlistReady, timeout, clock);
 }
@@ -526,10 +531,10 @@ export async function waitForPlaylist(streamId: number, timeout: number, clock: 
  * Waits for the first init segment to be available for a stream. Used by MPEG-TS consumers to wait for codec configuration before starting their FFmpeg remuxer.
  * @param streamId - The numeric stream ID.
  * @param timeout - Maximum time to wait in milliseconds.
- * @param clock - Clock used for the timeout race. Defaults to realClock; tests inject a fake to drive the race deterministically.
+ * @param clock - Clock used for the timeout race. Defaults to the system clock; tests inject a virtual clock to drive the race deterministically.
  * @returns True if init segment is ready, false if timeout or stream not found.
  */
-export async function waitForInitSegment(streamId: number, timeout: number, clock: Clock = realClock): Promise<boolean> {
+export async function waitForInitSegment(streamId: number, timeout: number, clock: Clock = systemClock): Promise<boolean> {
 
   return waitForReady(streamId, async (stream) => stream.hls.initSegmentReady, timeout, clock);
 }
@@ -566,7 +571,7 @@ async function waitForReady(streamId: number, getPromise: (stream: StreamRegistr
 
   try {
 
-    return await clock.waitWithTimeout(Promise.race([ getPromise(stream).then(() => true), terminated ]), timeout).catch(() => false);
+    return await waitWithTimeout(Promise.race([ getPromise(stream).then(() => true), terminated ]), timeout, { clock }).catch(() => false);
   } finally {
 
     emitter.off("terminated", onTerminated);

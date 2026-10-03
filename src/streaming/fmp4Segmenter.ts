@@ -7,6 +7,7 @@ import { createMP4BoxParser, detectMoofKeyframe, offsetMoofTimestamps, parseMoov
 import { getSegmentCount, storeInitSegment, storeSegment, updatePlaylist } from "./hlsSegments.ts";
 import { CONFIG } from "../config/index.ts";
 import type { CaptureCodec } from "./codec.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import { LOG } from "../utils/index.ts";
 import type { MP4Box } from "./mp4Parser.ts";
 import type { Nullable } from "../types/index.ts";
@@ -14,6 +15,7 @@ import type { PlaylistSegmentEntry } from "./playlistBuilder.ts";
 import type { Readable } from "node:stream";
 import { buildPlaylist } from "./playlistBuilder.ts";
 import { getStream } from "./registry.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* This module transforms a puppeteer-stream MP4 capture into HLS fMP4 segments. The overall flow is: (1) receive MP4 data from puppeteer-stream (the configured
  * capture codec, H.264 or HEVC per codec.ts, paired with AAC audio, from either native capture or FFmpeg transcoding), (2) parse MP4 box structure to identify ftyp
@@ -65,6 +67,10 @@ export interface SegmenterContinuity {
  * Options for creating an fMP4 segmenter.
  */
 export interface FMP4SegmenterOptions {
+
+  // The clock the segment-cut timing, the fallback EXTINF duration, the keyframe intervals, and the program-date-time stamps read. Defaults to the system clock; a
+  // test injects a virtual clock to drive the cut boundary without waiting on real time.
+  clock?: Clock;
 
   // What this segmenter continues from, when it continues from anything. Absent for a segmenter starting a stream from nothing.
   continuity?: SegmenterContinuity;
@@ -287,8 +293,8 @@ interface SegmenterState {
   // duration when media-time data is unavailable.
   segmentStartTime: number;
 
-  // Wall-clock timestamps for when each real segment was produced. Used to emit #EXT-X-PROGRAM-DATE-TIME in generatePlaylist(). Pruned alongside segmentDurations.
-  segmentTimestamps: Map<number, Date>;
+  // The epoch millisecond instant each real segment was produced. Used to emit #EXT-X-PROGRAM-DATE-TIME in generatePlaylist(). Pruned alongside segmentDurations.
+  segmentTimestamps: Map<number, number>;
 
   // Accumulated per-track trun durations for the current segment, in timescale units. Keyed by track_ID. Reset when a segment is output. Used with trackTimescales
   // to compute media-time EXTINF values that exactly match the fMP4 PTS progression.
@@ -508,7 +514,7 @@ export function computeDiscontinuitySequence(options: { discontinuityIndices: Se
  */
 export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4SegmenterResult {
 
-  const { continuity, onError, onStop, pendingDiscontinuity, prerollBaseUrl, prerollCodec, prerollSegmentCount, streamId } = options;
+  const { clock = systemClock, continuity, onError, onStop, pendingDiscontinuity, prerollBaseUrl, prerollCodec, prerollSegmentCount, streamId } = options;
   const { initialTrackTimestamps, previousInitSegment, priorSessionStats, startingInitVersion, startingSegmentIndex } = continuity ?? {};
 
   // Initialize state.
@@ -538,7 +544,7 @@ export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4Segmente
     segmentDurations: new Map(),
     segmentFirstMoofChecked: false,
     segmentIndex: startingSegmentIndex ?? 0,
-    segmentStartTime: Date.now(),
+    segmentStartTime: clock.now(),
     segmentTimestamps: new Map(),
     segmentTrackDurations: new Map(),
     segmentsWithoutLeadingKeyframe: 0,
@@ -633,9 +639,9 @@ export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4Segmente
       // placeholder content and assigning it wall-clock timestamps would create a backward time jump at the preroll-to-live boundary.
       const timestamp = state.segmentTimestamps.get(i);
 
-      if(timestamp) {
+      if(timestamp !== undefined) {
 
-        entry.programDateTime = timestamp.toISOString();
+        entry.programDateTime = new Date(timestamp).toISOString();
       }
 
       realEntries.push(entry);
@@ -677,7 +683,7 @@ export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4Segmente
 
     state.fragmentBuffer = [];
     state.segmentFirstMoofChecked = false;
-    state.segmentStartTime = Date.now();
+    state.segmentStartTime = clock.now();
     state.segmentTrackDurations = new Map();
 
     // Reset video traf tracking for the next segment. Stays null if the video trackId is unknown; otherwise starts false until a video traf is seen.
@@ -722,10 +728,10 @@ export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4Segmente
       }
     }
 
-    const actualDuration = Math.max(0.1, (mediaDuration > 0) ? mediaDuration : ((Date.now() - state.segmentStartTime) / 1000));
+    const actualDuration = Math.max(0.1, (mediaDuration > 0) ? mediaDuration : ((clock.now() - state.segmentStartTime) / 1000));
 
     state.segmentDurations.set(state.segmentIndex, actualDuration);
-    state.segmentTimestamps.set(state.segmentIndex, new Date());
+    state.segmentTimestamps.set(state.segmentIndex, clock.now());
 
     // Compute inter-track sync spread for session statistics. This measures the timing difference between audio and video tracks at each segment boundary. Only
     // computed when both tracks have known timescales and active timestamp counters.
@@ -810,7 +816,7 @@ export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4Segmente
     resetSegmentTracking();
 
     // Update the playlist.
-    updatePlaylist(streamId, generatePlaylist());
+    updatePlaylist(streamId, generatePlaylist(), clock.now());
   }
 
   /**
@@ -818,7 +824,7 @@ export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4Segmente
    */
   function trackKeyframe(isKeyframe: Nullable<boolean>): void {
 
-    const now = Date.now();
+    const now = clock.now();
 
     if(isKeyframe === true) {
 
@@ -890,7 +896,7 @@ export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4Segmente
           // Output the init segment.
           const initData = Buffer.concat(state.initBoxes);
 
-          storeInitSegment(streamId, initData);
+          storeInitSegment(streamId, initData, clock.now());
 
           state.hasInit = true;
           state.initSegment = initData;
@@ -1039,7 +1045,7 @@ export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4Segmente
           outputSegment();
         } else {
 
-          const elapsedMs = Date.now() - state.segmentStartTime;
+          const elapsedMs = clock.now() - state.segmentStartTime;
           const targetMs = CONFIG.hls.segmentDuration * 1000;
 
           if(elapsedMs >= targetMs) {

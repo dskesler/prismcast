@@ -12,10 +12,10 @@
  * Assertions are made on observable output only - playlists read back from the registry, segment and initialization names and bytes read through the hlsSegments
  * getters, and request counts read from the router. No internal proxy state is inspected.
  */
+import { TestClock, waitUntil } from "homebridge-plugin-utils/testing";
 import { afterEach, describe, test } from "node:test";
 import { getNamedInitSegment, getSegment } from "./../streaming/hlsSegments.ts";
 import { getStream, registerStream, unregisterStream } from "./../streaming/registry.ts";
-import type { Clock } from "../utils/index.ts";
 import type { NativeProxyOptions } from "./proxy.ts";
 import assert from "node:assert/strict";
 import { closePuppeteerStreamWssOnIdle } from "../testing.helpers.ts";
@@ -28,6 +28,9 @@ closePuppeteerStreamWssOnIdle();
 // The URL the harness always polls for the video variant, and the audio variant for the split-track cases.
 const VARIANT_URL = "https://cdn.test/variant.m3u8";
 const AUDIO_VARIANT_URL = "https://cdn.test/audio.m3u8";
+
+// The relay's network window, mirrored from proxy.ts so a row can recognize a poll's bound in the clock's ledger among the cadences parked on the same clock.
+const SEGMENT_FETCH_TIMEOUT = 10000;
 
 /* A recording fetch stub. Routes are matched by longest URL prefix so a test can register both a manifest and the segments beneath it; anything unmatched
  * answers 404 so an unintended request surfaces as a missing segment rather than a silent pass. Every request URL is appended to calls, which is what the
@@ -154,16 +157,31 @@ function installFetchRouter(routes: Record<string, RouteHandler>): FetchRouter {
   };
 }
 
-/* A clock whose sleeps resolve immediately, so poll cycles advance as fast as the microtask queue allows rather than on real timers.
+/* Releases each poll cadence the relay parks on its virtual clock until `reached` settles, so a paced route arrives at the cycle a row is waiting for without
+ * waiting real time. Each release has to wait for the cadence to actually park, because a cycle's fetches and writes settle across several turns of the queue
+ * before the next cadence is registered. The wait is bounded, so a relay that stops parking cadences ends the drive rather than hanging it.
  */
-function makeImmediateClock(): Clock {
+async function pumpCycles(clock: TestClock, reached: Promise<void>): Promise<void> {
 
-  return {
+  // The flag lives on an object rather than in a plain binding because the compiler narrows a `let` whose only assignment is inside a callback, which would make
+  // every read of it below unreachable code as far as the type checker is concerned.
+  const state = { done: false };
+  const finished = reached.finally(() => { state.done = true; });
 
-    now: (): number => 0,
-    sleep: async (): Promise<void> => { /* Resolve immediately so the cadence never waits on a real timer. */ },
-    waitWithTimeout: async <T>(promise: Promise<T>): Promise<T> => promise
-  };
+  for(;;) {
+
+    // eslint-disable-next-line no-await-in-loop -- Each cadence has to park before it can be released, and the cycle it releases has to run before the next one.
+    await waitUntil(() => state.done || (clock.pending > 0), { description: "the relay to park its next poll cadence or reach its target cycle" });
+
+    if(state.done) {
+
+      break;
+    }
+
+    clock.advanceToNext();
+  }
+
+  await finished;
 }
 
 /* A harness holding one registered stream and the proxy relaying into it. runCycles starts the proxy and resolves once the router has terminated the loop at the
@@ -172,6 +190,9 @@ function makeImmediateClock(): Clock {
 interface Harness {
 
   audioPlaylist: () => string;
+
+  // The virtual clock the relay's poll cadence parks on, exposed so a row releases each cycle rather than waiting one out.
+  clock: TestClock;
   initNames: () => { audio: string | null; video: string | null };
   playlist: () => string;
   proxy: ReturnType<typeof createNativeProxy>;
@@ -181,6 +202,7 @@ interface Harness {
 
 function makeHarness(overrides: Partial<NativeProxyOptions> = {}): Harness {
 
+  const clock = new TestClock();
   const entry = makeRegistryEntry();
 
   registerStream(entry);
@@ -189,7 +211,7 @@ function makeHarness(overrides: Partial<NativeProxyOptions> = {}): Harness {
 
     audioVariantUrl: null,
     channelName: "map-test-channel",
-    clock: makeImmediateClock(),
+    clock,
 
     // The container the proxy reports as its pipeline shape. Nothing in this file reads it - the relay follows whatever bodies the router serves - so the harness
     // names the fMP4 sources these initialization tests are about.
@@ -207,6 +229,7 @@ function makeHarness(overrides: Partial<NativeProxyOptions> = {}): Harness {
   return {
 
     audioPlaylist: (): string => getStream(entry.id)?.hls.audioPlaylist ?? "",
+    clock,
     initNames: (): { audio: string | null; video: string | null } => ({
 
       audio: getStream(entry.id)?.hls.currentInitNames.audio ?? null,
@@ -316,7 +339,7 @@ async function runRelay(options: { audioRoutes?: Record<string, RouteHandler>; b
 
   harness.proxy.start();
 
-  await settled;
+  await pumpCycles(harness.clock, settled);
   await drain();
 
   return { cycles: paced.cycles(), harness, router };
@@ -412,6 +435,27 @@ describe("fMP4 relay: MAP parsing, naming, and playlist emission", () => {
     assert.equal((/#EXT-X-MAP/g.exec(playlist) === null) ? 0 : playlist.match(/#EXT-X-MAP/g)?.length, 1, "a single sticky MAP emits exactly one reference");
 
     assert.equal(router.countMatching("init.cmfv"), 1, "the init is fetched once across both cycles");
+  });
+
+  test("arms the manifest poll's bound on the relay's own clock", async () => {
+
+    /* The relay's bounds and its poll cadence share one clock, and that clock keeps a single ledger of every window asked of it. Reading the ledger by value
+     * cannot tell the manifest poll's bound from a segment fetch's, because they ask for the same window, so this row reads it at the one instant when only the
+     * first poll has armed anything: start() calls the manifest poll synchronously and the poll builds its bound before its first await, so nothing else has
+     * reached the clock yet. A poll that built its bound on the platform instead leaves the ledger empty here.
+     */
+    installFetchRouter({ [VARIANT_URL]: (): Response => new Response(fmp4Manifest("https://cdn.test/init.cmfv", 100, ["s100.cmfv"]), { status: 200 }) });
+
+    const harness = makeHarness();
+
+    harness.proxy.start();
+
+    assert.deepEqual(harness.clock.requested, [SEGMENT_FETCH_TIMEOUT], "the first poll's bound is the only window asked of the relay's clock at this instant");
+    assert.equal(harness.clock.pending, 1, "and it is armed on that clock rather than on the platform's");
+
+    harness.proxy.stop();
+
+    await drain();
   });
 
   test("derives MEDIA-SEQUENCE from an .m4s filename rather than yielding NaN (T9)", async () => {
@@ -720,7 +764,7 @@ describe("fMP4 relay: init fetch failure handling", () => {
 
     harness.proxy.start();
 
-    await settled;
+    await pumpCycles(harness.clock, settled);
     await drain();
 
     assert.equal(escalated, true, "a persistently failing init escalates through the tracker");
@@ -794,12 +838,14 @@ describe("fMP4 relay: composite playlists with preroll", () => {
     entry.hls.prerollBaseUrl = "http://host.test";
     entry.hls.prerollCodec = "h264";
     entry.hls.prerollSegmentCount = 3;
-    entry.hls.prerollStartTime = new Date();
+    entry.hls.prerollStartTime = Date.now();
 
     registerStream(entry);
 
     // eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- Standard pattern for signal promises.
     const { promise: settled, resolve: markSettled } = Promise.withResolvers<void>();
+
+    const clock = new TestClock();
 
     let stopProxy: () => void = (): void => { /* Assigned once the proxy exists. */ };
 
@@ -811,7 +857,7 @@ describe("fMP4 relay: composite playlists with preroll", () => {
 
       audioVariantUrl: null,
       channelName: "composite-channel",
-      clock: makeImmediateClock(),
+      clock,
       container: "fmp4",
       encryption: "clear",
       keyUrl: null,
@@ -828,7 +874,7 @@ describe("fMP4 relay: composite playlists with preroll", () => {
 
     proxy.start();
 
-    await settled;
+    await pumpCycles(clock, settled);
     await drain();
 
     const playlist = getStream(entry.id)?.hls.playlist ?? "";
@@ -858,7 +904,7 @@ describe("fMP4 relay: composite playlists with preroll", () => {
     entry.hls.prerollBaseUrl = "http://host.test";
     entry.hls.prerollCodec = "h264";
     entry.hls.prerollSegmentCount = 3;
-    entry.hls.prerollStartTime = new Date();
+    entry.hls.prerollStartTime = Date.now();
 
     registerStream(entry);
 
@@ -873,6 +919,7 @@ describe("fMP4 relay: composite playlists with preroll", () => {
       "#EXTINF:6.000,", "s100.ts", "#EXTINF:6.000,", "s101.ts"
     ]);
 
+    const clock = new TestClock();
     const paced = makePacedManifestRoute(() => tsBody, 2, () => stopProxy(), markSettled);
 
     installFetchRouter({ [VARIANT_URL]: paced.handler, "https://cdn.test/s1": fragmentRoute });
@@ -881,7 +928,7 @@ describe("fMP4 relay: composite playlists with preroll", () => {
 
       audioVariantUrl: null,
       channelName: "composite-ts-channel",
-      clock: makeImmediateClock(),
+      clock,
       container: "ts",
       encryption: "clear",
       keyUrl: null,
@@ -898,7 +945,7 @@ describe("fMP4 relay: composite playlists with preroll", () => {
 
     proxy.start();
 
-    await settled;
+    await pumpCycles(clock, settled);
     await drain();
 
     const playlist = getStream(entry.id)?.hls.playlist ?? "";
@@ -1018,7 +1065,7 @@ describe("fMP4 relay: pruning and lifecycle", () => {
 
       audioVariantUrl: null,
       channelName: "straggler-channel",
-      clock: makeImmediateClock(),
+      clock: new TestClock(),
       container: "fmp4",
       encryption: "clear",
       keyUrl: null,
@@ -1144,7 +1191,7 @@ describe("fMP4 relay: separate audio renditions", () => {
 
     harness.proxy.start();
 
-    await settled;
+    await pumpCycles(harness.clock, settled);
     await drain();
 
     assert.equal(harness.initNames().video, "init-v0.mp4", "the video track names from its own prefix and counter");
@@ -1293,7 +1340,7 @@ describe("segment pipeline: bounded-parallel fetching, in-order commit, and canc
     held[1]!.release();
     held[2]!.release();
 
-    await settled;
+    await pumpCycles(harness.clock, settled);
     await drain();
 
     assert.equal(harness.segmentNames().length, 10, "the whole window committed once the holds lifted");
@@ -1357,7 +1404,7 @@ describe("segment pipeline: bounded-parallel fetching, in-order commit, and canc
 
     harness.proxy.start();
 
-    await secondManifest.requested;
+    await pumpCycles(harness.clock, secondManifest.requested);
     await drain();
 
     assert.deepEqual(harness.segmentNames(), ["segment0.ts"], "the succeeding segment committed and the failing one did not");
@@ -1365,7 +1412,7 @@ describe("segment pipeline: bounded-parallel fetching, in-order commit, and canc
 
     secondManifest.release();
 
-    await settled;
+    await pumpCycles(harness.clock, settled);
     await drain();
 
     assert.equal(harness.proxy.getConsecutiveErrors(), 0, "a later success clears the count");
@@ -1409,7 +1456,7 @@ describe("segment pipeline: bounded-parallel fetching, in-order commit, and canc
 
     harness.proxy.start();
 
-    await settled;
+    await pumpCycles(harness.clock, settled);
     await drain();
 
     assert.equal(escalations, 1, "the error callback fired exactly once");
@@ -1528,7 +1575,7 @@ describe("segment pipeline: bounded-parallel fetching, in-order commit, and canc
 
     harness.proxy.start();
 
-    await heldInitB.requested;
+    await pumpCycles(harness.clock, heldInitB.requested);
     await drain();
 
     assert.deepEqual(harness.segmentNames(), [ "segment0.m4s", "segment1.m4s", "segment2.m4s" ],
@@ -1537,7 +1584,7 @@ describe("segment pipeline: bounded-parallel fetching, in-order commit, and canc
 
     heldInitB.release();
 
-    await settled;
+    await pumpCycles(harness.clock, settled);
     await drain();
 
     assert.equal(router.countMatching("initB.cmfv"), 1, "the transition was attempted exactly once for the cycle");

@@ -8,11 +8,13 @@ import { getStatusSnapshot, getStreamStatus, subscribeToStatus } from "../stream
 import { sendNotFoundError, sendSuccess, sendValidationError } from "./config/http/envelope.ts";
 import { CONFIG } from "../config/index.ts";
 import type { ClientTypeCount } from "../streaming/clients.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import type { StreamHealthStatus } from "../streaming/statusEmitter.ts";
 import { buildSnapshotChannelPatch } from "./config/channels/healthBridge.ts";
 import { emitCurrentSystemStatus } from "../browser/index.ts";
 import { installSseStream } from "./sse.ts";
+import { systemClock } from "homebridge-plugin-utils";
 import { terminateStream } from "../streaming/lifecycle.ts";
 
 /* The streams endpoint provides visibility into active streams and allows operators to terminate streams via the API. This is useful for debugging and for
@@ -22,12 +24,14 @@ import { terminateStream } from "../streaming/lifecycle.ts";
 /**
  * Configures the stream management endpoints: listing, termination, and real-time status.
  * @param app - The Express application.
+ * @param clock - The clock the stream listing reads its instant from and the status stream's heartbeat arms on. The route aggregator omits it and takes the
+ *   system clock.
  */
-export function setupStreamsEndpoint(app: Express): void {
+export function setupStreamsEndpoint(app: Express, clock: Clock = systemClock): void {
 
   app.get("/streams", (_req: Request, res: Response): void => {
 
-    const now = Date.now();
+    const now = clock.now();
 
     const streams: {
       channel: Nullable<string>;
@@ -54,7 +58,7 @@ export function setupStreamsEndpoint(app: Express): void {
         channel: streamInfo.channelName,
         clientCount: status?.clientCount ?? 0,
         clients: status?.clients ?? [],
-        duration: Math.round((now - streamInfo.startTime.getTime()) / 1000),
+        duration: Math.round((now - streamInfo.startTime) / 1000),
         escalationLevel: status?.escalationLevel ?? 0,
         health: status?.health ?? "healthy",
         id: streamInfo.id,
@@ -62,7 +66,7 @@ export function setupStreamsEndpoint(app: Express): void {
         memory: getStreamMemoryUsage(streamInfo),
         recoveryAttempts: status?.recoveryAttempts ?? 0,
         showName: status?.showName ?? "",
-        startTime: streamInfo.startTime.toISOString(),
+        startTime: new Date(streamInfo.startTime).toISOString(),
         url: streamInfo.url
       });
     }
@@ -109,7 +113,7 @@ export function setupStreamsEndpoint(app: Express): void {
 
   app.get("/streams/status", (req: Request, res: Response): void => {
 
-    const sse = installSseStream(res);
+    const sse = installSseStream(res, clock);
 
     // Send the initial snapshot so clients have current state. The wire shape composes the stream/system snapshot owned by statusEmitter with the channel table
     // catch-up patch owned by healthBridge - assembled here at the route layer so neither module needs to know about the other.

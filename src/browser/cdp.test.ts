@@ -11,10 +11,10 @@
  * the report it gets.
  */
 import type { CDPSession, Page } from "puppeteer-core";
+import { TestClock, advanceThroughSchedule, drainClock, settle } from "homebridge-plugin-utils/testing";
 import { WINDOW_RESTORE_CEILING_MS, WINDOW_STATE_POLL_MS, fullscreenWindow, minimizeWindow, readWindowPlacement, readWindowState, reaffirmCaptureSurface,
   unminimizeWindow, withCDPSession } from "./cdp.ts";
 import { describe, test } from "node:test";
-import { makeAdvancingClock, makeFakeClock } from "../utils/clock.helpers.ts";
 import type { LogEntry } from "../utils/logEmitter.ts";
 import type { Nullable } from "../types/index.ts";
 import assert from "node:assert/strict";
@@ -424,12 +424,12 @@ describe("unminimizeWindow", () => {
      * A cadence sleep scheduled ahead of the first read would show up here as a recorded duration.
      */
     const cdpStub = makeCdpStub();
-    const { clock, sleeps } = makeFakeClock();
+    const clock = new TestClock();
 
     await unminimizeWindow(makePageStub({ cdpStub }), clock);
 
     assert.equal(cdpStub.calls.filter((c) => c.method === "Browser.getWindowBounds").length, 1, "exactly one state read for a window already on screen");
-    assert.deepEqual(sleeps, [], "no cadence sleep is paid when the first read already confirms");
+    assert.deepEqual(clock.requested, [], "no cadence sleep is paid when the first read already confirms");
   });
 
   test("polls the window state until Chrome reports normal", async () => {
@@ -438,16 +438,22 @@ describe("unminimizeWindow", () => {
     // asking again on the cadence, and the command is issued once regardless of how many reads the confirmation takes.
     const router = windowStateRouter([ "minimized", "minimized", "normal" ]);
     const cdpStub = makeCdpStub({ overrideSend: router.send });
-    const { clock, sleeps } = makeFakeClock();
+    const clock = new TestClock();
 
-    await unminimizeWindow(makePageStub({ cdpStub }), clock);
+    const running = unminimizeWindow(makePageStub({ cdpStub }), clock);
+
+    await settle();
+    assert.equal(clock.pending, 1, "the first read did not confirm, so its cadence is parked on the clock");
+
+    await advanceThroughSchedule(clock, [ WINDOW_STATE_POLL_MS, WINDOW_STATE_POLL_MS ]);
+    await running;
 
     const methods = cdpStub.calls.map((call) => call.method);
 
     assert.equal(methods.filter((method) => method === "Browser.setWindowBounds").length, 1, "the restore is commanded exactly once");
     assert.equal(router.reads(), 3, "the state is read until it reports normal");
     assert.ok(methods.indexOf("Browser.setWindowBounds") < methods.indexOf("Browser.getWindowBounds"), "the command precedes its confirmation");
-    assert.deepEqual(sleeps, [ WINDOW_STATE_POLL_MS, WINDOW_STATE_POLL_MS ], "one cadence sleep between each pair of reads");
+    assert.deepEqual(clock.requested, [ WINDOW_STATE_POLL_MS, WINDOW_STATE_POLL_MS ], "one cadence sleep between each pair of reads");
   });
 
   test("stops at the ceiling and warns, leaving the window in its reported state", async () => {
@@ -458,13 +464,20 @@ describe("unminimizeWindow", () => {
      */
     const router = windowStateRouter(["minimized"]);
     const cdpStub = makeCdpStub({ overrideSend: router.send });
-    const { clock } = makeAdvancingClock();
+    const clock = new TestClock();
 
     const warnings = await captureWarnings(async () => {
 
-      await unminimizeWindow(makePageStub({ cdpStub }), clock);
+      const running = unminimizeWindow(makePageStub({ cdpStub }), clock);
+
+      await settle();
+      assert.equal(clock.pending, 1, "the first read did not confirm, so its cadence is parked on the clock");
+
+      await drainClock(clock);
+      await running;
     });
 
+    assert.equal(clock.now(), WINDOW_RESTORE_CEILING_MS, "virtual time advanced by exactly the cadences the ceiling afforded");
     assert.equal(router.reads(), Math.floor(WINDOW_RESTORE_CEILING_MS / WINDOW_STATE_POLL_MS) + 1, "the ceiling affords one read plus one per cadence");
     assert.equal(warnings.length, 1, "exactly one warning");
     assert.match(warnings[0]?.message ?? "", /did not report a completed restore within 2000ms/, "the warning names the restore and its bound");
@@ -503,11 +516,20 @@ describe("unminimizeWindow", () => {
       }
     });
 
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
 
     const warnings = await captureWarnings(async () => {
 
-      await assert.doesNotReject(() => unminimizeWindow(makePageStub({ cdpStub }), clock), "a failed state read must not surface into the caller");
+      const running = unminimizeWindow(makePageStub({ cdpStub }), clock);
+
+      // The expectation is attached before the clock is driven, so whatever the second read produces is observed rather than left unhandled.
+      const settled = assert.doesNotReject(() => running, "a failed state read must not surface into the caller");
+
+      await settle();
+      assert.equal(clock.pending, 1, "the first read did not confirm, so its cadence is parked on the clock");
+
+      await drainClock(clock);
+      await settled;
     });
 
     assert.equal(reads, 2, "the poll reached the rejecting read");
@@ -531,7 +553,7 @@ describe("fullscreenWindow", () => {
     // The window is already in a state full screen can be reached from, so the staging restore is skipped and the command goes out on its own.
     const router = windowStateRouter([ "normal", "fullscreen" ]);
     const cdpStub = makeCdpStub({ overrideSend: router.send });
-    const { clock, sleeps } = makeFakeClock();
+    const clock = new TestClock();
 
     assert.equal(await fullscreenWindow(makePageStub({ cdpStub }), clock), true, "a confirmed presentation reports true");
 
@@ -539,7 +561,7 @@ describe("fullscreenWindow", () => {
 
     assert.equal(setBoundsCalls.length, 1, "exactly one setWindowBounds call");
     assert.equal((setBoundsCalls[0]?.params as { bounds?: { windowState?: string } }).bounds?.windowState, "fullscreen", "windowState: fullscreen applied");
-    assert.deepEqual(sleeps, [], "no cadence sleep is paid when the first confirmation read already reports full screen");
+    assert.deepEqual(clock.requested, [], "no cadence sleep is paid when the first confirmation read already reports full screen");
   });
 
   test("stages a minimized window through normal before commanding full screen", async () => {
@@ -549,7 +571,7 @@ describe("fullscreenWindow", () => {
      */
     const router = windowStateRouter([ "minimized", "normal", "fullscreen" ]);
     const cdpStub = makeCdpStub({ overrideSend: router.send });
-    const { clock } = makeFakeClock();
+    const clock = new TestClock();
 
     assert.equal(await fullscreenWindow(makePageStub({ cdpStub }), clock), true, "the staged transition still confirms");
 
@@ -566,13 +588,17 @@ describe("fullscreenWindow", () => {
      */
     const router = windowStateRouter(["normal"]);
     const cdpStub = makeCdpStub({ overrideSend: router.send });
-    const { clock } = makeAdvancingClock();
+    const clock = new TestClock();
 
     let presented: Nullable<boolean> = null;
 
     const warnings = await captureWarnings(async () => {
 
-      presented = await fullscreenWindow(makePageStub({ cdpStub }), clock);
+      const running = fullscreenWindow(makePageStub({ cdpStub }), clock);
+
+      await settle();
+      await drainClock(clock);
+      presented = await running;
     });
 
     assert.equal(presented, false, "an unconfirmed presentation reports false");

@@ -51,6 +51,15 @@ export interface SegmentEmitter extends EventEmitter {
 export type InitSegmentTrack = "audio" | "video";
 
 /**
+ * The HTTP status and user-facing message a failed stream setup answers its clients with.
+ */
+export interface SetupFailureStatus {
+
+  readonly statusCode: number;
+  readonly userMessage: string;
+}
+
+/**
  * HLS segment and playlist storage for a stream. This includes the fMP4 initialization segment (codec configuration), media segments (.m4s files), and the current
  * playlist content. The playlistReady promise allows callers to wait for the first playlist to be generated.
  *
@@ -145,20 +154,26 @@ export interface HLSState {
   // window are preroll entries vs real entries.
   prerollSegmentCount: number;
 
-  // Wall-clock time when the preroll timer fired and the progressive preroll playlist began. Used to compute elapsed time on each playlist poll so the progressive
-  // window advances in real time, simulating a live stream. Null before the preroll timer fires.
-  prerollStartTime: Nullable<Date>;
+  // The epoch millisecond instant the preroll timer fired and the progressive preroll playlist began. Compared against the instant of each playlist poll so the
+  // progressive window advances in real time, simulating a live stream. Null before the preroll timer fires.
+  prerollStartTime: Nullable<number>;
 
   // Timer handle for deferred preroll seeding. The timer fires after PREROLL_DELAY_MS; if real content hasn't arrived yet, preroll is seeded and playlistReady is
   // signaled. Deliberately NOT cancelled in completeStreamSetup() - the timer must survive setup completion for native streams where the proxy's first poll cycle
   // takes 10-15+ seconds. Every path that invalidates preroll state disarms it through cancelPrerollTimer(), the single disarm point.
-  prerollTimer: Nullable<ReturnType<typeof setTimeout>>;
+  prerollTimer: Nullable<Disposable>;
 
   // Resume continuity.
 
   // Snapshotted resume segment index from the prior session. Read once at stream registration and stored here so both the preroll timer callback and the segmenter
   // creation in completeStreamSetup() use the same value - eliminating the TTL race that would occur if each read the resume map independently.
   resumeSegmentIndex: number;
+
+  // Setup failure.
+
+  // The status a failed setup answers with, recorded just before the pending entry is terminated so a playlist request already waiting on this entry can answer
+  // with it. Null for every stream whose setup has not failed.
+  setupFailure: Nullable<SetupFailureStatus>;
 }
 
 /**
@@ -285,8 +300,9 @@ export interface StreamRegistryEntry {
   // that have been registered but whose async setup has not yet completed.
   profile: Nullable<ResolvedSiteProfile>;
 
-  // Set when the stream entry is created; the basis for uptime and duration calculations reported by status and logging.
-  startTime: Date;
+  // The epoch millisecond instant the stream entry was created, and the basis for the uptime and duration the status and the logs report. The ISO form is produced
+  // where the value leaves the process.
+  startTime: number;
 
   // The playback health monitor handle, or null if monitoring hasn't started. Exposes the live recovery metrics (read in the termination prologue) and a
   // self-contained dispose that stops the monitor's polling interval.
@@ -378,6 +394,20 @@ export function hasActiveCaptureStreams(): boolean {
   return getAllStreams().some(isCaptureIdentity);
 }
 
+/**
+ * Reports whether any registered stream has been established on the browser. A stream is established once its entry holds its page, in either mode - a capture
+ * reads that page's compositor output and a native relay keeps its page for re-establishment - and from that moment it depends on the browser the page lives in.
+ * A pending entry holds no page, so a tune that has released its page to wait on a relaunch does not count itself among the reasons that relaunch cannot run.
+ *
+ * It is deliberately narrower than hasActiveCaptureStreams beside it, which counts pending entries on purpose: the window has to be on screen for the whole tune,
+ * whereas the question here is what a browser teardown would destroy.
+ * @returns True when at least one registered stream holds a page.
+ */
+export function hasEstablishedStreams(): boolean {
+
+  return getAllStreams().some((entry) => entry.page !== null);
+}
+
 // Identity.
 
 /**
@@ -437,14 +467,15 @@ export function applyNativeQualityRefresh(entry: StreamRegistryEntry, refreshed:
 /**
  * Updates the last playlist request timestamp for a stream. This should be called whenever a playlist or segment is requested to keep the idle timeout accurate.
  * @param id - The numeric stream ID.
+ * @param now - The instant of the request.
  */
-export function updateLastAccess(id: number): void {
+export function updateLastAccess(id: number, now: number): void {
 
   const entry = streamRegistry.get(id);
 
   if(entry) {
 
-    entry.info.lastPlaylistRequest = Date.now();
+    entry.info.lastPlaylistRequest = now;
   }
 }
 
@@ -488,6 +519,7 @@ export function createHLSState(): HLSState {
     segmentBytes: 0,
     segmentEmitter,
     segments: new Map(),
+    setupFailure: null,
     signalInitSegmentReady,
     signalPlaylistReady,
     videoPlaylist: ""
@@ -505,7 +537,7 @@ export function cancelPrerollTimer(hls: HLSState): void {
 
   if(hls.prerollTimer) {
 
-    clearTimeout(hls.prerollTimer);
+    hls.prerollTimer[Symbol.dispose]();
     hls.prerollTimer = null;
   }
 }

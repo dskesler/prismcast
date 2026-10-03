@@ -413,6 +413,16 @@ describe("validateDomain", () => {
     assert.ok(errors.some((e) => e.includes("dismissSelector must be a non-empty string")));
   });
 
+  test("rejects an empty hideSelector string when the field is supplied", () => {
+
+    /* The validator treats hideSelector with the same asymmetry it applies to dismissSelector: a missing field is fine, an explicit empty string is not. Asserts
+     * it here so the domain-level field keeps the guarantee its sibling has.
+     */
+    const errors = validateDomain("custom-site.example", { hideSelector: "" }, noKnownProfiles);
+
+    assert.ok(errors.some((e) => e.includes("hideSelector must be a non-empty string")));
+  });
+
   test("rejects a non-string dismissSelector (defensive against hand-edited JSON)", () => {
 
     const errors = validateDomain("custom-site.example", { dismissSelector: 42 as unknown as string }, noKnownProfiles);

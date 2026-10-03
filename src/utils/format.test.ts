@@ -1,31 +1,22 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * format.test.ts: Unit tests for the formatting primitives in format.ts. The module's exports are pure functions plus two clock-readers (formatTimestamp,
- * formatTimeAgo). stringifySorted is the SSOT for sorted-key JSON serialization across all persisted and exported files; an unverified change here would alter
- * on-disk file shape without warning, so it earns the heaviest boundary coverage.
+ * format.test.ts: Unit tests for the formatting primitives and the URL readers in format.ts, the latter covering domain and pathname extraction and the
+ * resolution of a relative URL against a base. The module's exports are pure functions plus two clock-readers (formatTimestamp, formatTimeAgo).
+ * stringifySorted is the SSOT for sorted-key JSON serialization across all persisted and exported files; an unverified change here would alter on-disk file
+ * shape without warning, so it earns the heaviest boundary coverage.
  */
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
 import { capitalize, extractDomain, extractPathname, formatDuration, formatResolution, formatResolutionLabel, formatTimeAgo, formatTimestamp,
-  stringifySorted } from "./format.ts";
+  resolveUrl, stringifySorted } from "./format.ts";
+import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-// The reference instant every mocked clock in this file counts from, so a row's expected timestamps read as offsets rather than absolute epochs.
+// The reference instant every row in this file measures from, so a row's expected timestamps read as offsets rather than absolute epochs.
 const BASE_TIME_MS = 1700000000000;
 
 // One hour in milliseconds, the span the duration and interval rows measure against.
 const ONE_HOUR_MS = 3600000;
 
 describe("formatTimestamp", () => {
-
-  beforeEach(() => {
-
-    mock.timers.enable({ apis: ["Date"], now: new Date("2026-03-15T14:09:07.042Z").getTime() });
-  });
-
-  afterEach(() => {
-
-    mock.timers.reset();
-  });
 
   test("formats the current Date as yyyy/mm/dd hh:mm:ss.mmm AM/PM in local time", () => {
 
@@ -45,7 +36,7 @@ describe("formatTimestamp", () => {
     const ss = String(expected.getSeconds()).padStart(2, "0");
     const ms = String(expected.getMilliseconds()).padStart(3, "0");
 
-    assert.equal(formatTimestamp(), yyyy + "/" + mm + "/" + dd + " " + hh + ":" + min + ":" + ss + "." + ms + " " + ampm);
+    assert.equal(formatTimestamp(expected.getTime()), yyyy + "/" + mm + "/" + dd + " " + hh + ":" + min + ":" + ss + "." + ms + " " + ampm);
   });
 
   test("renders midnight (00:00:00) as 12 AM, not 00 AM", () => {
@@ -54,9 +45,7 @@ describe("formatTimestamp", () => {
     // build the date with local-hour-zero constructor args so the test is timezone-independent.
     const midnight = new Date(2026, 2, 15, 0, 0, 0, 0);
 
-    mock.timers.setTime(midnight.getTime());
-
-    assert.match(formatTimestamp(), / 12:00:00\.000 AM$/);
+    assert.match(formatTimestamp(midnight.getTime()), / 12:00:00\.000 AM$/);
   });
 
   test("renders noon (12:00:00) as 12 PM, not 00 PM", () => {
@@ -64,9 +53,7 @@ describe("formatTimestamp", () => {
     // Boundary: hours == 12 stays 12 PM (modulo 12 gives 0, the || keeps 12).
     const noon = new Date(2026, 2, 15, 12, 0, 0, 0);
 
-    mock.timers.setTime(noon.getTime());
-
-    assert.match(formatTimestamp(), / 12:00:00\.000 PM$/);
+    assert.match(formatTimestamp(noon.getTime()), / 12:00:00\.000 PM$/);
   });
 
   test("pads single-digit milliseconds to three places", () => {
@@ -74,9 +61,7 @@ describe("formatTimestamp", () => {
     // Boundary: ms = 5 must become "005" not "5". This is the canonical padStart(3, "0") test.
     const ts = new Date(2026, 2, 15, 9, 0, 0, 5);
 
-    mock.timers.setTime(ts.getTime());
-
-    assert.match(formatTimestamp(), /:00\.005 AM$/);
+    assert.match(formatTimestamp(ts.getTime()), /:00\.005 AM$/);
   });
 });
 
@@ -138,71 +123,61 @@ describe("formatDuration", () => {
 
 describe("formatTimeAgo", () => {
 
-  beforeEach(() => {
-
-    mock.timers.enable({ apis: ["Date"], now: BASE_TIME_MS });
-  });
-
-  afterEach(() => {
-
-    mock.timers.reset();
-  });
-
   test("returns 'just now' for timestamps less than 60 seconds old", () => {
 
-    assert.equal(formatTimeAgo(BASE_TIME_MS - 30000), "just now", "30 seconds ago");
-    assert.equal(formatTimeAgo(BASE_TIME_MS - 59000), "just now", "59 seconds ago (boundary inside)");
-    assert.equal(formatTimeAgo(BASE_TIME_MS), "just now", "0 seconds ago");
+    assert.equal(formatTimeAgo(BASE_TIME_MS - 30000, BASE_TIME_MS), "just now", "30 seconds ago");
+    assert.equal(formatTimeAgo(BASE_TIME_MS - 59000, BASE_TIME_MS), "just now", "59 seconds ago (boundary inside)");
+    assert.equal(formatTimeAgo(BASE_TIME_MS, BASE_TIME_MS), "just now", "0 seconds ago");
   });
 
   test("returns singular 'minute ago' for exactly one minute", () => {
 
-    assert.equal(formatTimeAgo(BASE_TIME_MS - 60000), "1 minute ago", "60 seconds = 1 minute, singular");
+    assert.equal(formatTimeAgo(BASE_TIME_MS - 60000, BASE_TIME_MS), "1 minute ago", "60 seconds = 1 minute, singular");
   });
 
   test("returns plural 'minutes ago' for two or more minutes", () => {
 
-    assert.equal(formatTimeAgo(BASE_TIME_MS - 120000), "2 minutes ago");
-    assert.equal(formatTimeAgo(BASE_TIME_MS - 30 * 60000), "30 minutes ago");
+    assert.equal(formatTimeAgo(BASE_TIME_MS - 120000, BASE_TIME_MS), "2 minutes ago");
+    assert.equal(formatTimeAgo(BASE_TIME_MS - 30 * 60000, BASE_TIME_MS), "30 minutes ago");
   });
 
   test("transitions from minutes to hours at 60 minutes", () => {
 
-    assert.equal(formatTimeAgo(BASE_TIME_MS - 59 * 60000), "59 minutes ago", "59 minutes still in minutes");
-    assert.equal(formatTimeAgo(BASE_TIME_MS - 60 * 60000), "1 hour ago", "60 minutes = 1 hour");
+    assert.equal(formatTimeAgo(BASE_TIME_MS - 59 * 60000, BASE_TIME_MS), "59 minutes ago", "59 minutes still in minutes");
+    assert.equal(formatTimeAgo(BASE_TIME_MS - 60 * 60000, BASE_TIME_MS), "1 hour ago", "60 minutes = 1 hour");
   });
 
   test("returns singular 'hour ago' for exactly one hour", () => {
 
-    assert.equal(formatTimeAgo(BASE_TIME_MS - ONE_HOUR_MS), "1 hour ago");
+    assert.equal(formatTimeAgo(BASE_TIME_MS - ONE_HOUR_MS, BASE_TIME_MS), "1 hour ago");
   });
 
   test("returns plural 'hours ago' for two or more hours", () => {
 
-    assert.equal(formatTimeAgo(BASE_TIME_MS - 3 * ONE_HOUR_MS), "3 hours ago");
+    assert.equal(formatTimeAgo(BASE_TIME_MS - 3 * ONE_HOUR_MS, BASE_TIME_MS), "3 hours ago");
   });
 
   test("transitions from hours to days at 24 hours", () => {
 
-    assert.equal(formatTimeAgo(BASE_TIME_MS - 23 * ONE_HOUR_MS), "23 hours ago", "23 hours still in hours");
-    assert.equal(formatTimeAgo(BASE_TIME_MS - 24 * ONE_HOUR_MS), "1 day ago", "24 hours = 1 day");
+    assert.equal(formatTimeAgo(BASE_TIME_MS - 23 * ONE_HOUR_MS, BASE_TIME_MS), "23 hours ago", "23 hours still in hours");
+    assert.equal(formatTimeAgo(BASE_TIME_MS - 24 * ONE_HOUR_MS, BASE_TIME_MS), "1 day ago", "24 hours = 1 day");
   });
 
   test("returns singular 'day ago' for exactly one day", () => {
 
-    assert.equal(formatTimeAgo(BASE_TIME_MS - 86400000), "1 day ago");
+    assert.equal(formatTimeAgo(BASE_TIME_MS - 86400000, BASE_TIME_MS), "1 day ago");
   });
 
   test("returns plural 'days ago' for multi-day spans", () => {
 
-    assert.equal(formatTimeAgo(BASE_TIME_MS - 7 * 86400000), "7 days ago");
+    assert.equal(formatTimeAgo(BASE_TIME_MS - 7 * 86400000, BASE_TIME_MS), "7 days ago");
   });
 
   test("future timestamps (negative elapsed) round to 'just now'", () => {
 
     // Boundary: clock skew or a future timestamp produces a negative seconds value, which Math.floor rounds toward -Infinity. The first guard `seconds < 60`
     // catches negatives too, so the function gracefully reports "just now" rather than "-N minutes ago".
-    assert.equal(formatTimeAgo(BASE_TIME_MS + 5000), "just now");
+    assert.equal(formatTimeAgo(BASE_TIME_MS + 5000, BASE_TIME_MS), "just now");
   });
 });
 
@@ -316,6 +291,51 @@ describe("extractPathname", () => {
     assert.notEqual(extractPathname("https://cdn.test/path/"), extractPathname("https://cdn.test/path"));
     assert.equal(extractPathname("https://cdn.test/a%20b/seg.ts"), "/a%20b/seg.ts");
     assert.equal(extractPathname("https://cdn.test/Path/Seg.TS"), "/Path/Seg.TS");
+  });
+});
+
+describe("resolveUrl", () => {
+
+  test("returns an http:// URL unchanged (already absolute)", () => {
+
+    // Happy path: the function must short-circuit on already-absolute URLs and return them verbatim.
+    assert.equal(resolveUrl("http://example.test/segment.ts", "https://base.test/manifest.m3u8"), "http://example.test/segment.ts");
+  });
+
+  test("returns an https:// URL unchanged (already absolute)", () => {
+
+    assert.equal(resolveUrl("https://cdn.test/seg.ts", "https://master.test/index.m3u8"), "https://cdn.test/seg.ts");
+  });
+
+  test("resolves a path-relative URL against the base URL", () => {
+
+    // Standard relative-URL resolution per WHATWG URL: the relative segment replaces the base's filename component, preserving the directory.
+    assert.equal(resolveUrl("segment0.ts", "https://cdn.test/path/manifest.m3u8"), "https://cdn.test/path/segment0.ts");
+  });
+
+  test("resolves a root-relative URL against the base host", () => {
+
+    // Boundary: a leading "/" rebases to the host root of the base URL.
+    assert.equal(resolveUrl("/abs/segment.ts", "https://cdn.test/path/manifest.m3u8"), "https://cdn.test/abs/segment.ts");
+  });
+
+  test("resolves a parent-directory traversal in the relative URL", () => {
+
+    // Boundary: ../ segments collapse the base path appropriately.
+    assert.equal(resolveUrl("../other/seg.ts", "https://cdn.test/a/b/manifest.m3u8"), "https://cdn.test/a/other/seg.ts");
+  });
+
+  test("preserves query strings on the relative URL", () => {
+
+    // Query strings carry auth tokens in many HLS providers - the resolver must preserve them through the URL constructor pipeline.
+    assert.equal(resolveUrl("seg.ts?token=abc", "https://cdn.test/path/manifest.m3u8"), "https://cdn.test/path/seg.ts?token=abc");
+  });
+
+  test("treats a protocol-relative URL (//host/path) as absolute via the base scheme", () => {
+
+    // Boundary: //host/path is technically not absolute by our string check (it doesn't start with http:// or https://), so it falls through to the URL
+    // constructor. The constructor inherits the base scheme. Lock the resulting behavior.
+    assert.equal(resolveUrl("//other.test/seg.ts", "https://cdn.test/manifest.m3u8"), "https://other.test/seg.ts");
   });
 });
 

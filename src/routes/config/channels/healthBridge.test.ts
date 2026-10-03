@@ -4,11 +4,12 @@
  * single-source-of-truth rule for channel row presentation - server renders, client applies. These tests assert the routing behavior, the affected-keys
  * resolution, the reach of the domain fan-out across rows the listing hides, the snapshot-time catch-up patch, and the unsubscribe contract.
  */
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
+import { afterEach, beforeEach, describe, test } from "node:test";
 import { buildSnapshotChannelPatch, installHealthBridge, resolveAffectedKeys } from "./healthBridge.ts";
 import { disablePredefinedChannels, enablePredefinedChannels, getChannelListing, initializeUserChannels } from "../../../config/userChannels.ts";
 import { loadHealthState, markChannelFailure, markChannelSuccess, markDomainAuth } from "../../../config/health.ts";
 import { mkdtemp, rm } from "node:fs/promises";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { initializeDataDir } from "../../../config/paths.ts";
 import { mutateEnabledServices } from "../../../config/services.ts";
@@ -28,7 +29,7 @@ describe("resolveAffectedKeys", () => {
 
     // Clear the module-scope channelHealth and domainAuth maps by re-loading from the fresh (empty) data dir. Without this, in-memory state from prior tests
     // bleeds into the snapshot patch and the affected-keys resolution.
-    await loadHealthState();
+    await loadHealthState(new TestClock());
   });
 
   afterEach(async () => {
@@ -80,15 +81,11 @@ describe("installHealthBridge", () => {
 
     // Clear the module-scope channelHealth and domainAuth maps by re-loading from the fresh (empty) data dir. Without this, in-memory state from prior tests
     // bleeds into the snapshot patch and the affected-keys resolution.
-    await loadHealthState();
-
-    // Suppress the 2-second debounced flushHealthState() write timer that markChannelSuccess() schedules, so the test process can exit cleanly.
-    mock.timers.enable({ apis: ["setTimeout"] });
+    await loadHealthState(new TestClock());
   });
 
   afterEach(async () => {
 
-    mock.timers.reset();
     await rm(dir, { force: true, recursive: true });
   });
 
@@ -198,13 +195,11 @@ describe("buildSnapshotChannelPatch", () => {
 
     // Clear the module-scope channelHealth and domainAuth maps by re-loading from the fresh (empty) data dir. Without this, in-memory state from prior tests
     // bleeds into the snapshot patch and the affected-keys resolution.
-    await loadHealthState();
-    mock.timers.enable({ apis: ["setTimeout"] });
+    await loadHealthState(new TestClock());
   });
 
   afterEach(async () => {
 
-    mock.timers.reset();
     await rm(dir, { force: true, recursive: true });
   });
 
@@ -241,12 +236,11 @@ describe("domain fan-out across rows the listing hides", () => {
 
     // Clear the module-scope channelHealth and domainAuth maps by re-loading from the fresh (empty) data dir. Without this, in-memory state from prior tests
     // bleeds into the snapshot patch and the affected-keys resolution.
-    await loadHealthState();
+    await loadHealthState(new TestClock());
   });
 
   afterEach(async () => {
 
-    mock.timers.reset();
     await rm(dir, { force: true, recursive: true });
   });
 
@@ -268,14 +262,11 @@ describe("domain fan-out across rows the listing hides", () => {
 
       assert.ok(affected.includes("abc"), "a disabled channel sharing the domain belongs in the affected set");
 
-      // Suppress the debounced flushHealthState() write timer that markDomainAuth schedules, so nothing writes into the temp directory after it is removed.
-      mock.timers.enable({ apis: ["setTimeout"] });
       markDomainAuth("abc.com");
 
       assert.ok(buildSnapshotChannelPatch().rows.some((row) => row.key === "abc"), "the catch-up snapshot patch carries the disabled channel's row");
     } finally {
 
-      mock.timers.reset();
       await enablePredefinedChannels(["abc"]);
     }
   });
@@ -298,13 +289,11 @@ describe("domain fan-out across rows the listing hides", () => {
 
       assert.ok(affected.includes("msg"), "a service-filtered channel sharing the domain belongs in the affected set");
 
-      mock.timers.enable({ apis: ["setTimeout"] });
       markDomainAuth("directv.com");
 
       assert.ok(buildSnapshotChannelPatch().rows.some((row) => row.key === "msg"), "the catch-up snapshot patch carries the service-filtered channel's row");
     } finally {
 
-      mock.timers.reset();
       await mutateEnabledServices([]);
     }
   });

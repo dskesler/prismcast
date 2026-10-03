@@ -3,12 +3,15 @@
  * monitor.test.ts: Unit tests for the playback health monitor's tick discipline. monitorPlaybackHealth offers no injection point for its recovery actions - they
  * drive a real Chrome through the browser layer - so the coverage here is the part that is drivable without one: how the monitor schedules and bounds its health
  * reads, and what it does with a read that fails or a recovery that finishes after the stream is already gone. The assertions run the real module against a Page double
- * and node:test's mock clock, so what they exercise is the shipped code path, not a re-implementation of it.
+ * and a virtual clock, so what they exercise is the shipped code path, not a re-implementation of it.
  *
  * Two mechanics make that possible and are baked into every assertion below. The clock advances in steps no larger than one monitor interval, because a single large
  * step fires the interval once and silently skips the nested timer firings a real run would see. And microtasks are flushed between a settlement and the next
  * step, because a rejection surfacing through the evaluate wrapper, the tick's catch, and the dispatcher's finally needs one turn per link before the next tick
  * can observe the result.
+ *
+ * The clock each row drives is the one its deps carry. The monitor arms its tick through that clock and reads every grace window, every mark, and every recovery
+ * instant from it, so one advance moves the whole timeline a row is asserting on and no platform timer is involved at all.
  *
  * The recovery-action interiors (tab replacement, source reload, fullscreen reinforcement, segment-health escalation) still need a real browser and a live
  * capture pipeline, and stay with the e2e tier. The pure decision helpers they rest on - checkCircuitBreaker, getIssueCategory, formatIssueType,
@@ -25,6 +28,7 @@ import { LOG } from "../utils/index.ts";
 import type { MonitorDeps } from "./monitor.ts";
 import type { Nullable } from "../types/index.ts";
 import type { StreamStatus } from "./statusEmitter.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { makeProfile } from "../config/profiles.helpers.ts";
@@ -86,11 +90,11 @@ function resolutionReadableState(currentTime: number): Record<string, unknown> {
 }
 
 /**
- * Advances the mock clock, in steps no larger than one monitor interval, flushing microtasks after each step.
- * @param t - The test context owning the mock timers.
+ * Advances the row's clock, in steps no larger than one monitor interval, flushing microtasks after each step.
+ * @param clock - The clock the row's monitor was started on.
  * @param totalMs - How far to advance.
  */
-async function advance(t: TestContext, totalMs: number): Promise<void> {
+async function advance(clock: TestClock, totalMs: number): Promise<void> {
 
   let remaining = totalMs;
 
@@ -98,7 +102,7 @@ async function advance(t: TestContext, totalMs: number): Promise<void> {
 
     const step = Math.min(remaining, MONITOR_INTERVAL);
 
-    t.mock.timers.tick(step);
+    clock.advance(step);
     remaining -= step;
 
     // Sequential by definition: each step must let the work it caused settle before the next step fires.
@@ -111,32 +115,51 @@ async function advance(t: TestContext, totalMs: number): Promise<void> {
 // substituting it is what lets an assertion drive the ladder's availability decision with no browser anywhere in the picture.
 const IMPAIRED: CaptureImpairment = { reason: "Could not start video source", since: 0 };
 
-const IMPAIRED_DEPS: MonitorDeps = {
+/**
+ * Builds the dependency set a marked browser reports through, over the row's own clock.
+ * @param clock - The clock the monitor's tick and every instant it reads run on.
+ * @returns The dependency set.
+ */
+function makeImpairedDeps(clock: TestClock): MonitorDeps {
 
-  getCaptureImpairment: (): Nullable<CaptureImpairment> => IMPAIRED,
-  getEffectiveCaptureCodec: (): CaptureCodec => "h264",
-  isCaptureHardwareAccelerated: (): boolean => false,
-  syncWindowVisibility: async (): Promise<void> => undefined
-};
+  return {
 
-const HEALTHY_DEPS: MonitorDeps = {
+    clock,
+    getCaptureImpairment: (): Nullable<CaptureImpairment> => IMPAIRED,
+    getEffectiveCaptureCodec: (): CaptureCodec => "h264",
+    isCaptureHardwareAccelerated: (): boolean => false,
+    syncWindowVisibility: async (): Promise<void> => undefined
+  };
+}
 
-  getCaptureImpairment: (): Nullable<CaptureImpairment> => null,
-  getEffectiveCaptureCodec: (): CaptureCodec => "h264",
-  isCaptureHardwareAccelerated: (): boolean => false,
-  syncWindowVisibility: async (): Promise<void> => undefined
-};
+/**
+ * Builds the dependency set an unmarked browser reports through, over the row's own clock.
+ * @param clock - The clock the monitor's tick and every instant it reads run on.
+ * @returns The dependency set.
+ */
+function makeHealthyDeps(clock: TestClock): MonitorDeps {
+
+  return {
+
+    clock,
+    getCaptureImpairment: (): Nullable<CaptureImpairment> => null,
+    getEffectiveCaptureCodec: (): CaptureCodec => "h264",
+    isCaptureHardwareAccelerated: (): boolean => false,
+    syncWindowVisibility: async (): Promise<void> => undefined
+  };
+}
 
 /**
  * Starts a monitor against a Page double, with the minimal profile that keeps the tune path shallow: no channel selection, no iframe search, no click-to-play.
  * @param page - The Page double to monitor.
  * @param streamId - The stream id string for log context and abort lookup.
  * @param numericStreamId - The numeric stream id the status and registry lookups use.
+ * @param clock - The clock this row drives. The monitor arms its tick on it and reads every instant from it, so the row's advances are the whole timeline.
  * @param options - The collaborators an assertion substitutes: a tab-replacement handler, a circuit-break stub, and the browser-boundary deps. Each defaults to what the
- *                  monitor sees in the assertions written before they existed - no handler, a no-op break, and the real defaults.
+ *                  monitor sees in the assertions written before they existed - no handler, a no-op break, and the unmarked-browser reads over the row's clock.
  * @returns The monitor handle.
  */
-function startMonitor(page: ReturnType<typeof makeFakePage>["page"], streamId: string, numericStreamId: number, options: {
+function startMonitor(page: ReturnType<typeof makeFakePage>["page"], streamId: string, numericStreamId: number, clock: TestClock, options: {
   deps?: MonitorDeps;
   onCircuitBreak?: () => void;
   onTabReplacement?: () => Promise<Nullable<TabReplacementResult>>;
@@ -147,8 +170,9 @@ function startMonitor(page: ReturnType<typeof makeFakePage>["page"], streamId: s
     channelName: "Monitor Test",
     numericStreamId,
     serviceName: "monitor-test",
-    startTime: new Date()
-  }, options.onCircuitBreak ?? ((): void => { /* The circuit-break callback is not what these assertions exercise. */ }), options.onTabReplacement, options.deps);
+    startTime: clock.now()
+  }, options.onCircuitBreak ?? ((): void => { /* The circuit-break callback is not what these assertions exercise. */ }), options.onTabReplacement,
+  options.deps ?? makeHealthyDeps(clock));
 }
 
 /**
@@ -187,18 +211,18 @@ describe("monitorPlaybackHealth", () => {
     assert.equal(typeof monitorPlaybackHealth, "function", "monitorPlaybackHealth is a function");
   });
 
-  test("runs one health read at a time: interval firings during an outstanding read are skipped", async (t) => {
+  test("runs one health read at a time: interval firings during an outstanding read are skipped", async () => {
 
     /* The incident this assertion exists for: a hung tab left one read outstanding for the full evaluate bound while the interval kept firing, and every firing that
      * landed in that window started another tick body against the same counters. Here the read is never answered, so any firing that dispatched a body would
      * show up as a second evaluate.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
-    const fake = makeFakePage();
-    const handle = startMonitor(fake.page, "serialize-1", 9001);
+    const fake = makeFakePage({ clock });
+    const handle = startMonitor(fake.page, "serialize-1", 9001, clock);
 
-    await advance(t, MONITOR_INTERVAL * 5);
+    await advance(clock, MONITOR_INTERVAL * 5);
 
     assert.equal(fake.evaluations.length, 1, "five interval firings, one health read");
 
@@ -206,20 +230,20 @@ describe("monitorPlaybackHealth", () => {
     fake.evaluations[0]?.resolve(readableState(1));
 
     await flushMicrotasks();
-    await advance(t, MONITOR_INTERVAL);
+    await advance(clock, MONITOR_INTERVAL);
 
     assert.equal(fake.evaluations.length, 2, "the next firing runs once the previous body settled");
 
     handle.dispose();
   });
 
-  test("reads the capture surface once for the monitor's lifetime rather than once per tick", async (t) => {
+  test("reads the capture surface once for the monitor's lifetime rather than once per tick", async () => {
 
     /* The quality preset is restart-gated, so a stream's capture surface cannot change while that stream runs. Re-deriving it on every two-second tick would
      * spend work to reach the same answer forever. The values alone cannot tell a once-per-lifetime read from a once-per-tick one, so the assertion counts reads: a
      * counting accessor stands in front of the configured preset, which is the single property the viewport getter consults.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const configured = CONFIG.streaming.qualityPreset;
     const descriptor = Object.getOwnPropertyDescriptor(CONFIG.streaming, "qualityPreset");
@@ -239,15 +263,15 @@ describe("monitorPlaybackHealth", () => {
 
     try {
 
-      const fake = makeFakePage();
-      const handle = startMonitor(fake.page, "surface-read-1", 9010);
+      const fake = makeFakePage({ clock });
+      const handle = startMonitor(fake.page, "surface-read-1", 9010, clock);
 
       // Four ticks, each answered with a healthy state carrying real intrinsic dimensions, so the resolution comparison runs its full body every time.
       for(let tick = 0; tick < 4; tick++) {
 
         // Sequential by definition: each tick's read must settle before the next firing.
         // eslint-disable-next-line no-await-in-loop
-        await advance(t, MONITOR_INTERVAL);
+        await advance(clock, MONITOR_INTERVAL);
         fake.evaluations[tick]?.resolve(resolutionReadableState(tick + 1));
 
         // eslint-disable-next-line no-await-in-loop
@@ -267,11 +291,11 @@ describe("monitorPlaybackHealth", () => {
     }
   });
 
-  test("emits status on the firings it skips, so subscribers stay current during a long read", async (t) => {
+  test("emits status on the firings it skips, so subscribers stay current during a long read", async () => {
 
     // The skip path is the common case under a hung tab, so it has to keep feeding the status stream that the web UI reads. The stream is registered with the
     // emitter first because the emitter drops updates for streams it has never seen.
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const numericStreamId = 9002;
 
@@ -288,10 +312,10 @@ describe("monitorPlaybackHealth", () => {
       }
     });
 
-    const fake = makeFakePage();
-    const handle = startMonitor(fake.page, "skip-status-1", numericStreamId);
+    const fake = makeFakePage({ clock });
+    const handle = startMonitor(fake.page, "skip-status-1", numericStreamId, clock);
 
-    await advance(t, MONITOR_INTERVAL * 4);
+    await advance(clock, MONITOR_INTERVAL * 4);
 
     assert.equal(fake.evaluations.length, 1, "the read is still outstanding");
     assert.ok(healthEvents >= 3, "the skipped firings emitted status, giving " + String(healthEvents) + " updates");
@@ -301,13 +325,13 @@ describe("monitorPlaybackHealth", () => {
     emitStreamRemoved(numericStreamId);
   });
 
-  test("reports the source's own size beside the surface capture encodes at", async (t) => {
+  test("reports the source's own size beside the surface capture encodes at", async () => {
 
     /* The pair is the point: the surface comes from the configured preset and the source size from the tick's own reading, so an operator can see a 720p source
      * being captured at 1080p. The fixture makes the two values differ - a 1920x1080 reading under the default 720p preset - so a swap or a cross-derivation
      * cannot pass by rendering the same number twice.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const numericStreamId = 9011;
 
@@ -324,10 +348,10 @@ describe("monitorPlaybackHealth", () => {
       }
     });
 
-    const fake = makeFakePage();
-    const handle = startMonitor(fake.page, "resolution-report-1", numericStreamId);
+    const fake = makeFakePage({ clock });
+    const handle = startMonitor(fake.page, "resolution-report-1", numericStreamId, clock);
 
-    await advance(t, MONITOR_INTERVAL);
+    await advance(clock, MONITOR_INTERVAL);
     fake.evaluations[0]?.resolve({ ...readableState(1), videoHeight: 1080, videoWidth: 1920 });
     await flushMicrotasks();
 
@@ -348,17 +372,17 @@ describe("monitorPlaybackHealth", () => {
      * comparison called forty steady readings a degradation and reloaded the page. Measured against the stream's own peak - which this source sets on its first
      * reading and then matches - the same forty readings are full quality.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const messages = captureLogs(t);
-    const fake = makeFakePage();
-    const handle = startMonitor(fake.page, "resolution-steady-1", 9012);
+    const fake = makeFakePage({ clock });
+    const handle = startMonitor(fake.page, "resolution-steady-1", 9012, clock);
 
     for(let tick = 0; tick < 40; tick++) {
 
       // Sequential by definition: each tick's read must settle before the next firing.
       // eslint-disable-next-line no-await-in-loop
-      await advance(t, MONITOR_INTERVAL);
+      await advance(clock, MONITOR_INTERVAL);
       fake.evaluations[tick]?.resolve({ ...readableState(tick + 1), videoHeight: 270, videoWidth: 480 });
 
       // eslint-disable-next-line no-await-in-loop
@@ -377,17 +401,17 @@ describe("monitorPlaybackHealth", () => {
      * that peak by area, the ordinary pacing of an adaptive stream rather than a collapse. Every recovery the detector drives is a capture restart, so a dip of
      * this size has to be tolerated: no degradation warning and no recovery navigation across the same forty ticks that fire for a genuine collapse.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const messages = captureLogs(t);
-    const fake = makeFakePage();
-    const handle = startMonitor(fake.page, "resolution-onerung-1", 9014);
+    const fake = makeFakePage({ clock });
+    const handle = startMonitor(fake.page, "resolution-onerung-1", 9014, clock);
 
     for(let tick = 0; tick < 40; tick++) {
 
       // Sequential by definition: each tick's read must settle before the next firing.
       // eslint-disable-next-line no-await-in-loop
-      await advance(t, MONITOR_INTERVAL);
+      await advance(clock, MONITOR_INTERVAL);
       fake.evaluations[tick]?.resolve((tick < 16) ? { ...readableState(tick + 1), videoHeight: 900, videoWidth: 1600 } :
         { ...readableState(tick + 1), videoHeight: 576, videoWidth: 1024 });
 
@@ -407,11 +431,11 @@ describe("monitorPlaybackHealth", () => {
      * percent of that peak by area. The ladder's first step still fires, one reading count later than the grace window and the count threshold together allow,
      * and it issues exactly one page navigation.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const messages = captureLogs(t);
-    const fake = makeFakePage();
-    const handle = startMonitor(fake.page, "resolution-drop-1", 9013);
+    const fake = makeFakePage({ clock });
+    const handle = startMonitor(fake.page, "resolution-drop-1", 9013, clock);
 
     let warnTick = -1;
 
@@ -419,7 +443,7 @@ describe("monitorPlaybackHealth", () => {
 
       // Sequential by definition: each tick's read must settle before the next firing.
       // eslint-disable-next-line no-await-in-loop
-      await advance(t, MONITOR_INTERVAL);
+      await advance(clock, MONITOR_INTERVAL);
       fake.evaluations[tick]?.resolve((tick < 16) ? resolutionReadableState(tick + 1) : { ...readableState(tick + 1), videoHeight: 270, videoWidth: 480 });
 
       // eslint-disable-next-line no-await-in-loop
@@ -454,45 +478,45 @@ describe("monitorPlaybackHealth", () => {
      * the streak is still open at that point, and a tab that answers evaluates at all answers well inside it. The two assertions bracket the contracted value -
      * a shorter bound would strike before the first assertion, and the full-length default would not have struck by the second.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const messages = captureLogs(t);
-    const fake = makeFakePage();
-    const handle = startMonitor(fake.page, "probe-1", 9003);
+    const fake = makeFakePage({ clock });
+    const handle = startMonitor(fake.page, "probe-1", 9003, clock);
 
-    await advance(t, MONITOR_INTERVAL);
+    await advance(clock, MONITOR_INTERVAL);
 
     assert.equal(fake.evaluations.length, 1, "the first firing issued a read");
 
-    await advance(t, DEFAULT_EVALUATE_TIMEOUT);
+    await advance(clock, DEFAULT_EVALUATE_TIMEOUT);
 
     assert.equal(countMessages(messages, "Monitor check timed out"), 1, "the full-length bound produced the first strike");
 
     // The next firing issues the confirmation probe. Its dispatch time is what the two bracketing advances below are measured from.
-    await advance(t, MONITOR_INTERVAL);
+    await advance(clock, MONITOR_INTERVAL);
 
     assert.equal(fake.evaluations.length, 2, "the streak's next read was issued");
 
     const probeIssuedAt = fake.evaluations[1]?.at ?? 0;
 
-    assert.equal(probeIssuedAt, Date.now(), "the probe was issued at the current clock value");
+    assert.equal(probeIssuedAt, clock.now(), "the probe was issued at the current clock value");
 
-    await advance(t, UNRESPONSIVE_PROBE_TIMEOUT - 100);
+    await advance(clock, UNRESPONSIVE_PROBE_TIMEOUT - 100);
 
     assert.equal(countMessages(messages, "Monitor check timed out"), 1, "the probe has not lapsed a hundred milliseconds short of its bound");
 
-    await advance(t, 200);
+    await advance(clock, 200);
 
     assert.equal(countMessages(messages, "Monitor check timed out"), 2, "the probe lapsed at its bound rather than at the full-length default");
 
     handle.dispose();
   });
 
-  test("routes a page-death read failure into a context re-search within the same tick", async (t) => {
+  test("routes a page-death read failure into a context re-search within the same tick", async () => {
 
     // A destroyed execution context means the video may simply live in a context other than the one the monitor holds, so the tick re-searches instead of
     // treating the failure as a dead player. The follow-up read inside the same tick is the re-search's validation of the context it found.
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const fake = makeFakePage({ onEvaluate: (call, index) => {
 
@@ -502,9 +526,9 @@ describe("monitorPlaybackHealth", () => {
       }
     } });
 
-    const handle = startMonitor(fake.page, "routing-1", 9004);
+    const handle = startMonitor(fake.page, "routing-1", 9004, clock);
 
-    await advance(t, MONITOR_INTERVAL);
+    await advance(clock, MONITOR_INTERVAL);
 
     assert.equal(fake.evaluations.length, 2, "the tick re-searched after the context died");
 
@@ -517,7 +541,7 @@ describe("monitorPlaybackHealth", () => {
      * sends real errors into recovery machinery built for something else. Such a failure belongs to the tick's general error handling instead, which is what
      * the single read and the failure log together show.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const messages = captureLogs(t);
     const fake = makeFakePage({ onEvaluate: (call, index) => {
@@ -528,9 +552,9 @@ describe("monitorPlaybackHealth", () => {
       }
     } });
 
-    const handle = startMonitor(fake.page, "routing-2", 9005);
+    const handle = startMonitor(fake.page, "routing-2", 9005, clock);
 
-    await advance(t, MONITOR_INTERVAL);
+    await advance(clock, MONITOR_INTERVAL);
 
     assert.equal(fake.evaluations.length, 1, "no re-search followed the unrelated failure");
     assert.equal(countMessages(messages, "Monitor check failed"), 1, "the failure went to the tick's general error handling");
@@ -540,7 +564,7 @@ describe("monitorPlaybackHealth", () => {
 
   test("does not route a plain protocol failure into a context re-search", async (t) => {
 
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const messages = captureLogs(t);
     const fake = makeFakePage({ onEvaluate: (call, index) => {
@@ -551,9 +575,9 @@ describe("monitorPlaybackHealth", () => {
       }
     } });
 
-    const handle = startMonitor(fake.page, "routing-3", 9006);
+    const handle = startMonitor(fake.page, "routing-3", 9006, clock);
 
-    await advance(t, MONITOR_INTERVAL);
+    await advance(clock, MONITOR_INTERVAL);
 
     assert.equal(fake.evaluations.length, 1, "no re-search followed the protocol failure");
     assert.equal(countMessages(messages, "Monitor check failed"), 1, "the failure went to the tick's general error handling");
@@ -568,14 +592,14 @@ describe("monitorPlaybackHealth", () => {
      * failure, all of them bookkeeping for a stream that has already ended. The distinguishing observable is the resumption's own log line - the recovery's
      * failure line above it still emits, which is what shows the recovery genuinely resumed rather than never running at all.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const messages = captureLogs(t);
-    const fake = makeFakePage();
-    const handle = startMonitor(fake.page, "stale-1", 9007);
+    const fake = makeFakePage({ clock });
+    const handle = startMonitor(fake.page, "stale-1", 9007, clock);
 
     // First pass down the ladder: no video, and no video element anywhere in the DOM.
-    await advance(t, MONITOR_INTERVAL);
+    await advance(clock, MONITOR_INTERVAL);
     fake.evaluations[0]?.resolve(NO_VIDEO);
     await flushMicrotasks();
 
@@ -585,7 +609,7 @@ describe("monitorPlaybackHealth", () => {
     await flushMicrotasks();
 
     // Second pass: the ladder re-searches the frames before it escalates.
-    await advance(t, MONITOR_INTERVAL);
+    await advance(clock, MONITOR_INTERVAL);
     fake.evaluations[2]?.resolve(NO_VIDEO);
     await flushMicrotasks();
     fake.evaluations[3]?.resolve(NO_PRESENCE);
@@ -597,7 +621,7 @@ describe("monitorPlaybackHealth", () => {
     await flushMicrotasks();
 
     // Third pass: the ladder escalates to page navigation, which the double holds at its first navigation step.
-    await advance(t, MONITOR_INTERVAL);
+    await advance(clock, MONITOR_INTERVAL);
     fake.evaluations[5]?.resolve(NO_VIDEO);
     await flushMicrotasks();
     fake.evaluations[6]?.resolve(NO_PRESENCE);
@@ -620,17 +644,17 @@ describe("monitorPlaybackHealth: tab replacement on a browser that can no longer
 
   /* Drives a tab that has stopped answering evaluates past three timeout strikes. The first strike lapses at the full-length bound; the two that follow lapse at
    * the short confirmation probe, which is the cadence the streak assertion above bracket-proves.
-   * @param t - The test context owning the mock timers.
+   * @param clock - The clock the row's monitor runs on.
    * @param fake - The Page double whose evaluates are left pending.
    */
-  async function driveToThirdTimeout(t: TestContext, fake: ReturnType<typeof makeFakePage>): Promise<void> {
+  async function driveToThirdTimeout(clock: TestClock, fake: ReturnType<typeof makeFakePage>): Promise<void> {
 
-    await advance(t, MONITOR_INTERVAL);
-    await advance(t, DEFAULT_EVALUATE_TIMEOUT);
-    await advance(t, MONITOR_INTERVAL);
-    await advance(t, UNRESPONSIVE_PROBE_TIMEOUT);
-    await advance(t, MONITOR_INTERVAL);
-    await advance(t, UNRESPONSIVE_PROBE_TIMEOUT);
+    await advance(clock, MONITOR_INTERVAL);
+    await advance(clock, DEFAULT_EVALUATE_TIMEOUT);
+    await advance(clock, MONITOR_INTERVAL);
+    await advance(clock, UNRESPONSIVE_PROBE_TIMEOUT);
+    await advance(clock, MONITOR_INTERVAL);
+    await advance(clock, UNRESPONSIVE_PROBE_TIMEOUT);
 
     assert.ok(fake.evaluations.length >= 3, "three reads were issued, one per strike");
   }
@@ -641,17 +665,17 @@ describe("monitorPlaybackHealth: tab replacement on a browser that can no longer
      * leaving it in the registry would hold open the very relaunch that would cure the browser. So the stream terminates: the recovering line is never logged, the
      * handler is never called, the breaker fires once, and the monitor stops issuing reads.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const messages = captureLogs(t);
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
     let replacements = 0;
     let breaks = 0;
 
-    const handle = startMonitor(fake.page, "impaired-unresponsive-1", 9101, {
+    const handle = startMonitor(fake.page, "impaired-unresponsive-1", 9101, clock, {
 
-      deps: IMPAIRED_DEPS,
+      deps: makeImpairedDeps(clock),
       onCircuitBreak: (): void => { breaks++; },
       onTabReplacement: async (): Promise<Nullable<TabReplacementResult>> => {
 
@@ -661,7 +685,7 @@ describe("monitorPlaybackHealth: tab replacement on a browser that can no longer
       }
     });
 
-    await driveToThirdTimeout(t, fake);
+    await driveToThirdTimeout(clock, fake);
 
     const readsAtTermination = fake.evaluations.length;
 
@@ -670,7 +694,7 @@ describe("monitorPlaybackHealth: tab replacement on a browser that can no longer
     assert.equal(countMessages(messages, "Tab unresponsive and tab replacement is unavailable"), 1, "the termination was announced exactly once");
     assert.equal(breaks, 1, "and the breaker fired exactly once");
 
-    await advance(t, MONITOR_INTERVAL * 5);
+    await advance(clock, MONITOR_INTERVAL * 5);
 
     assert.equal(fake.evaluations.length, readsAtTermination, "no further read was issued after the stop");
 
@@ -681,16 +705,16 @@ describe("monitorPlaybackHealth: tab replacement on a browser that can no longer
 
     // The mutation half. The identical drive against an unmarked browser takes the replacement path, which is what makes the assertion above a statement about the mark
     // rather than about the drive.
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const messages = captureLogs(t);
-    const fake = makeFakePage();
+    const fake = makeFakePage({ clock });
 
     let replacements = 0;
 
-    const handle = startMonitor(fake.page, "healthy-unresponsive-1", 9102, {
+    const handle = startMonitor(fake.page, "healthy-unresponsive-1", 9102, clock, {
 
-      deps: HEALTHY_DEPS,
+      deps: makeHealthyDeps(clock),
       onTabReplacement: async (): Promise<Nullable<TabReplacementResult>> => {
 
         replacements++;
@@ -699,7 +723,7 @@ describe("monitorPlaybackHealth: tab replacement on a browser that can no longer
       }
     });
 
-    await driveToThirdTimeout(t, fake);
+    await driveToThirdTimeout(clock, fake);
 
     assert.ok(replacements >= 1, "the replacement handler was called");
     assert.equal(countMessages(messages, "Tab unresponsive - recovering via"), 1, "and the recovery was announced once");
@@ -713,15 +737,17 @@ describe("monitorPlaybackHealth: resolution escalation on a browser that can no 
 
   /* Builds a Page double that answers every read itself: the first sixteen readings at full size to establish the peak, every reading after them at 480x270, which
    * is fourteen percent of that peak by area. Navigations reject, so the ladder's first step completes as a failed reload and the second step becomes reachable.
+   * @param clock - The clock the double stamps its issue times from.
    * @param establishing - How many readings report the peak size before the drop begins.
    * @returns The Page double.
    */
-  function makeDegradingPage(establishing = 16): ReturnType<typeof makeFakePage> {
+  function makeDegradingPage(clock: TestClock, establishing = 16): ReturnType<typeof makeFakePage> {
 
     let reads = 0;
 
     return makeFakePage({
 
+      clock,
       onEvaluate: (call): void => {
 
         const index = reads++;
@@ -735,17 +761,17 @@ describe("monitorPlaybackHealth: resolution escalation on a browser that can no 
 
   /* Runs the monitor until the ladder announces its second step or the tick budget runs out. The budget covers the first step's count threshold, the grace window
    * it arms afterwards, and the second count threshold that follows.
-   * @param t - The test context owning the mock timers.
+   * @param clock - The clock the row's monitor runs on.
    * @param messages - The captured log messages.
    * @returns How many ticks ran.
    */
-  async function runUntilSecondStep(t: TestContext, messages: string[]): Promise<number> {
+  async function runUntilSecondStep(clock: TestClock, messages: string[]): Promise<number> {
 
     for(let tick = 0; tick < 120; tick++) {
 
       // Sequential by definition: each tick's work must settle before the next firing.
       // eslint-disable-next-line no-await-in-loop
-      await advance(t, MONITOR_INTERVAL);
+      await advance(clock, MONITOR_INTERVAL);
 
       // eslint-disable-next-line no-await-in-loop
       await flushMicrotasks();
@@ -764,16 +790,16 @@ describe("monitorPlaybackHealth: resolution escalation on a browser that can no 
     /* The ladder's second step is a tab replacement, so on a marked browser it is unavailable and the ladder skips to acceptance. The first step still runs - the
      * page reload is unaffected by the mark - which is what makes the absence of the second step a decision rather than a stalled drive.
      */
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const messages = captureLogs(t);
-    const fake = makeDegradingPage();
+    const fake = makeDegradingPage(clock);
 
     let replacements = 0;
 
-    const handle = startMonitor(fake.page, "impaired-resolution-1", 9103, {
+    const handle = startMonitor(fake.page, "impaired-resolution-1", 9103, clock, {
 
-      deps: IMPAIRED_DEPS,
+      deps: makeImpairedDeps(clock),
       onTabReplacement: async (): Promise<Nullable<TabReplacementResult>> => {
 
         replacements++;
@@ -782,7 +808,7 @@ describe("monitorPlaybackHealth: resolution escalation on a browser that can no 
       }
     });
 
-    const reached = await runUntilSecondStep(t, messages);
+    const reached = await runUntilSecondStep(clock, messages);
 
     assert.equal(reached, -1, "the ladder never announced its second step");
     assert.equal(countMessages(messages, "Video resolution has been degraded for"), 1, "though its first step ran, so the drive did reach the ladder");
@@ -795,16 +821,16 @@ describe("monitorPlaybackHealth: resolution escalation on a browser that can no 
   test("takes the ladder's tab-replacement step when the browser can still start captures", async (t) => {
 
     // The mutation half: the identical drive against an unmarked browser reaches the second step and calls the handler.
-    t.mock.timers.enable({ apis: [ "setInterval", "setTimeout", "Date" ] });
+    const clock = new TestClock();
 
     const messages = captureLogs(t);
-    const fake = makeDegradingPage();
+    const fake = makeDegradingPage(clock);
 
     let replacements = 0;
 
-    const handle = startMonitor(fake.page, "healthy-resolution-1", 9104, {
+    const handle = startMonitor(fake.page, "healthy-resolution-1", 9104, clock, {
 
-      deps: HEALTHY_DEPS,
+      deps: makeHealthyDeps(clock),
       onTabReplacement: async (): Promise<Nullable<TabReplacementResult>> => {
 
         replacements++;
@@ -813,7 +839,7 @@ describe("monitorPlaybackHealth: resolution escalation on a browser that can no 
       }
     });
 
-    const reached = await runUntilSecondStep(t, messages);
+    const reached = await runUntilSecondStep(clock, messages);
 
     assert.notEqual(reached, -1, "the ladder announced its second step");
     assert.equal(countMessages(messages, "Video resolution is still degraded after"), 1, "exactly once");

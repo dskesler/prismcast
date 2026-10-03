@@ -70,8 +70,9 @@ const resumeMap = new Map<string, ResumeEntry>();
 /**
  * Loads resume state from disk into memory. Called once at startup after config loading. The file is deleted immediately after reading - it only needs to exist
  * between shutdown and the next startup. If the file is missing or corrupt, the map stays empty and all streams start at 0 (today's behavior).
+ * @param now - The instant the TTL is measured against.
  */
-export function loadResumeState(): void {
+export function loadResumeState(now: number): void {
 
   const filePath = getResumeFilePath();
 
@@ -107,7 +108,6 @@ export function loadResumeState(): void {
     return;
   }
 
-  const now = Date.now();
   let loaded = 0;
 
   for(const [ channel, entry ] of Object.entries(parsed)) {
@@ -151,9 +151,10 @@ export function loadResumeState(): void {
  * Returns the saved segment index for a channel without consuming the resume data. Used by registerPendingStream() to offset the preroll playlist's
  * MEDIA-SEQUENCE so it continues from the prior session's sequence range rather than starting at 0. Returns null if no valid resume data exists.
  * @param channelName - The channel key to look up.
+ * @param now - The instant the TTL is measured against.
  * @returns The saved segment index, or null if no valid resume data exists.
  */
-export function getResumeSegmentIndex(channelName: string): Nullable<number> {
+export function getResumeSegmentIndex(channelName: string, now: number): Nullable<number> {
 
   const entry = resumeMap.get(channelName);
 
@@ -162,7 +163,7 @@ export function getResumeSegmentIndex(channelName: string): Nullable<number> {
     return null;
   }
 
-  if((Date.now() - entry.timestamp) > RESUME_TTL) {
+  if((now - entry.timestamp) > RESUME_TTL) {
 
     return null;
   }
@@ -175,9 +176,10 @@ export function getResumeSegmentIndex(channelName: string): Nullable<number> {
  * is available. The caller must call deleteResumeData() after successfully using the data to prevent double-consumption. This two-step pattern ensures resume data
  * survives if segmenter creation fails - the next stream start can retry with the same resume state instead of starting from scratch.
  * @param channelName - The channel key to look up.
+ * @param now - The instant the TTL is measured against.
  * @returns Resume data for seeding the segmenter, or null.
  */
-export function peekResumeData(channelName: string): Nullable<ResumeData> {
+export function peekResumeData(channelName: string, now: number): Nullable<ResumeData> {
 
   const entry = resumeMap.get(channelName);
 
@@ -187,7 +189,7 @@ export function peekResumeData(channelName: string): Nullable<ResumeData> {
   }
 
   // Check TTL in case time has passed since loadResumeState(). Expired entries are cleaned up by deleteResumeData() or the next loadResumeState().
-  if((Date.now() - entry.timestamp) > RESUME_TTL) {
+  if((now - entry.timestamp) > RESUME_TTL) {
 
     resumeMap.delete(channelName);
 
@@ -248,10 +250,10 @@ function serializeEntry(
  * Called during graceful shutdown with data collected from active streams by the shutdown handler. The caller passes pre-collected stream data to avoid circular
  * dependencies with the registry module.
  * @param entries - Stream data collected from active streams at shutdown.
+ * @param now - The instant the TTL is measured against, and the timestamp the active entries are written with.
  */
-export function saveResumeState(entries: ResumeStreamData[]): void {
+export function saveResumeState(entries: ResumeStreamData[], now: number): void {
 
-  const now = Date.now();
   const merged = new Map<string, ResumeEntryJSON>();
 
   // Carry forward unconsumed entries that are still within TTL.

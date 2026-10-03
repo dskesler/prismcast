@@ -1,8 +1,8 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
  * bootSession.context.ts: The default adapter for BootSessionContext. Snapshots host boot time and container instance state at adapter-creation time and serves
- * the frozen values for the lifetime of the context. This file is the only place in the boot-session module that calls Date.now(), reads os.uptime(), touches
- * the filesystem, or queries platform helpers; tests construct BootSessionContext literals inline and bypass this file entirely.
+ * the frozen values for the lifetime of the context. This file is the only place in the boot-session module that calls systemClock.now(), reads os.uptime(),
+ * touches the filesystem, or queries platform helpers; tests construct BootSessionContext literals inline and bypass this file entirely.
  *
  * The snapshot semantics matter. NTP correction or system-clock adjustment mid-process would otherwise let two reads of "host boot minute" disagree by a
  * minute, breaking the guarantee that two calls to getBootSessionId within the same process return equal values. Capturing the math at adapter creation locks
@@ -13,6 +13,7 @@ import type { Nullable } from "../types/index.ts";
 import fs from "node:fs";
 import { isRunningInContainer } from "./platform.ts";
 import os from "node:os";
+import { systemClock } from "homebridge-plugin-utils";
 
 /**
  * Builds the default BootSessionContext from real runtime I/O, snapshotting every reading at construction time so subsequent accessor calls return frozen values.
@@ -26,7 +27,7 @@ export function createDefaultBootSessionContext(): BootSessionContext {
   // /proc/sys/kernel/random/boot_id is a kernel-generated UUID that is regenerated each boot and immune to clock drift; switching this branch to read that file would
   // eliminate the minute-boundary jitter entirely. macOS (sysctl kern.boottime) and Windows (Win32_OS.LastBootUpTime) have equivalent kernel facts but require a
   // subprocess; deferred until a real boundary-jitter incident motivates the work.
-  const hostBootMinuteSnapshot = Math.round((Date.now() - (os.uptime() * 1000)) / 60000);
+  const hostBootMinuteSnapshot = Math.round((systemClock.now() - (os.uptime() * 1000)) / 60000);
 
   // Snapshot the container detection result. The project-wide helper reads PRISMCAST_CONTAINER and /.dockerenv; both are stable for the process lifetime.
   const inContainerSnapshot = isRunningInContainer();

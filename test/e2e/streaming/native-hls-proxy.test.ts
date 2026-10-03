@@ -28,13 +28,12 @@ import { bootStubServer, createIntegrationContext, initializePersistence } from 
 import { createCipheriv, randomBytes } from "node:crypto";
 import { firstOf, nthOf } from "../../../src/testing.helpers.ts";
 import { getStream, registerStream, unregisterStream } from "../../../src/streaming/registry.ts";
-import type { Clock } from "../../../src/utils/clock.ts";
 import type { NativeProxy } from "../../../src/native/proxy.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { createNativeProxy } from "../../../src/native/proxy.ts";
 import { delay } from "../../../src/utils/delay.ts";
 import { deriveIvFromSequence } from "../../../src/native/decrypt.ts";
-import { makeFakeClock } from "../../../src/utils/clock.helpers.ts";
 import { makeRegistryEntry } from "../../../src/streaming/registry.helpers.ts";
 
 /* aes128Encrypt produces an encrypted segment matching the proxy's decryption contract: AES-128-CBC with PKCS7 padding (Node's default), key as a 16-byte
@@ -740,11 +739,11 @@ describe("native HLS proxy - upstream fetch and registry-write contract", () => 
      * upstream stub. A regression that left the polling loop running would surface as continued upstream load on a stream the operator believed was terminated - with
      * bandwidth and rate-limit consequences in production.
      *
-     * Architecture under test. The proxy's polling cadence routes through the Clock port (utils/clock.ts) so the test injects a fake clock whose sleep returns
-     * a controllable promise. The first poll fires immediately on start(); the awaiter created by schedulePoll then awaits clock.sleep(MANIFEST_BACKOFF_BASE)
-     * - in this test, that promise stays pending until the test releases it. The test calls stop(), then releases the held sleep, then drains microtasks. The
-     * awaiter wakes, sees lifecycle.stopped === true, and exits without issuing a second fetch. The guarantee under test: zero upstream requests after stop()
-     * regardless of whether the in-flight sleep ever resolves. The fake-clock injection point proves this negative deterministically, without any wall-clock wait.
+     * Architecture under test. The proxy's polling cadence routes through the library's Clock port, so the test injects a virtual clock and the cadence parks on
+     * it. The first poll fires immediately on start(); the awaiter created by schedulePoll then awaits clock.delay(MANIFEST_BACKOFF_BASE), which stays parked
+     * until the test advances. The test calls stop(), then advances past the parked cadence, then drains microtasks. The awaiter wakes, sees
+     * lifecycle.stopped === true, and exits without issuing a second fetch. The guarantee under test: zero upstream requests after stop() regardless of whether
+     * the in-flight cadence ever resolves. The injected clock proves this negative deterministically, without any wall-clock wait.
      */
     await using ctx = await createIntegrationContext();
 
@@ -773,23 +772,17 @@ describe("native HLS proxy - upstream fetch and registry-write contract", () => 
       app.get("/seg0.ts", (_req, res) => { res.type("video/mp2t").send(randomBytes(128)); });
     });
 
-    // Build a fake clock whose sleep returns a promise the test holds open. The post-first-poll awaiter inside schedulePoll is the only consumer of
-    // clock.sleep here; we capture its resolver so the test can release the sleep deterministically after asserting the rule.
-    const sleepResolvers: (() => void)[] = [];
-    const sleepDurations: number[] = [];
+    /* A virtual clock holds the cadence open on its own: the post-first-poll awaiter inside schedulePoll is the only consumer of clock.delay here, and its wait
+     * parks until the test advances, which is what lets the row release it deterministically after asserting the rule.
+     *
+     * The relay's own network bounds arm on this same clock, and the clock records every window asked of it - delays and callback timers alike - in one ledger.
+     * The cadence assertion at the end therefore reads that ledger by value, setting the relay's fetch window aside, rather than at a fixed position whose
+     * meaning would depend on how many bounds a cycle happened to arm.
+     */
+    const clock = new TestClock();
 
-    const clock: Clock = makeFakeClock({
-
-      sleep: async (ms: number): Promise<void> => {
-
-        sleepDurations.push(ms);
-
-        return new Promise<void>((resolve) => {
-
-          sleepResolvers.push(resolve);
-        });
-      }
-    }).clock;
+    // The relay's network window, mirrored from proxy.ts so the cadence read below can tell a poll's bound apart from the sleep it is asserting.
+    const segmentFetchTimeout = 10000;
 
     const entry = makeRegistryEntry({ channelName: "stub-stop" });
 
@@ -815,21 +808,18 @@ describe("native HLS proxy - upstream fetch and registry-write contract", () => 
     activeProxy = proxy;
     proxy.start();
 
-    // Wait for the first poll to land AND the post-poll awaiter to enter clock.sleep. Both are observable: manifestRequestCount goes to 1 when the first
-    // fetch completes; sleepDurations is populated when the awaiter calls clock.sleep with the next-poll backoff. Combining the two asserts the proxy is
-    // sitting in the exact state we want to test against - one fetch issued, one sleep pending.
-    await waitFor(() => (manifestRequestCount >= 1) && (sleepDurations.length >= 1), 5000, "first manifest poll lands and the next-poll sleep is queued");
+    // Wait for the first poll to land AND the post-poll awaiter to enter clock.delay. Both are observable: manifestRequestCount goes to 1 when the first
+    // fetch completes; the clock carries a pending entry when the awaiter registers the next-poll backoff. Combining the two asserts the proxy is
+    // sitting in the exact state we want to test against - one fetch issued, one cadence parked.
+    await waitFor(() => (manifestRequestCount >= 1) && (clock.pending >= 1), 5000, "first manifest poll lands and the next-poll cadence is parked");
 
     proxy.stop();
 
     const countAtStop = manifestRequestCount;
 
-    // Release every queued sleep resolver. With lifecycle.stopped === true, the post-sleep guard in schedulePoll's awaiter must short-circuit and skip the
-    // next pollManifest call. If the guard regressed, releasing the sleep would issue a second fetch and the assertion below would fail.
-    for(const resolve of sleepResolvers) {
-
-      resolve();
-    }
+    // Advance past the parked cadence. With lifecycle.stopped === true, the post-sleep guard in schedulePoll's awaiter must short-circuit and skip the next
+    // pollManifest call. If the guard regressed, releasing the cadence would issue a second fetch and the assertion below would fail.
+    clock.advanceToNext();
 
     // Drain microtasks so the released awaiter runs to completion. Eight rounds of Promise.resolve() is enough to flush any plausible async chain in the
     // schedulePoll closure.
@@ -841,7 +831,7 @@ describe("native HLS proxy - upstream fetch and registry-write contract", () => 
 
     assert.equal(manifestRequestCount, countAtStop, "no further manifest polls should hit the stub after stop() even when the in-flight sleep resolves");
     assert.equal(proxy.isStopped(), true, "the proxy reports itself as stopped");
-    assert.equal(sleepDurations[0], 3000, "the next-poll sleep used MANIFEST_BACKOFF_BASE on a successful first poll");
+    assert.equal(clock.requested.find((ms) => ms !== segmentFetchTimeout), 3000, "the next-poll sleep used MANIFEST_BACKOFF_BASE on a successful first poll");
   });
 
   test("polls a separate-audio rendition and stores its audio segments as audioN.ts with a master + audio variant playlist", async () => {

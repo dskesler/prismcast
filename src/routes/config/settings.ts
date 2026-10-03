@@ -16,6 +16,7 @@ import { VIDEO_QUALITY_PRESETS } from "../../config/presets.ts";
 import { getConfigFilePath } from "../../config/paths.ts";
 import { getGpuCapabilities } from "../../browser/display.ts";
 import { getProviderModuleInfo } from "../../browser/channelSelection.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* The checkboxList setting type renders a grid of checkboxes backed by a hidden JSON array input. Each checkboxList field specifies a listItemsKey that identifies
  * which item provider to use. The registry maps keys to functions that return the list of items to render. Keeping the registry in the routes layer (not the config
@@ -1247,7 +1248,7 @@ export function setupSettingsRoutes(app: Express): void {
 
     // Close the browser first to avoid orphan Chrome processes. The delay gives the success response above time to
     // reach the client before the process exits.
-    setTimeout(() => {
+    systemClock.schedule(() => {
 
       LOG.info("Exiting for forced service manager restart.");
 

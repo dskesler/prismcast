@@ -17,16 +17,17 @@ import type { Express, Request, Response } from "express";
 import { LOG, sanitizeString } from "../../../../utils/index.ts";
 import { M3U_FIELDS, playlistHintForChange, playlistHintForDelta, playlistHintForStored } from "../http/playlistHint.ts";
 import { channelMatches, computePredefinedDelta, findMatchingVariant } from "../../../../config/channelForm.ts";
-import { clearChannelOverrides, getPredefinedChannel, inferTargetVariant, intersectBindingDeltas, isPredefinedChannel, isUserChannel,
-  mutateChannels, parseTagInput, pickBindingFields, pickIdentityFields, replaceVariantBinding, sortTags, validateChannelKey, validateChannelName,
-  validateChannelNumber, validateChannelProfile, validateChannelUrl } from "../../../../config/userChannels.ts";
+import { clearChannelOverrides, getPredefinedChannel, inferTargetVariant, intersectBindingDeltas, isPredefinedChannel, isUserChannel, mutateChannels,
+  parseTagInput, replaceVariantBinding, sortTags, validateChannelKey, validateChannelName, validateChannelNumber, validateChannelProfile,
+  validateChannelUrl } from "../../../../config/userChannels.ts";
 import { getResolvedChannel, resolveServiceKey } from "../../../../config/services.ts";
+import { pickBindingFields, pickIdentityFields } from "../../../../config/channelIdentity.ts";
 import { sendFormErrors, sendSuccess, sendValidationError } from "../../http/envelope.ts";
 import type { ChannelFormValues } from "../../../../config/channelForm.ts";
 import { PREDEFINED_CHANNELS } from "../../../../channels/index.ts";
 import type { UserChannel } from "../../../../config/userChannels.ts";
 import { buildServiceFilterWarning } from "../http/serviceWarning.ts";
-import { getBuiltinProfile } from "../../../../config/profiles.ts";
+import { getBuiltinProfile } from "../../../../config/sites.ts";
 import { getUserProfiles } from "../../../../config/userProfiles.ts";
 import { route } from "../http/handler.ts";
 import { updateChannelLogo } from "../../../../streaming/showInfo.ts";

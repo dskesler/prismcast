@@ -3,7 +3,7 @@
  * userChannels.ts: User channel file management for PrismCast.
  */
 import { CHANNEL_BINDING_KEYS, CHANNEL_IDENTITY_KEYS, DELTA_ELIGIBLE_BINDING_KEYS, DELTA_ELIGIBLE_IDENTITY_KEYS } from "../types/index.ts";
-import type { Channel, ChannelDelta, ChannelIdentity, ChannelListingEntry, ChannelMap, ChannelSortField, CustomizableField, ResolvedChannel, ResolvedChannelMap,
+import type { Channel, ChannelDelta, ChannelListingEntry, ChannelMap, ChannelSortField, CustomizableField, ResolvedChannel, ResolvedChannelMap,
   SortDirection, StoredChannel, StoredChannelMap } from "../types/index.ts";
 import { FileStoreParseError, createFileStore } from "./persistence.ts";
 import { LOG, containsNonPrintable, extractDomain, sanitizeString } from "../utils/index.ts";
@@ -11,6 +11,7 @@ import type { Migration, ValidationIssue } from "./persistence.ts";
 import { PREDEFINED_CHANNELS, PREDEFINED_TAGS } from "../channels/index.ts";
 import { buildServiceGroups, getAllServiceTags, getResolvedChannel, isChannelAvailableByService, isServiceVariant,
   resolveServiceKey, setEnabledServices, setServiceSelections } from "./services.ts";
+import { pickBindingFields, pickIdentity, pickIdentityFields } from "./channelIdentity.ts";
 import { CONFIG } from "./index.ts";
 import fs from "node:fs";
 import { getChannelsFilePath } from "./paths.ts";
@@ -586,54 +587,6 @@ function buildResolvedCanonicals(stored: StoredChannelMap): ResolvedChannelMap {
 function stripNulls(stored: StoredChannel): StoredChannel {
 
   return Object.fromEntries(Object.entries(stored).filter(([ , v ]) => v !== null));
-}
-
-/* Module-private partition Sets, derived once from the type-system source of truth. The Sets back the public picker functions below; callers never reference
- * the Sets directly. Adding or renaming a field in CHANNEL_IDENTITY_KEYS / CHANNEL_BINDING_KEYS automatically updates both Sets at runtime - the partition
- * lives in types/channels.ts and these are the single derived runtime form.
- */
-const IDENTITY_FIELDS: ReadonlySet<string> = new Set(CHANNEL_IDENTITY_KEYS);
-const BINDING_FIELDS: ReadonlySet<string> = new Set(CHANNEL_BINDING_KEYS);
-
-/**
- * Internal: filters a delta to fields in the supplied allowlist. Backs pickIdentityFields and pickBindingFields. Not exported - the public surface is the
- * named pickers, which hide the partition Sets so consumers never have to know how the partition is enumerated.
- */
-function filterDeltaFields(delta: ChannelDelta, allowlist: ReadonlySet<string>): ChannelDelta {
-
-  const filtered: Record<string, unknown> = {};
-
-  for(const [ field, value ] of Object.entries(delta)) {
-
-    if(allowlist.has(field)) {
-
-      filtered[field] = value;
-    }
-  }
-
-  return filtered;
-}
-
-/**
- * Returns the identity-only subset of a ChannelDelta - the fields enumerated by CHANNEL_IDENTITY_KEYS. Used by the per-field write router (PUT handler) and
- * the storage normalizer's heal path to split a full delta into identity-only and binding-only halves so each half is routed to the correct stored entry.
- * @param delta - The delta to project.
- * @returns A new delta with only identity fields retained.
- */
-export function pickIdentityFields(delta: ChannelDelta): ChannelDelta {
-
-  return filterDeltaFields(delta, IDENTITY_FIELDS);
-}
-
-/**
- * Returns the binding-only subset of a ChannelDelta - the fields enumerated by CHANNEL_BINDING_KEYS. Peer to pickIdentityFields; together they cover the
- * delta surface and partition it cleanly.
- * @param delta - The delta to project.
- * @returns A new delta with only binding fields retained.
- */
-export function pickBindingFields(delta: ChannelDelta): ChannelDelta {
-
-  return filterDeltaFields(delta, BINDING_FIELDS);
 }
 
 /**
@@ -1328,6 +1281,61 @@ export async function runStartupChannelsCleanup(staleSelections: readonly string
   });
 }
 
+/* Service selections persist inside the channels.json envelope, so the writers that change them belong with the store that owns it. Each routes through
+ * mutateChannels, which hydrates the service-group module's selection cache from the data it just wrote. That hydration entry point is the plural
+ * setServiceSelections, which reads at a glance like a bulk writer but is not one - the bulk writer is mutateServiceSelections below.
+ */
+
+/**
+ * Persists a single service selection through the file store. Goes through mutateChannels so the file write, integrity validation, and post-mutate cache
+ * hydration all run uniformly - after the call returns, both disk and the service-selection cache reflect the new value. Selecting the canonical key itself (the
+ * default service) deletes the selection rather than storing a redundant entry.
+ *
+ * For bulk updates, prefer mutateServiceSelections to coalesce multiple changes into a single atomic write.
+ * @param canonicalKey - The canonical channel key.
+ * @param serviceKey - The selected service key. When equal to canonicalKey, the selection is removed.
+ * @throws FileStoreParseError if channels.json contains invalid JSON and the .bak rotation is also unparseable.
+ */
+export async function setServiceSelection(canonicalKey: string, serviceKey: string): Promise<void> {
+
+  await mutateChannels((data) => {
+
+    if(serviceKey === canonicalKey) {
+
+      Reflect.deleteProperty(data.serviceSelections, canonicalKey);
+    } else {
+
+      data.serviceSelections[canonicalKey] = serviceKey;
+    }
+  });
+}
+
+/**
+ * Bulk variant of setServiceSelection. Applies multiple selection changes inside a single mutate transaction so all changes land atomically with one disk
+ * write. Use this whenever a single user action (e.g., browse-modal submit, bulk service assignment) updates more than one selection - serial awaits over
+ * setServiceSelection would produce N writes and N intermediate disk states.
+ *
+ * Each entry follows the same canonical-key-equals-service-key convention as setServiceSelection: when the value matches the key, the selection is removed.
+ * @param updates - Object mapping canonical channel keys to their new service keys.
+ * @throws FileStoreParseError if channels.json contains invalid JSON and the .bak rotation is also unparseable.
+ */
+export async function mutateServiceSelections(updates: Record<string, string>): Promise<void> {
+
+  await mutateChannels((data) => {
+
+    for(const [ canonicalKey, serviceKey ] of Object.entries(updates)) {
+
+      if(serviceKey === canonicalKey) {
+
+        Reflect.deleteProperty(data.serviceSelections, canonicalKey);
+      } else {
+
+        data.serviceSelections[canonicalKey] = serviceKey;
+      }
+    }
+  });
+}
+
 /**
  * Deletes a user channel by key.
  * @param key - The channel key to delete.
@@ -1618,38 +1626,6 @@ const VARIANT_OVERLAY_ALLOWED_FIELDS = new Set<string>(CHANNEL_BINDING_KEYS);
 // so adding or removing a delta-eligible field in one place propagates everywhere. Typed as Set<string> for ergonomics at .has() call sites that take string-keyed
 // values from Object.entries iteration; the contents are statically-known CustomizableField values via the spread below.
 const DELTA_ALLOWED_FIELDS = new Set<string>([ ...DELTA_ELIGIBLE_IDENTITY_KEYS, ...DELTA_ELIGIBLE_BINDING_KEYS ]);
-
-/**
- * Extracts the identity-only subset of a channel. Used by resolveVariant and normalizeChannelDeltas to compute the inheritance base for variants: a variant
- * inherits identity from its canonical but must contribute its own service binding (URL, channelSelector, profile, etc.) - the canonical's binding is for the
- * canonical service and is structurally wrong for any other service.
- *
- * The fields copied are exactly those listed in CHANNEL_IDENTITY_KEYS, the single source of truth for the identity partition. Array-valued fields are shallow-
- * copied so downstream mutation cannot leak back into the source.
- * @param channel - The channel to extract identity from. Typed as ResolvedChannel because that is the shape after canonical resolution; CanonicalChannel is
- *   structurally compatible.
- * @returns A new ChannelIdentity object with just the identity fields populated.
- */
-export function pickIdentity(channel: ResolvedChannel): ChannelIdentity {
-
-  const identity: ChannelIdentity = {};
-
-  for(const field of CHANNEL_IDENTITY_KEYS) {
-
-    const value = channel[field];
-
-    if(value === undefined) {
-
-      continue;
-    }
-
-    (identity as Record<string, unknown>)[field] = value;
-  }
-
-  identity.tags &&= identity.tags.slice();
-
-  return identity;
-}
 
 /**
  * Overlays a stored channel (full definition or delta) onto a base. Allowlisted delta fields in the stored entry override the base: a null value clears the

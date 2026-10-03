@@ -7,6 +7,7 @@
  * globalThis.fetch responses for the master/variant/key URLs, and a minimal page stub.
  */
 import type { AttemptNativeStreamingOptions, RefreshedFeedMetadata } from "./index.ts";
+import { TestClock, waitUntil } from "homebridge-plugin-utils/testing";
 import { afterEach, beforeEach, describe, mock, test } from "node:test";
 import { buildProbeCacheStamp, clearProbeCache } from "./probe.ts";
 import { closePuppeteerStreamWssOnIdle, noop } from "../testing.helpers.ts";
@@ -102,6 +103,13 @@ const feedAppliedPayloads: RefreshedFeedMetadata[] = [];
  * put every test in one slot and make each test's clearProbeCache call address a key nothing reads. The stamp comes from the production builder over the
  * options' own URL, which is the binding an orchestration test has.
  */
+/* The instant every clock in this file is seeded at, the bound the attempt waits its interception out on, and the cadence the relay's healthy poll re-arms at.
+ * All three are private to the modules under test, so a row that crosses one of them restates it here.
+ */
+const BASE_TIME_MS = 1700000000000;
+const INTERCEPTION_AWAIT_TIMEOUT_MS = 5000;
+const MANIFEST_BACKOFF_BASE_MS = 3000;
+
 function makeAttemptOptions(overrides: Partial<AttemptNativeStreamingOptions> = {}): AttemptNativeStreamingOptions {
 
   const channelName = overrides.channelName ?? "test-channel";
@@ -412,48 +420,48 @@ describe("attemptNativeStreaming", () => {
      * the bound has to genuinely bind on a promise the orchestrator does not own, and its null has to reach the "No manifest intercepted" fallback. A bound
      * that failed to bind would leave this call pending forever rather than returning, which is exactly what the assertion below would catch.
      *
-     * We virtualize setTimeout via mock.timers so the 5-second wait is instantaneous in test time. The neverResolving promise simulates a CDP listener that
-     * captured no manifest before the deadline. After advancing past INTERCEPTION_AWAIT_TIMEOUT (5000ms) the bound's timer fires, the wait settles null, and
-     * the function short-circuits to the "No manifest intercepted" log path without waiting on real wall-clock time.
+     * The bound runs on the clock the options carry, so the five-second wait is crossed by an advance rather than waited out. The neverResolving promise
+     * simulates a CDP listener that captured no manifest before the deadline: once virtual time reaches the deadline the bound aborts its signal, the wait
+     * settles null, and the function short-circuits to the "No manifest intercepted" log path.
      */
-    mock.timers.enable({ apis: ["setTimeout"] });
+    const clock = new TestClock(BASE_TIME_MS);
 
-    try {
+    // A promise that intentionally never resolves, so only the bound can settle the wait. We construct it via Promise.withResolvers and discard the
+    // resolvers so nothing can complete the promise from outside; this is the modern equivalent of `new Promise(() => {})` without the empty-executor
+    // lint complaint.
+    const { promise: neverResolving } = Promise.withResolvers<null>();
 
-      // A promise that intentionally never resolves, so only the bound can settle the wait. We construct it via Promise.withResolvers and discard the
-      // resolvers so nothing can complete the promise from outside; this is the modern equivalent of `new Promise(() => {})` without the empty-executor
-      // lint complaint.
-      const { promise: neverResolving } = Promise.withResolvers<null>();
+    const options = makeAttemptOptions({
 
-      const options = makeAttemptOptions({
+      channelName: "timeout-channel",
+      clock,
+      interceptionPromise: neverResolving
+    });
 
-        channelName: "timeout-channel",
-        interceptionPromise: neverResolving
-      });
+    clearProbeCache("timeout-channel");
 
-      clearProbeCache("timeout-channel");
+    const resultPromise = attemptNativeStreaming(options);
 
-      const resultPromise = attemptNativeStreaming(options);
+    /* The bound is composed before the attempt's first await, so it is on the clock the instant the call is issued. A bound left on the system clock registers
+     * nothing here and fails this assertion at once rather than passing the row five real seconds later.
+     */
+    assert.equal(clock.pending, 1, "the interception bound is armed on the injected clock");
+    assert.deepEqual(clock.requested, [INTERCEPTION_AWAIT_TIMEOUT_MS], "and it waits the interception bound's own window");
 
-      // Advance past the 5-second INTERCEPTION_AWAIT_TIMEOUT. The bound's timer fires and aborts its signal, the wait settles null, and the function returns
-      // through the "No manifest intercepted" branch. A small extra tick (1ms) ensures we are past the timer's exact firing boundary regardless of
-      // strict-vs-loose comparison semantics in the runtime's timer wheel.
-      mock.timers.tick(5001);
+    clock.advance(INTERCEPTION_AWAIT_TIMEOUT_MS);
 
-      const result = await resultPromise;
+    const result = await resultPromise;
 
-      assert.equal(result, null, "the lapsed bound returns null and falls back to capture");
-    } finally {
-
-      mock.timers.reset();
-    }
+    assert.equal(result, null, "the lapsed bound returns null and falls back to capture");
+    assert.equal(clock.pending, 0, "and the bound was cancelled rather than left armed");
   });
 
   test("schedules a token refresh when the master URL contains an expiry token", async () => {
 
     // Boundary: when the master URL embeds an exp= token, the orchestrator schedules a refresh timer on the proxy. The minimum-refresh-delay floor of 30s keeps
     // the refresh from firing during the test. We verify by ensuring proxy.stop() is safe to call and cancels the scheduled timer.
-    const expirySeconds = Math.floor(Date.now() / 1000) + 600;
+    const clock = new TestClock(BASE_TIME_MS);
+    const expirySeconds = Math.floor(BASE_TIME_MS / 1000) + 600;
     const masterUrl = "https://cdn.test/exp-master.m3u8?exp=" + String(expirySeconds);
     const variantUrl = "https://cdn.test/exp-variant.m3u8";
 
@@ -466,6 +474,7 @@ describe("attemptNativeStreaming", () => {
     const options = makeAttemptOptions({
 
       channelName: "exp-channel",
+      clock,
       interceptionPromise: Promise.resolve({ manifestUrl: masterUrl, selectedKind: "master" })
     });
 
@@ -481,6 +490,50 @@ describe("attemptNativeStreaming", () => {
 
       result.proxy.stop();
     });
+  });
+
+  test("builds the relay on the chain's clock, so its poll cadence runs on the timeline the attempt was handed", async () => {
+
+    /* The relay is constructed inside the attempt, so nothing outside it can inject its clock: a construction that omitted it would leave the relay's poll
+     * cadence and its store stamps on a clock of their own, beside the one every other deadline in the chain runs on. Starting the relay and reading the
+     * clock's ledger is what shows the two are one - the sleep before the next poll is registered on the clock the options carried.
+     */
+    const clock = new TestClock(BASE_TIME_MS);
+    const masterUrl = "https://cdn.test/relay-master.m3u8";
+    const variantUrl = "https://cdn.test/relay-variant.m3u8";
+
+    makeFetchRouter({
+
+      [masterUrl]: () => new Response("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nrelay-variant.m3u8\n", { status: 200 }),
+      [variantUrl]: () => new Response("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2,\nseg.ts\n#EXTINF:2,\nseg1.ts\n", { status: 200 }),
+      "https://cdn.test/seg": () => new Response(Buffer.alloc(64), { status: 200 })
+    });
+
+    const options = makeAttemptOptions({
+
+      channelName: "relay-channel",
+      clock,
+      interceptionPromise: Promise.resolve({ manifestUrl: masterUrl, selectedKind: "master" })
+    });
+
+    clearProbeCache("relay-channel");
+
+    const result = await attemptNativeStreaming(options);
+
+    assert.ok(result, "the attempt reaches native mode");
+    assert.equal(clock.pending, 0, "the attempt's own bound was cancelled when the interception arrived");
+
+    result.proxy.start();
+
+    /* The poll cycle runs through stubbed fetches that settle on their own turns, so the wait is on the registration landing rather than on a fixed number of
+     * yields. A relay built without the chain's clock registers nothing here and the wait lapses, which is the failure this row exists to produce.
+     */
+    await waitUntil(() => clock.requested.includes(MANIFEST_BACKOFF_BASE_MS),
+      { description: "the relay to register its next poll on the clock the attempt injected", timeoutMs: 5000 });
+
+    assert.equal(clock.pending, 1, "exactly one sleep is outstanding on that clock: the relay's own cadence");
+
+    result.proxy.stop();
   });
 
   test("returns a NativeStreamResult and enters native mode when the AES-128 key is accessible on both the probe and the prefetch", async () => {

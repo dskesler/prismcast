@@ -3,8 +3,8 @@
  * services.test.ts: Unit tests for the predicates, lookups, and label dispatchers in services.ts - PREDEFINED_SUFFIX, getServiceDisplayName, getCanonicalKey,
  * isServiceTagEnabled, isChannelAvailableByService, getAllServiceTags, getAuthDomainForChannel, resolvePredefinedVariant, findPredefinedByDomain,
  * getChannelServiceLabel, isServiceVariant, hasMultipleServices, getEnabledServices defensive copy, plus the in-memory cache mutators (setEnabledServices,
- * setServiceSelections). Service-group construction lives in services.serviceGroups.test.ts; sort-key computation lives in services.sortKeys.test.ts;
- * persistent mutators (mutateEnabledServices, setServiceSelection) are exercised indirectly via the persistence test layer.
+ * setServiceSelections). Service-group construction lives in services.serviceGroups.test.ts; sort-key computation lives in channelSort.test.ts; the
+ * persistent mutator mutateEnabledServices is exercised indirectly via the persistence test layer.
  */
 import { PREDEFINED_SUFFIX, buildServiceGroups, findPredefinedByDomain, getAllServiceTags, getAuthDomainForChannel, getCanonicalKey, getChannelServiceLabel,
   getEnabledServices, getServiceDisplayName, getServiceSelections, getServiceTagForChannel, hasMultipleServices, isChannelAvailableByService, isServiceTagEnabled,

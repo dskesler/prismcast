@@ -326,6 +326,12 @@ export interface DomainConfig {
   // browser/consent.ts's startOverlayHandling. Omit for sites without intermittent modals.
   dismissSelector?: string;
 
+  // CSS selector for site-owned overlay elements to hide for every channel on the domain, whatever profile those channels resolve to. A persistent stylesheet
+  // applies "display: none !important" to the matched elements, so an overlay that renders late in a session is hidden the moment it appears. Use this where the
+  // overlay belongs to the site rather than the player and its close control is unreachable (a cross-origin iframe) or the site re-shows it after a dismissal.
+  // Omit for sites with no such overlay.
+  hideSelector?: string;
+
   // Optional URL to a service logo or icon. When specified, tried first before the domain-derived Apple touch icon and favicon fallbacks in the service filter
   // dropdown, chips, and browse modal. Use for services whose favicon or touch icon is missing, low quality, or doesn't represent the brand well.
   iconUrl?: string;

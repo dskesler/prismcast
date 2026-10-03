@@ -5,10 +5,12 @@
  * Tests bypass this file entirely by constructing UpgradeLifecycleContext literals inline.
  */
 import type { UpgradeLifecycleContext, UpgradeRunResult } from "./lifecycle.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import { SERVICE_NAME } from "../identity.ts";
 import { getDataDir } from "../config/paths.ts";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { systemClock } from "homebridge-plugin-utils";
 
 /**
  * Options the caller uses to shape the context it gets back. The only knob is the command deadline, because that is the one policy the two callers disagree
@@ -16,6 +18,9 @@ import { spawn } from "node:child_process";
  * indefinitely.
  */
 export interface LifecycleContextOptions {
+
+  // The clock the in-process command deadline arms on. Omitted takes the system clock, whose timer is the platform's.
+  readonly clock?: Clock;
 
   // The deadline, in milliseconds, applied to the in-process upgrade command. Omitted runs the command unbounded.
   readonly commandTimeoutMs?: number;
@@ -34,19 +39,20 @@ export interface LifecycleContextOptions {
  * @param cmd - The shell command line to run.
  * @param options.cwd - The working directory for the command, when the install method has one.
  * @param options.timeoutMs - The deadline in milliseconds, or undefined to run unbounded.
+ * @param clock - The clock the deadline arms on.
  * @returns Promise resolving to the run outcome.
  */
-async function runShellCommand(cmd: string, options: { readonly cwd?: string; readonly timeoutMs?: number }): Promise<UpgradeRunResult> {
+async function runShellCommand(cmd: string, options: { readonly cwd?: string; readonly timeoutMs?: number }, clock: Clock): Promise<UpgradeRunResult> {
 
   const { promise, resolve } = Promise.withResolvers<UpgradeRunResult>();
   const child = spawn(cmd, { cwd: options.cwd, shell: true, stdio: "inherit" });
-  const deadline = (options.timeoutMs === undefined) ? undefined : setTimeout(() => { child.kill("SIGTERM"); }, options.timeoutMs);
+  const deadline = (options.timeoutMs === undefined) ? undefined : clock.schedule(() => { child.kill("SIGTERM"); }, options.timeoutMs);
 
   // Both terminal events route through one settle so the deadline timer is always cleared, whichever way the command ends. A second call is harmless: the first
   // resolution wins and the rest are dropped by the promise itself.
   const settle = (success: boolean): void => {
 
-    clearTimeout(deadline);
+    deadline?.[Symbol.dispose]();
     resolve({ success });
   };
 
@@ -78,12 +84,17 @@ async function runShellCommand(cmd: string, options: { readonly cwd?: string; re
  */
 export function createDefaultLifecycleContext(options: LifecycleContextOptions = {}): UpgradeLifecycleContext {
 
+  const clock = options.clock ?? systemClock;
+
   return {
 
     commandTimeoutMs: options.commandTimeoutMs,
     parentPid: process.pid,
     platform: process.platform,
-    runCommand: runShellCommand,
+
+    // The port's runCommand takes the command and its options only, so the clock is closed over here rather than added to a type the strategies would have to
+    // carry through every call.
+    runCommand: async (cmd, commandOptions) => runShellCommand(cmd, commandOptions, clock),
     serviceTaskName: (process.platform === "win32") ? SERVICE_NAME : "",
     spawnDetached: (command: string, args: readonly string[]): void => {
 

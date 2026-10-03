@@ -3,9 +3,10 @@
  * cdp.ts: Chrome DevTools Protocol helpers for PrismCast.
  */
 import type { CDPSession, Page } from "puppeteer-core";
-import { LOG, delay, formatError, pollUntil, realClock } from "../utils/index.ts";
-import type { Clock } from "../utils/index.ts";
+import { LOG, delay, formatError, pollUntil } from "../utils/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* The Chrome DevTools Protocol (CDP) provides low-level access to Chrome's internal state and capabilities. While Puppeteer abstracts most common operations, some
  * features require direct CDP access:
@@ -249,9 +250,9 @@ export async function minimizeWindow(page: Page): Promise<void> {
  * requested against a window still mid-restore is the shape of the 2026-08-26 through 08-28 capture-start failures. A window already on screen confirms on its
  * first read, so the confirmation costs one round trip on the common path.
  * @param page - The Puppeteer page object.
- * @param clock - Clock driving the confirmation cadence and its elapsed measurement. Defaults to realClock; tests inject a fake.
+ * @param clock - Clock driving the confirmation cadence and its elapsed measurement. Defaults to the system clock; tests inject a virtual clock.
  */
-export async function unminimizeWindow(page: Page, clock: Clock = realClock): Promise<void> {
+export async function unminimizeWindow(page: Page, clock: Clock = systemClock): Promise<void> {
 
   // Early exit if the page is already closed.
   if(page.isClosed()) {
@@ -273,7 +274,7 @@ export async function unminimizeWindow(page: Page, clock: Clock = realClock): Pr
     const outcome = await pollUntil({ cadenceMs: WINDOW_STATE_POLL_MS, ceilingMs: WINDOW_RESTORE_CEILING_MS, clock,
       read: (): Promise<Nullable<string>> => readWindowStateWith(session, windowId), until: (state: Nullable<string>): boolean => state === "normal" });
 
-    if(outcome.lapsed) {
+    if(outcome.status === "lapsed") {
 
       /* A lapse is reported and then stepped past. The window's presentation is the caller's precondition, not its permission: blocking capture on a window that
        * will not report itself restored would convert a presentation fault into a stream failure, which is strictly worse than capturing against a window whose
@@ -300,10 +301,10 @@ export async function unminimizeWindow(page: Page, clock: Clock = realClock): Pr
  * The contract matches unminimizeWindow's - a confirmed state, or a warning and whatever state Chrome does report. A lapse leaves the capture running against a
  * window that is merely not presented well, which is worth a warning and not worth failing a stream over.
  * @param page - The Puppeteer page object.
- * @param clock - Clock driving the confirmation cadence and its elapsed measurement. Defaults to realClock; tests inject a fake.
+ * @param clock - Clock driving the confirmation cadence and its elapsed measurement. Defaults to systemClock; tests inject a fake.
  * @returns True when Chrome confirmed the window full screen, false when the confirmation lapsed or the page was gone.
  */
-export async function fullscreenWindow(page: Page, clock: Clock = realClock): Promise<boolean> {
+export async function fullscreenWindow(page: Page, clock: Clock = systemClock): Promise<boolean> {
 
   // Early exit if the page is already closed.
   if(page.isClosed()) {
@@ -332,7 +333,7 @@ export async function fullscreenWindow(page: Page, clock: Clock = realClock): Pr
     const outcome = await pollUntil({ cadenceMs: WINDOW_STATE_POLL_MS, ceilingMs: WINDOW_RESTORE_CEILING_MS, clock,
       read: (): Promise<Nullable<string>> => readWindowStateWith(session, windowId), until: (state: Nullable<string>): boolean => state === "fullscreen" });
 
-    if(outcome.lapsed) {
+    if(outcome.status === "lapsed") {
 
       LOG.warn("The browser window did not report itself full screen within %dms; the capture will include whatever the display shows instead.",
         WINDOW_RESTORE_CEILING_MS, { windowState: outcome.value });

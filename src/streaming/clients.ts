@@ -77,8 +77,9 @@ const clientMaps = new Map<number, Map<string, StreamClient>>();
  * @param streamId - The numeric stream ID.
  * @param clientAddress - The raw client IP address.
  * @param protocol - The protocol ("hls" or "mpegts").
+ * @param now - The instant of the registration.
  */
-export function registerClient(streamId: number, clientAddress: string, protocol: ClientType): void {
+export function registerClient(streamId: number, clientAddress: string, protocol: ClientType, now: number): void {
 
   // Guard against registration after stream termination. If the stream no longer exists in the registry, skip silently to prevent orphaned client entries.
   if(!getStream(streamId)) {
@@ -100,7 +101,7 @@ export function registerClient(streamId: number, clientAddress: string, protocol
   clients.set(key, {
 
     clientAddress: address,
-    lastSeen: Date.now(),
+    lastSeen: now,
     protocol
   });
 }
@@ -141,9 +142,10 @@ export function unregisterClient(streamId: number, clientAddress: string, protoc
  *
  * Called by the monitor every ~2 seconds during status emission.
  * @param streamId - The numeric stream ID.
+ * @param now - The instant the TTL is measured against.
  * @returns The client summary with total count and per-type breakdown.
  */
-export function getClientSummary(streamId: number): ClientSummary {
+export function getClientSummary(streamId: number, now: number): ClientSummary {
 
   const clients = clientMaps.get(streamId);
 
@@ -153,8 +155,6 @@ export function getClientSummary(streamId: number): ClientSummary {
   }
 
   // Expire stale HLS clients.
-  const now = Date.now();
-
   for(const [ key, client ] of clients) {
 
     if((client.protocol === "hls") && ((now - client.lastSeen) > HLS_CLIENT_TTL)) {

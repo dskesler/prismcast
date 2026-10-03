@@ -14,7 +14,7 @@
  *   GET  /cdp/json/list            Alias of /cdp/json (matches the Chrome convention).
  *   WS   /cdp/devtools/browser/X   Browser-level CDP with flat multiplexing.
  *
- * Multiplexing model. Each WS connection owns one browser-level Puppeteer CDPSession (`browserSession`) and a Map<syntheticSessionId, CDPSession> for the
+ * Multiplexing model. Each WS connection owns one browser-level Puppeteer CDPSession (the attachment's session) and a Map<syntheticSessionId, CDPSession> for
  * per-target sub-sessions the client attaches. We synthesize the Target domain locally on top of Puppeteer's Browser/Connection API (intercepting
  * Target.setDiscoverTargets, Target.setAutoAttach, Target.attachToTarget, Target.detachFromTarget, Target.getTargets, Target.getTargetInfo) and pass every other
  * command through to the appropriate session. Events from each session are forwarded to the WS with the corresponding sessionId via an emit-monkey-patch
@@ -30,6 +30,7 @@ import type { Express, Request, Response } from "express";
 import type { Server as HttpServer, IncomingMessage } from "node:http";
 import { LOG, formatError, getPackageVersion, isCategoryEnabled } from "../utils/index.ts";
 import { WebSocket, WebSocketServer } from "ws";
+import type { Nullable } from "../types/index.ts";
 import type { Protocol } from "devtools-protocol";
 import type { Socket } from "node:net";
 import { getBrowserInstance } from "../browser/index.ts";
@@ -43,7 +44,7 @@ import { getBrowserInstance } from "../browser/index.ts";
  * disconnect subscription: the discoverySessions WeakMap is keyed by Browser identity, so rotation invalidates structurally and the old entry GCs with its
  * browser.
  */
-let wss: WebSocketServer | null = null;
+let wss: Nullable<WebSocketServer> = null;
 
 /* Browser-hosted origins permitted to open a CDP debugging socket. Chrome serves its own DevTools frontend from devtools://devtools, which is the origin the
  * frontend reached through chrome://inspect presents. Nothing else belongs here: the devtoolsFrontendUrl the discovery endpoint hands out is a path relative to
@@ -175,17 +176,16 @@ async function sendCdp(session: CDPSession, method: string, params?: unknown): P
   return (session.send as unknown as ErasedCdpSend)(method, params);
 }
 
-/**
- * Looks up the underlying Connection for a CDPSession. Returns null when the session is detached.
- * @param session - The CDP session.
- * @returns The Connection or null.
- */
-function connectionFor(session: CDPSession): Connection | null {
-
-  return session.connection() ?? null;
-}
-
 /* End of wire helpers. */
+
+/* The browser-level CDPSession a proxy connection speaks through and the Connection that minted it, held as one value because neither is usable without the
+ * other: the session carries every browser-level command and event, and the Connection is what mints a session for a target the client attaches to.
+ */
+interface BrowserAttachment {
+
+  readonly connection: Connection;
+  readonly session: CDPSession;
+}
 
 /**
  * Per-WebSocket CDP proxy state. One instance per attached client. Owns the browser-level CDPSession, the per-target sub-session map, and the lifecycle
@@ -194,15 +194,12 @@ function connectionFor(session: CDPSession): Connection | null {
  */
 export class CdpProxySession {
 
-  /* The active CDPSession attached to the browser target. Handles browser-level commands and serves as the routing channel for events the proxy emits when no
-   * sessionId is present.
+  /* The browser attachment, set once in start() at the point both halves exist and released in cleanup(). A command is dispatched only while it is set, which is
+   * what lets every handler take the attachment, or the half it needs, as a non-null parameter. It answers a different question than the `attached` flag below:
+   * this is whether there is something to send to, where `attached` is whether setup completed and was announced...a socket closing late has an attachment and
+   * no announced attach.
    */
-  private browserSession: CDPSession | null = null;
-
-  /* The underlying Puppeteer Connection that owns every CDPSession we create. Captured for the Connection.createSession path which lets us mint a Puppeteer
-   * CDPSession from a CDP TargetInfo (the recommended public API for attaching to an arbitrary target by id).
-   */
-  private connection: Connection | null = null;
+  private attachment: Nullable<BrowserAttachment> = null;
 
   /* Maps synthetic sessionId values (opaque to the client; we hand them out via Target.attachToTarget responses and Target.attachedToTarget events) to the
    * underlying Puppeteer CDPSession for that target. Subsequent client messages with a sessionId route through this map.
@@ -243,7 +240,7 @@ export class CdpProxySession {
    * arrow function at unsubscribe time would silently fail to remove the original listener because EventEmitter compares listener identity. Cleared back to null
    * on unsubscribe so the field's presence is a faithful indicator of "are we still listening."
    */
-  private onBrowserDisconnect: (() => void) | null = null;
+  private onBrowserDisconnect: Nullable<() => void> = null;
 
   private readonly ws: WebSocket;
   private readonly browser: Browser;
@@ -259,7 +256,8 @@ export class CdpProxySession {
    * CDPSession, captures the underlying Connection, and subscribes to CDP target events. Any failure during async setup is caught by the WS close handler
    * (registered first), which fires when `closeWith()` closes the socket and routes cleanup through the same path the happy-path teardown takes. Wiring the
    * lifecycle handlers before any async operation that can fail guarantees the session is torn down (including its disconnect listener) regardless of where
-   * setup aborts. Handler bodies are null-safe so an early message arriving before browserSession is set produces a clean error frame rather than a crash.
+   * setup aborts. The socket is then held paused until setup completes, so no client command is read before the browser session and its target subscriptions
+   * exist.
    */
   async start(): Promise<void> {
 
@@ -272,8 +270,21 @@ export class CdpProxySession {
     this.ws.on("error", (err: Error) => {
 
       LOG.warn("CDP proxy WebSocket error: %s.", err.message);
+
+      /* A send-side error leaves ws half-closing without a resume of its own, so the peer's close frame would wait out ws's close timer before the socket ends.
+       * Resuming lets it end at once.
+       */
+      this.ws.resume();
       void this.cleanup();
     });
+
+    /* Hold the socket paused before the first await so no client command is read until the browser session and its target subscriptions exist. A paused ws socket
+     * emits no message events and its bytes wait in the TCP stream, so resume releases them in arrival order - nothing is lost and nothing is reordered. The
+     * resume lives at the end of setup, after the Target.* subscriptions and the discovery enable, because a client's opening commands include
+     * Target.setDiscoverTargets and depend on that wiring being in place. closeWith() resumes on every failure path, because a paused socket never reads the
+     * peer's close frame and the close event that runs cleanup() would otherwise wait out ws's close timer.
+     */
+    this.ws.pause();
 
     /* Subscribe to the browser's "disconnected" event so this session tears down cleanly when the browser PrismCast launched goes away (crash, rotation, normal
      * shutdown). The handler closes our WS with 1001 ("going away"); the WS close handler above then runs cleanup(), which unsubscribes us. Doing this per-session
@@ -283,9 +294,11 @@ export class CdpProxySession {
     this.onBrowserDisconnect = (): void => { this.closeWith(1001, "browser disconnected"); };
     this.browser.on("disconnected", this.onBrowserDisconnect);
 
+    let session: CDPSession;
+
     try {
 
-      this.browserSession = await this.browser.target().createCDPSession();
+      session = await this.browser.target().createCDPSession();
     } catch(error) {
 
       LOG.warn("CDP proxy could not open a browser session: %s.", formatError(error));
@@ -294,8 +307,12 @@ export class CdpProxySession {
       return;
     }
 
-    const connection = connectionFor(this.browserSession);
+    const connection = session.connection();
 
+    /* The abstract CDPSession type admits a session that reports no connection, and a session created through the browser target always reports one: puppeteer's
+     * CdpCDPSession.connection() returns the connection captured at construction, whatever the session's detach state. So this branch answers the type rather
+     * than a state the proxy meets...the session never entered the attachment, which is why the socket closes and nothing is released.
+     */
     if(!connection) {
 
       this.closeWith(1011, "no CDP connection");
@@ -303,18 +320,19 @@ export class CdpProxySession {
       return;
     }
 
-    this.connection = connection;
+    this.attachment = { connection, session };
 
     /* Subscribe to CDP Target.* lifecycle events on the browser session so we can drive internal session cleanup and auto-attach. This is CDP-native: the
      * targetId on these events matches what Chrome reports through Target.getTargets and is the same id clients send back via Target.attachToTarget. Using
      * Puppeteer's higher-level browser.on("targetcreated") instead would force us to map Puppeteer's opaque Target objects to CDP targetIds, which Puppeteer
-     * doesn't expose. The listeners are registered before we enable discovery so no event slips past during the round-trip.
+     * doesn't expose. The listeners are registered before we enable discovery so no event slips past during the round-trip. The created handler takes the
+     * Connection from this closure, so it mints a sub-session for the new target without reading the field.
      */
-    this.browserSession.on("Target.targetCreated", (event) => { void this.handleCdpTargetCreated(event); });
-    this.browserSession.on("Target.targetDestroyed", (event) => { void this.handleCdpTargetDestroyed(event); });
+    session.on("Target.targetCreated", (event) => { void this.handleCdpTargetCreated(connection, event); });
+    session.on("Target.targetDestroyed", (event) => { void this.handleCdpTargetDestroyed(event); });
 
     // Capture every event the browser session emits and forward it to the client with no sessionId (it's a browser-level event).
-    this.attachEventListener(this.browserSession, null);
+    this.attachEventListener(session, null);
 
     /* Enable target discovery on our browser session so Target.targetCreated / targetDestroyed events fire. This is required for our internal session cleanup
      * regardless of whether the client has called Target.setDiscoverTargets - the wildcard forwarder gates client-facing emission of Target.* events on
@@ -322,18 +340,33 @@ export class CdpProxySession {
      */
     try {
 
-      await sendCdp(this.browserSession, "Target.setDiscoverTargets", { discover: true });
+      await sendCdp(session, "Target.setDiscoverTargets", { discover: true });
     } catch(error) {
 
       LOG.warn("CDP proxy could not enable target discovery: %s.", formatError(error));
     }
 
+    /* The socket can close during any of setup's awaits - a browser disconnect or a peer close - and the close handler's cleanup has already run against a session
+     * that did not exist yet, so the session created since is detached here and the attach is never announced. cleanup() is safe to run again. One guard at the
+     * tail covers every await window, which is why it is not repeated after each of them.
+     */
+    if(this.ws.readyState !== WebSocket.OPEN) {
+
+      await this.cleanup();
+
+      return;
+    }
+
     this.attached = true;
+
+    // Setup is complete, so the buffered client commands flow.
+    this.ws.resume();
     LOG.info("CDP client attached.");
   }
 
   /**
-   * Closes the WS with a code/reason and triggers cleanup. Safe to call when the WS is already closed.
+   * Closes the WS with a code/reason and then resumes the socket so the close handshake can finish, which triggers cleanup. Safe to call when the WS is already
+   * closed.
    * @param code - WebSocket close code (1000 normal, 1001 going-away, 1011 internal-error).
    * @param reason - Human-readable reason.
    */
@@ -350,6 +383,12 @@ export class CdpProxySession {
         // handler registered synchronously at the top of start() - that handler-first ordering guarantees cleanup runs from any failure path.
       }
     }
+
+    /* A socket paused during setup never reads the peer's close frame, so ws's close handshake would wait out its close timer before firing the close event that
+     * runs cleanup(). The resume follows the close rather than preceding it: a resume on a still-open socket would flush the buffered commands into a proxy whose
+     * session may not exist yet, and each would be answered with an error frame instead of its result. Resuming is a no-op on a socket that was never paused.
+     */
+    this.ws.resume();
   }
 
   /**
@@ -358,6 +397,18 @@ export class CdpProxySession {
    * @param data - The raw WebSocket message data.
    */
   private async handleClientMessage(data: unknown): Promise<void> {
+
+    /* A command can be answered only while the socket is open and the attachment exists, and the attachment read here is what hands the handlers below a
+     * non-null value. One close takes both facts away in turn: the socket leaves OPEN the moment closeWith() calls close(), and cleanup() releases the
+     * attachment once its detaches have settled. So a command closeWith() releases from the pause buffer meets a socket that is no longer open, and the close
+     * reason the client receives is its answer...the frame is dropped rather than refused.
+     */
+    const attachment = this.attachment;
+
+    if(!attachment || (this.ws.readyState !== WebSocket.OPEN)) {
+
+      return;
+    }
 
     let raw: string;
 
@@ -395,7 +446,7 @@ export class CdpProxySession {
       await this.handleTargetMessage(msg);
     } else {
 
-      await this.handleBrowserMessage(msg);
+      await this.handleBrowserMessage(msg, attachment);
     }
   }
 
@@ -403,28 +454,29 @@ export class CdpProxySession {
    * Dispatches a browser-level CDP command. Intercepts the Target domain to synthesize its semantics on top of Puppeteer's Browser API; passes everything else
    * through to the browser session.
    * @param msg - The parsed CDP request.
+   * @param attachment - The browser attachment this command is dispatched against.
    */
-  private async handleBrowserMessage(msg: CdpRequest): Promise<void> {
+  private async handleBrowserMessage(msg: CdpRequest, attachment: BrowserAttachment): Promise<void> {
 
     switch(msg.method) {
 
       case "Target.setDiscoverTargets": {
 
-        await this.handleSetDiscoverTargets(msg);
+        await this.handleSetDiscoverTargets(msg, attachment.session);
 
         return;
       }
 
       case "Target.setAutoAttach": {
 
-        await this.handleSetAutoAttach(msg);
+        await this.handleSetAutoAttach(msg, attachment);
 
         return;
       }
 
       case "Target.attachToTarget": {
 
-        await this.handleAttachToTarget(msg);
+        await this.handleAttachToTarget(msg, attachment);
 
         return;
       }
@@ -440,14 +492,14 @@ export class CdpProxySession {
       case "Target.getTargetInfo": {
 
         // These are pure reads. We pass them through to the browser session which returns Chrome's authoritative answer.
-        await this.passthrough(msg, this.browserSession);
+        await this.passthrough(msg, attachment.session);
 
         return;
       }
 
       default: {
 
-        await this.passthrough(msg, this.browserSession);
+        await this.passthrough(msg, attachment.session);
 
         return;
       }
@@ -486,14 +538,7 @@ export class CdpProxySession {
    * @param msg - The parsed CDP request.
    * @param session - The CDP session to forward to.
    */
-  private async passthrough(msg: CdpRequest, session: CDPSession | null): Promise<void> {
-
-    if(!session) {
-
-      this.sendResponse({ error: { code: -32603, message: "no session" }, id: msg.id, sessionId: msg.sessionId });
-
-      return;
-    }
+  private async passthrough(msg: CdpRequest, session: CDPSession): Promise<void> {
 
     try {
 
@@ -510,15 +555,16 @@ export class CdpProxySession {
    * Handles Target.setDiscoverTargets. When enabled, emits Target.targetCreated for every existing target so the client's view of the world matches Chrome's;
    * Target.targetCreated / Target.targetDestroyed events thereafter flow via the browser session's CDP Target.* event subscriptions.
    * @param msg - The parsed CDP request.
+   * @param session - The browser-level session the target enumeration runs on.
    */
-  private async handleSetDiscoverTargets(msg: CdpRequest): Promise<void> {
+  private async handleSetDiscoverTargets(msg: CdpRequest, session: CDPSession): Promise<void> {
 
     const params = (msg.params ?? {}) as { discover?: boolean };
 
     this.discoverTargets = params.discover === true;
     this.sendResponse({ id: msg.id, result: {} });
 
-    if(!this.discoverTargets || !this.browserSession) {
+    if(!this.discoverTargets) {
 
       return;
     }
@@ -526,7 +572,7 @@ export class CdpProxySession {
     // Emit Target.targetCreated for every existing target so the client has the full picture as of attach time.
     try {
 
-      const info = await sendCdp(this.browserSession, "Target.getTargets", {}) as Protocol.Target.GetTargetsResponse;
+      const info = await sendCdp(session, "Target.getTargets", {}) as Protocol.Target.GetTargetsResponse;
 
       for(const targetInfo of info.targetInfos) {
 
@@ -542,8 +588,9 @@ export class CdpProxySession {
    * Handles Target.setAutoAttach. When enabled, creates a per-target CDPSession for every existing target, generates a synthetic sessionId, and emits
    * Target.attachedToTarget for each. Subsequent new targets attach via the targetcreated lifecycle hook.
    * @param msg - The parsed CDP request.
+   * @param attachment - The browser attachment the target enumeration and each attach run on.
    */
-  private async handleSetAutoAttach(msg: CdpRequest): Promise<void> {
+  private async handleSetAutoAttach(msg: CdpRequest, attachment: BrowserAttachment): Promise<void> {
 
     const params = (msg.params ?? {}) as { autoAttach?: boolean; flatten?: boolean };
 
@@ -552,21 +599,21 @@ export class CdpProxySession {
     this.autoAttach = (params.autoAttach === true) && (params.flatten !== false);
     this.sendResponse({ id: msg.id, result: {} });
 
-    if(!this.autoAttach || !this.browserSession) {
+    if(!this.autoAttach) {
 
       return;
     }
 
     try {
 
-      const info = await sendCdp(this.browserSession, "Target.getTargets", {}) as Protocol.Target.GetTargetsResponse;
+      const info = await sendCdp(attachment.session, "Target.getTargets", {}) as Protocol.Target.GetTargetsResponse;
 
       // Sequential attach (not Promise.all) so synthetic sessionIds are assigned and emitted in target order. Parallelism would interleave the
       // Target.attachedToTarget events and complicate any client that asserts on the attachment sequence.
       for(const targetInfo of info.targetInfos) {
 
         // eslint-disable-next-line no-await-in-loop
-        await this.attachToTargetInfo(targetInfo);
+        await this.attachToTargetInfo(attachment.connection, targetInfo);
       }
     } catch(error) {
 
@@ -578,8 +625,9 @@ export class CdpProxySession {
    * Handles Target.attachToTarget. Looks up the target's info via the browser session, creates a Puppeteer CDPSession via Connection.createSession (the public
    * API for attaching to a target by id), generates a synthetic sessionId, and returns it. The client uses that sessionId for subsequent messages.
    * @param msg - The parsed CDP request.
+   * @param attachment - The browser attachment the target lookup and the attach run on.
    */
-  private async handleAttachToTarget(msg: CdpRequest): Promise<void> {
+  private async handleAttachToTarget(msg: CdpRequest, attachment: BrowserAttachment): Promise<void> {
 
     const params = (msg.params ?? {}) as { flatten?: boolean; targetId?: string };
 
@@ -590,17 +638,10 @@ export class CdpProxySession {
       return;
     }
 
-    if(!this.browserSession || !this.connection) {
-
-      this.sendResponse({ error: { code: -32603, message: "browser session not ready" }, id: msg.id });
-
-      return;
-    }
-
     try {
 
-      const info = await sendCdp(this.browserSession, "Target.getTargetInfo", { targetId: params.targetId }) as Protocol.Target.GetTargetInfoResponse;
-      const sessionId = await this.attachToTargetInfo(info.targetInfo, { emitEvent: false });
+      const info = await sendCdp(attachment.session, "Target.getTargetInfo", { targetId: params.targetId }) as Protocol.Target.GetTargetInfoResponse;
+      const sessionId = await this.attachToTargetInfo(attachment.connection, info.targetInfo, { emitEvent: false });
 
       this.sendResponse({ id: msg.id, result: { sessionId } });
     } catch(error) {
@@ -613,19 +654,15 @@ export class CdpProxySession {
    * Attaches to a target given its TargetInfo: creates a Puppeteer CDPSession via Connection.createSession, generates a synthetic sessionId, wires event
    * forwarding, and optionally emits Target.attachedToTarget for the client. Returns the sessionId so callers (manual attach via Target.attachToTarget) can
    * include it in their response.
+   * @param connection - The Puppeteer Connection that mints the session.
    * @param targetInfo - The CDP TargetInfo identifying the target.
    * @param options - emitEvent: whether to emit Target.attachedToTarget after attach (defaults to true; manual attach sets false and returns the sessionId via
    *                  the original response).
    * @returns The synthetic sessionId for the newly-attached session.
    */
-  private async attachToTargetInfo(targetInfo: Protocol.Target.TargetInfo, options: { emitEvent?: boolean } = {}): Promise<string> {
+  private async attachToTargetInfo(connection: Connection, targetInfo: Protocol.Target.TargetInfo, options: { emitEvent?: boolean } = {}): Promise<string> {
 
-    if(!this.connection) {
-
-      throw new Error("connection unavailable");
-    }
-
-    const session = await this.connection.createSession(targetInfo);
+    const session = await connection.createSession(targetInfo);
     const sessionId = "cdp-proxy-" + String(this.nextSessionSerial++);
 
     this.sessions.set(sessionId, session);
@@ -699,9 +736,10 @@ export class CdpProxySession {
    * Handles the CDP `Target.targetCreated` event emitted by the browser session. When autoAttach is on, mints a Puppeteer CDPSession for the new target and emits
    * a synthetic Target.attachedToTarget to the client. Whether the client also sees the Target.targetCreated event is decided by the wildcard forwarder (which
    * gates Target.* events on this.discoverTargets).
+   * @param connection - The Puppeteer Connection that mints the sub-session for the new target.
    * @param event - The CDP event payload.
    */
-  private async handleCdpTargetCreated(event: Protocol.Target.TargetCreatedEvent): Promise<void> {
+  private async handleCdpTargetCreated(connection: Connection, event: Protocol.Target.TargetCreatedEvent): Promise<void> {
 
     if(!this.autoAttach) {
 
@@ -710,7 +748,7 @@ export class CdpProxySession {
 
     try {
 
-      await this.attachToTargetInfo(event.targetInfo);
+      await this.attachToTargetInfo(connection, event.targetInfo);
     } catch(error) {
 
       LOG.warn("CDP proxy auto-attach failed: %s.", formatError(error));
@@ -757,7 +795,7 @@ export class CdpProxySession {
    * @param session - The CDP session to monitor.
    * @param sessionId - The synthetic sessionId to include in the forwarded events (null for browser-level events).
    */
-  private attachEventListener(session: CDPSession, sessionId: string | null): void {
+  private attachEventListener(session: CDPSession, sessionId: Nullable<string>): void {
 
     const original = session.emit.bind(session) as (event: string | symbol, ...args: unknown[]) => boolean;
 
@@ -868,19 +906,21 @@ export class CdpProxySession {
       await this.detachSessionById(sessionId);
     }
 
-    if(this.browserSession) {
+    const attachment = this.attachment;
 
-      this.detachEventListener(this.browserSession);
+    if(attachment) {
+
+      this.detachEventListener(attachment.session);
 
       try {
 
-        await this.browserSession.detach();
+        await attachment.session.detach();
       } catch {
 
         // Best-effort.
       }
 
-      this.browserSession = null;
+      this.attachment = null;
     }
 
     if(this.attached) {

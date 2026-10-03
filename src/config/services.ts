@@ -2,15 +2,15 @@
  *
  * services.ts: Service group management for multi-service channels.
  */
-import type { Channel, ChannelMap, ChannelSortField, ResolvedChannel, ServiceGroup, SortDirection } from "../types/index.ts";
-import { DOMAIN_CONFIG, getDomainConfig } from "./sites.ts";
+import type { Channel, ChannelMap, ResolvedChannel, ServiceGroup } from "../types/index.ts";
 import { LOG, extractDomain } from "../utils/index.ts";
-import { getChannelEffectiveTags, getEffectiveHdhrEnabled, mutateChannels, pickIdentity } from "./userChannels.ts";
 import { CONFIG } from "./index.ts";
+import { DOMAIN_CONFIG } from "./sites.ts";
 import { PREDEFINED_CHANNELS } from "../channels/index.ts";
-import { getProfileForChannel } from "./profiles.ts";
+import { getDomainConfig } from "./profiles.ts";
 import { getUserDomains } from "./userProfiles.ts";
 import { mutateConfig } from "./userConfig.ts";
+import { pickIdentity } from "./channelIdentity.ts";
 
 /* Service groups allow multiple streaming services to offer the same content. For example, ESPN can be watched via ESPN.com (native) or Disney+.
  *
@@ -698,139 +698,6 @@ export function getChannelServiceLabel(channel: ResolvedChannel): string {
   return getServiceDisplayName(channel.url);
 }
 
-// Valid sort field values for the channels table. Exported as the single source of truth for sort field validation, shared by the config POST handler and the
-// playlist endpoint's query parameter validation.
-export const VALID_SORT_FIELDS = new Set<ChannelSortField>(
-  [ "channelNumber", "channelSelector", "hdhrEnabled", "key", "name", "profile", "service", "stationId", "tags" ]
-);
-
-/**
- * Extracts a sortable string value from a channel for the specified sort field. Channel numbers are zero-padded to 6 digits for correct numeric ordering within a
- * string comparison. Service values use the display label for human-meaningful sort order. This is the single source of truth for channel sort key extraction,
- * shared by both the server-side table renderer and the M3U playlist generator.
- * @param channel - Fallback channel definition, used only when the selected service variant cannot be resolved (e.g., key not in the merged channel map).
- * @param key - The canonical channel key. Used for key-based sorting and to resolve the selected service variant internally.
- * @param field - The sort field to extract.
- * @returns A lowercase string suitable for comparison-based sorting.
- */
-export function getChannelSortKey(channel: ResolvedChannel, key: string, field: ChannelSortField): string {
-
-  // Resolve the selected service variant so all sort keys reflect the user's service selection. For URL-dependent fields (profile, service), this is essential -
-  // a canonical's URL may differ from the selected variant's (e.g., bbcnews canonical uses cox but the user selected the directv variant). For identity fields
-  // (name, stationId, channelNumber), the flattener eagerly sets these on all entries, so the resolved channel has identical values regardless of variant.
-  const effective = getResolvedChannel(resolveServiceKey(key)) ?? channel;
-
-  switch(field) {
-
-    case "channelNumber": {
-
-      const num = effective.channelNumber;
-
-      return num ? String(num).padStart(6, "0") : "zzzzzz";
-    }
-
-    case "channelSelector": {
-
-      return (effective.channelSelector ?? "").toLowerCase();
-    }
-
-    case "hdhrEnabled": {
-
-      // Sort enabled channels before disabled. "0" (enabled/absent) sorts before "1" (disabled). The effective-view helper centralizes the implicit-true
-      // convention so the sort key here, the table's checked attribute, and every other consumer agree on the meaning of an absent value.
-      return getEffectiveHdhrEnabled(effective) ? "0" : "1";
-    }
-
-    case "key": {
-
-      return key.toLowerCase();
-    }
-
-    case "name": {
-
-      return (effective.name ?? key).toLowerCase();
-    }
-
-    case "profile": {
-
-      // Explicit profile: sort by its name.
-      if(effective.profile) {
-
-        return effective.profile.toLowerCase();
-      }
-
-      // Auto-detected: check whether the profile resolves to a real service or falls back to default. Only apply the ! prefix for non-default auto profiles so
-      // they sort between explicit profiles and empty profiles.
-      const resolved = getProfileForChannel(effective);
-
-      if(resolved.profileName === "default") {
-
-        return "";
-      }
-
-      const label = getChannelServiceLabel(effective);
-
-      return label ? ("!" + label.toLowerCase()) : "";
-    }
-
-    case "service": {
-
-      return getChannelServiceLabel(effective).toLowerCase();
-    }
-
-    case "stationId": {
-
-      const id = effective.stationId;
-
-      return id ? id.padStart(6, "0") : "zzzzzz";
-    }
-
-    case "tags": {
-
-      const effectiveTags = getChannelEffectiveTags(effective);
-
-      return (effectiveTags.length > 0) ? effectiveTags.join(",") : "zz";
-    }
-
-    default: {
-
-      return key.toLowerCase();
-    }
-  }
-}
-
-/**
- * Compares two channels for sorting by the specified field and direction with a builtin channel name tiebreaker. The tiebreaker is always ascending so that rows
- * within each group maintain a consistent alphabetical order regardless of the primary sort direction. This is the single comparator for all sort sites - server HTML
- * render, client re-sort, and M3U playlist - to prevent ordering divergence.
- * @param channelA - First channel definition.
- * @param keyA - First channel key.
- * @param channelB - Second channel definition.
- * @param keyB - Second channel key.
- * @param field - The sort field to compare.
- * @param direction - Sort direction for the primary field.
- * @returns A negative, zero, or positive number for sort ordering.
- */
-export function compareChannelSort(
-  channelA: ResolvedChannel, keyA: string, channelB: ResolvedChannel, keyB: string, field: ChannelSortField, direction: SortDirection
-): number {
-
-  const valA = getChannelSortKey(channelA, keyA, field);
-  const valB = getChannelSortKey(channelB, keyB, field);
-  const cmp = (direction === "asc") ? valA.localeCompare(valB) : valB.localeCompare(valA);
-
-  if(cmp !== 0) {
-
-    return cmp;
-  }
-
-  // Tiebreaker: channel name ascending regardless of primary direction.
-  const nameA = (channelA.name ?? keyA).toLowerCase();
-  const nameB = (channelB.name ?? keyB).toLowerCase();
-
-  return nameA.localeCompare(nameB);
-}
-
 /**
  * Gets the service group for a channel key. Works with both canonical and variant keys.
  * @param key - Any channel key in the group.
@@ -907,56 +774,6 @@ export function getServiceSelections(): Record<string, string> {
 export function getServiceSelection(canonicalKey: string): string | undefined {
 
   return serviceSelections.get(canonicalKey);
-}
-
-/**
- * Persists a single service selection through the file store. Goes through mutateChannels so the file write, integrity validation, and post-mutate cache
- * hydration all run uniformly - after the call returns, both disk and the module-state Map reflect the new value. Selecting the canonical key itself (the
- * default service) deletes the selection rather than storing a redundant entry.
- *
- * For bulk updates, prefer mutateServiceSelections to coalesce multiple changes into a single atomic write.
- * @param canonicalKey - The canonical channel key.
- * @param serviceKey - The selected service key. When equal to canonicalKey, the selection is removed.
- * @throws FileStoreParseError if channels.json contains invalid JSON and the .bak rotation is also unparseable.
- */
-export async function setServiceSelection(canonicalKey: string, serviceKey: string): Promise<void> {
-
-  await mutateChannels((data) => {
-
-    if(serviceKey === canonicalKey) {
-
-      Reflect.deleteProperty(data.serviceSelections, canonicalKey);
-    } else {
-
-      data.serviceSelections[canonicalKey] = serviceKey;
-    }
-  });
-}
-
-/**
- * Bulk variant of setServiceSelection. Applies multiple selection changes inside a single mutate transaction so all changes land atomically with one disk
- * write. Use this whenever a single user action (e.g., browse-modal submit, bulk service assignment) updates more than one selection - serial awaits over
- * setServiceSelection would produce N writes and N intermediate disk states.
- *
- * Each entry follows the same canonical-key-equals-service-key convention as setServiceSelection: when the value matches the key, the selection is removed.
- * @param updates - Object mapping canonical channel keys to their new service keys.
- * @throws FileStoreParseError if channels.json contains invalid JSON and the .bak rotation is also unparseable.
- */
-export async function mutateServiceSelections(updates: Record<string, string>): Promise<void> {
-
-  await mutateChannels((data) => {
-
-    for(const [ canonicalKey, serviceKey ] of Object.entries(updates)) {
-
-      if(serviceKey === canonicalKey) {
-
-        Reflect.deleteProperty(data.serviceSelections, canonicalKey);
-      } else {
-
-        data.serviceSelections[canonicalKey] = serviceKey;
-      }
-    }
-  });
 }
 
 /* The default selection lookup consults the module-level serviceSelections cache, which mirrors the last committed configuration. Injecting it as a default

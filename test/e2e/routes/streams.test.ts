@@ -48,7 +48,9 @@ describe("GET /streams - populated projection", () => {
     await initializePersistence(ctx);
 
     const { urlFor } = await bootApp(ctx);
-    const entry = makeRegistryEntry({ channelName: "abc", url: "https://origin.test/abc.m3u8" });
+    // Seed the entry sixty-five seconds in the past so the row's duration and ISO start both carry a value the epoch math has to have got right, rather than the
+    // zero a fresh entry would report either way.
+    const entry = makeRegistryEntry({ channelName: "abc", startTime: Date.now() - 65000, url: "https://origin.test/abc.m3u8" });
 
     registerStream(entry);
 
@@ -79,8 +81,10 @@ describe("GET /streams - populated projection", () => {
       assert.equal(row.logoUrl, "", "logoUrl defaults to an empty string");
       assert.equal(row.recoveryAttempts, 0, "recoveryAttempts defaults to 0");
       assert.equal(row.showName, "", "showName defaults to an empty string");
-      assert.equal(typeof row.duration, "number", "duration is projected as a number of seconds");
-      assert.ok(row.duration >= 0, "duration is non-negative");
+      assert.equal(row.startTime, new Date(entry.startTime).toISOString(), "startTime is the entry's instant in ISO form");
+
+      // The e2e tier runs on real time, so the window absorbs the request's own latency around the sixty-five seconds the entry was seeded with.
+      assert.ok((row.duration >= 63) && (row.duration <= 67), "duration is whole seconds since the entry's start");
     } finally {
 
       unregisterStream(entry.id);

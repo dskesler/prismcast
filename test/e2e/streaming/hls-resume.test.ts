@@ -25,13 +25,13 @@ describe("HLS resume state round-trip", () => {
     saveResumeState([
       { channelName: "abc", initSegment: null, initVersion: 1, segmentIndex: 42, trackTimestamps: new Map() },
       { channelName: "nbc", initSegment: null, initVersion: 1, segmentIndex: 7, trackTimestamps: new Map() }
-    ]);
+    ], Date.now());
 
     // Now load - simulating the next startup. loadResumeState reads from disk and populates the in-memory map.
-    loadResumeState();
+    loadResumeState(Date.now());
 
-    assert.equal(getResumeSegmentIndex("abc"), 42, "abc segmentIndex round-trips");
-    assert.equal(getResumeSegmentIndex("nbc"), 7, "nbc segmentIndex round-trips");
+    assert.equal(getResumeSegmentIndex("abc", Date.now()), 42, "abc segmentIndex round-trips");
+    assert.equal(getResumeSegmentIndex("nbc", Date.now()), 7, "nbc segmentIndex round-trips");
 
     // Cleanup so this test does not leak resume state into subsequent tests.
     deleteResumeData("abc");
@@ -47,12 +47,12 @@ describe("HLS resume state round-trip", () => {
 
     await initializePersistence(ctx);
 
-    saveResumeState([{ channelName: "abc", initSegment: null, initVersion: 1, segmentIndex: 42, trackTimestamps: new Map() }]);
+    saveResumeState([{ channelName: "abc", initSegment: null, initVersion: 1, segmentIndex: 42, trackTimestamps: new Map() }], Date.now());
 
     // File exists post-save.
     await assert.doesNotReject(() => access(pathInDataDir(ctx, "hls-resume.json")), "resume file should exist after save");
 
-    loadResumeState();
+    loadResumeState(Date.now());
 
     // File should be gone post-load.
     await assert.rejects(() => access(pathInDataDir(ctx, "hls-resume.json")), /ENOENT/, "resume file should be deleted by loadResumeState");
@@ -70,17 +70,17 @@ describe("HLS resume state round-trip", () => {
 
     await initializePersistence(ctx);
 
-    saveResumeState([{ channelName: "abc", initSegment: null, initVersion: 1, segmentIndex: 42, trackTimestamps: new Map() }]);
-    loadResumeState();
+    saveResumeState([{ channelName: "abc", initSegment: null, initVersion: 1, segmentIndex: 42, trackTimestamps: new Map() }], Date.now());
+    loadResumeState(Date.now());
 
     // First peek returns the data.
-    const first = peekResumeData("abc");
+    const first = peekResumeData("abc", Date.now());
 
     assert.ok(first, "first peek returns the resume data");
     assert.equal(first.segmentIndex, 42, "segmentIndex is what we saved");
 
     // Second peek (without delete) returns the same data.
-    const second = peekResumeData("abc");
+    const second = peekResumeData("abc", Date.now());
 
     assert.ok(second, "second peek returns the same data (no consumption)");
     assert.equal(second.segmentIndex, 42, "segmentIndex unchanged");
@@ -88,7 +88,7 @@ describe("HLS resume state round-trip", () => {
     // After explicit delete, peek returns null.
     deleteResumeData("abc");
 
-    assert.equal(peekResumeData("abc"), null, "peek after delete returns null");
+    assert.equal(peekResumeData("abc", Date.now()), null, "peek after delete returns null");
   });
 
   test("a channel with no saved resume data returns null from getResumeSegmentIndex", async () => {
@@ -97,7 +97,7 @@ describe("HLS resume state round-trip", () => {
 
     await initializePersistence(ctx);
 
-    assert.equal(getResumeSegmentIndex("never-saved"), null, "no resume data -> null");
+    assert.equal(getResumeSegmentIndex("never-saved", Date.now()), null, "no resume data -> null");
   });
 
   test("an empty save list produces a file that loads without error and has no resume entries", async () => {
@@ -109,9 +109,9 @@ describe("HLS resume state round-trip", () => {
 
     await initializePersistence(ctx);
 
-    saveResumeState([]);
+    saveResumeState([], Date.now());
 
-    assert.doesNotThrow(() => { loadResumeState(); }, "empty resume file loads cleanly");
-    assert.equal(getResumeSegmentIndex("any-channel"), null, "no entries to retrieve");
+    assert.doesNotThrow(() => { loadResumeState(Date.now()); }, "empty resume file loads cleanly");
+    assert.equal(getResumeSegmentIndex("any-channel", Date.now()), null, "no entries to retrieve");
   });
 });

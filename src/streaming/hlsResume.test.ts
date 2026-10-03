@@ -5,16 +5,18 @@
  * older than 90 seconds so stale resume state does not poison a fresh recording. The tests exercise the file round-trip, TTL discard, peek/delete consume contract,
  * and the merge-with-active-streams path used by saveResumeState.
  */
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
+import { afterEach, beforeEach, describe, test } from "node:test";
 import { deleteResumeData, getResumeSegmentIndex, loadResumeState, peekResumeData, saveResumeState } from "./hlsResume.ts";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { readFileSync, writeFileSync } from "node:fs";
+import { LOG } from "../utils/index.ts";
+import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { initializeDataDir } from "../config/paths.ts";
 import os from "node:os";
 import path from "node:path";
 
-// The reference instant every mocked clock in this file counts from, so a row's expected timestamps read as offsets rather than absolute epochs.
+// The reference instant every row in this file counts from, so a row's expected timestamps read as offsets rather than absolute epochs.
 const BASE_TIME_MS = 1700000000000;
 
 /**
@@ -58,12 +60,10 @@ describe("loadResumeState", () => {
 
     tempDir = await mkdtemp(path.join(os.tmpdir(), "prismcast-resume-test-"));
     initializeDataDir(tempDir);
-    mock.timers.enable({ apis: ["Date"], now: BASE_TIME_MS });
   });
 
   afterEach(async () => {
 
-    mock.timers.reset();
     await rm(tempDir, { force: true, recursive: true });
   });
 
@@ -78,7 +78,7 @@ describe("loadResumeState", () => {
       cnn: { initVersion: 5, segmentIndex: 1234, timestamp: BASE_TIME_MS, trackTimestamps: { 1: "9000000" } }
     });
 
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
     let postLoadFileExists = true;
 
@@ -91,7 +91,35 @@ describe("loadResumeState", () => {
     }
 
     assertEqual(postLoadFileExists, false, "file deleted after read");
-    assertEqual(getResumeSegmentIndex("cnn"), 1234, "entry available in memory after load");
+    assertEqual(getResumeSegmentIndex("cnn", BASE_TIME_MS), 1234, "entry available in memory after load");
+  });
+
+  test("discards an entry past the TTL at load time and keeps the fresh one", async (t: TestContext) => {
+
+    /* The load-time discard is otherwise invisible: every read re-checks the TTL, so an implementation that kept expired entries at load would still answer null
+     * to every read. The count the load reports is the one observation that separates the two, so the row reads it off the info line.
+     */
+    const infos: string[] = [];
+
+    await makeResumeFile(tempDir, {
+
+
+      expired: { initVersion: 0, segmentIndex: 7, timestamp: BASE_TIME_MS - 91000, trackTimestamps: {} },
+      fresh: { initVersion: 0, segmentIndex: 11, timestamp: BASE_TIME_MS, trackTimestamps: {} }
+    });
+
+    t.mock.method(LOG, "info", (message: string, ...args: unknown[]): void => {
+
+      infos.push(message + "|" + args.map((arg) => String(arg)).join(","));
+    });
+
+    loadResumeState(BASE_TIME_MS);
+
+    const loadLine = infos.find((entry) => entry.startsWith("Loaded HLS resume state"));
+
+    assert(loadLine, "the load reported a count");
+    assertEqual(loadLine.split("|")[1], "1,", "one channel loaded - the expired entry was discarded at load, not deferred to the read-time check");
+    assertEqual(getResumeSegmentIndex("fresh", BASE_TIME_MS), 11, "the fresh entry reads back");
   });
 
   test("loads a recent entry and exposes it via getResumeSegmentIndex", async () => {
@@ -102,10 +130,10 @@ describe("loadResumeState", () => {
       espn: { initVersion: 0, segmentIndex: 42, timestamp: BASE_TIME_MS, trackTimestamps: {} }
     });
 
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
     assert(typeof getResumeSegmentIndex !== "undefined");
-    assertEqual(getResumeSegmentIndex("espn"), 42, "loaded segment index for espn");
+    assertEqual(getResumeSegmentIndex("espn", BASE_TIME_MS), 42, "loaded segment index for espn");
   });
 
   test("discards entries older than the 90-second TTL", async () => {
@@ -119,9 +147,9 @@ describe("loadResumeState", () => {
       old: { initVersion: 0, segmentIndex: 999, timestamp: expiredTs, trackTimestamps: {} }
     });
 
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
-    assertEqual(getResumeSegmentIndex("old"), null, "expired entry not loaded");
+    assertEqual(getResumeSegmentIndex("old", BASE_TIME_MS), null, "expired entry not loaded");
   });
 
   test("loads entries inside the TTL window even at the boundary", async () => {
@@ -135,9 +163,9 @@ describe("loadResumeState", () => {
       boundary: { initVersion: 0, segmentIndex: 7, timestamp: boundaryTs, trackTimestamps: {} }
     });
 
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
-    assertEqual(getResumeSegmentIndex("boundary"), 7, "TTL boundary inclusive");
+    assertEqual(getResumeSegmentIndex("boundary", BASE_TIME_MS), 7, "TTL boundary inclusive");
   });
 
   test("is a no-op when the resume file does not exist (clean start)", () => {
@@ -147,14 +175,14 @@ describe("loadResumeState", () => {
 
     try {
 
-      loadResumeState();
+      loadResumeState(BASE_TIME_MS);
     } catch {
 
       threw = true;
     }
 
     assertEqual(threw, false, "missing file did not throw");
-    assertEqual(getResumeSegmentIndex("anything"), null, "empty map after no-file load");
+    assertEqual(getResumeSegmentIndex("anything", BASE_TIME_MS), null, "empty map after no-file load");
   });
 
   test("discards corrupt JSON and continues with an empty map", async () => {
@@ -168,14 +196,14 @@ describe("loadResumeState", () => {
 
     try {
 
-      loadResumeState();
+      loadResumeState(BASE_TIME_MS);
     } catch {
 
       threw = true;
     }
 
     assertEqual(threw, false, "corrupt JSON did not throw");
-    assertEqual(getResumeSegmentIndex("anything"), null, "empty map after corrupt-file load");
+    assertEqual(getResumeSegmentIndex("anything", BASE_TIME_MS), null, "empty map after corrupt-file load");
   });
 });
 
@@ -187,12 +215,10 @@ describe("peekResumeData", () => {
 
     tempDir = await mkdtemp(path.join(os.tmpdir(), "prismcast-resume-test-"));
     initializeDataDir(tempDir);
-    mock.timers.enable({ apis: ["Date"], now: BASE_TIME_MS });
   });
 
   afterEach(async () => {
 
-    mock.timers.reset();
     await rm(tempDir, { force: true, recursive: true });
   });
 
@@ -205,9 +231,9 @@ describe("peekResumeData", () => {
       foo: { initVersion: 3, segmentIndex: 100, timestamp: BASE_TIME_MS, trackTimestamps: { 1: "1000" } }
     });
 
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
-    const data = peekResumeData("foo");
+    const data = peekResumeData("foo", BASE_TIME_MS);
 
     assert(data, "peek returned data");
     assertEqual(data.segmentIndex, 100, "segment index preserved");
@@ -217,7 +243,7 @@ describe("peekResumeData", () => {
 
   test("returns null for unknown channels", () => {
 
-    assertEqual(peekResumeData("unknown-channel"), null);
+    assertEqual(peekResumeData("unknown-channel", BASE_TIME_MS), null);
   });
 
   test("returns null and removes the entry when its TTL has expired", async () => {
@@ -229,14 +255,12 @@ describe("peekResumeData", () => {
       stale: { initVersion: 0, segmentIndex: 1, timestamp: BASE_TIME_MS, trackTimestamps: {} }
     });
 
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
-    // Advance clock past TTL.
-    mock.timers.tick(91000);
-
-    assertEqual(peekResumeData("stale"), null, "expired entry returns null");
+    // Read past the TTL by supplying an instant beyond the window.
+    assertEqual(peekResumeData("stale", BASE_TIME_MS + 91000), null, "expired entry returns null");
     // After eviction, the segment index lookup must also fail.
-    assertEqual(getResumeSegmentIndex("stale"), null);
+    assertEqual(getResumeSegmentIndex("stale", BASE_TIME_MS + 91000), null);
   });
 
   test("does NOT consume the entry on read - same data returned on a second peek", async () => {
@@ -248,10 +272,10 @@ describe("peekResumeData", () => {
       bar: { initVersion: 1, segmentIndex: 50, timestamp: BASE_TIME_MS, trackTimestamps: {} }
     });
 
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
-    const first = peekResumeData("bar");
-    const second = peekResumeData("bar");
+    const first = peekResumeData("bar", BASE_TIME_MS);
+    const second = peekResumeData("bar", BASE_TIME_MS);
 
     assert(first);
     assert(second);
@@ -267,12 +291,10 @@ describe("deleteResumeData", () => {
 
     tempDir = await mkdtemp(path.join(os.tmpdir(), "prismcast-resume-test-"));
     initializeDataDir(tempDir);
-    mock.timers.enable({ apis: ["Date"], now: BASE_TIME_MS });
   });
 
   afterEach(async () => {
 
-    mock.timers.reset();
     await rm(tempDir, { force: true, recursive: true });
   });
 
@@ -284,11 +306,11 @@ describe("deleteResumeData", () => {
       gone: { initVersion: 0, segmentIndex: 99, timestamp: BASE_TIME_MS, trackTimestamps: {} }
     });
 
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
     deleteResumeData("gone");
-    assertEqual(peekResumeData("gone"), null, "post-delete peek returns null");
-    assertEqual(getResumeSegmentIndex("gone"), null);
+    assertEqual(peekResumeData("gone", BASE_TIME_MS), null, "post-delete peek returns null");
+    assertEqual(getResumeSegmentIndex("gone", BASE_TIME_MS), null);
   });
 
   test("is a no-op for unknown channels", () => {
@@ -315,18 +337,16 @@ describe("getResumeSegmentIndex", () => {
 
     tempDir = await mkdtemp(path.join(os.tmpdir(), "prismcast-resume-test-"));
     initializeDataDir(tempDir);
-    mock.timers.enable({ apis: ["Date"], now: BASE_TIME_MS });
   });
 
   afterEach(async () => {
 
-    mock.timers.reset();
     await rm(tempDir, { force: true, recursive: true });
   });
 
   test("returns null for an unknown channel", () => {
 
-    assertEqual(getResumeSegmentIndex("nope"), null);
+    assertEqual(getResumeSegmentIndex("nope", BASE_TIME_MS), null);
   });
 
   test("returns the segment index for a recent entry", async () => {
@@ -337,9 +357,9 @@ describe("getResumeSegmentIndex", () => {
       ok: { initVersion: 0, segmentIndex: 17, timestamp: BASE_TIME_MS, trackTimestamps: {} }
     });
 
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
-    assertEqual(getResumeSegmentIndex("ok"), 17);
+    assertEqual(getResumeSegmentIndex("ok", BASE_TIME_MS), 17);
   });
 
   test("returns null when the TTL check fails (read-time staleness check)", async () => {
@@ -351,11 +371,9 @@ describe("getResumeSegmentIndex", () => {
       maybe: { initVersion: 0, segmentIndex: 5, timestamp: BASE_TIME_MS, trackTimestamps: {} }
     });
 
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
-    mock.timers.tick(91000);
-
-    assertEqual(getResumeSegmentIndex("maybe"), null, "stale entry filtered at read time");
+    assertEqual(getResumeSegmentIndex("maybe", BASE_TIME_MS + 91000), null, "stale entry filtered at read time");
   });
 });
 
@@ -367,12 +385,10 @@ describe("saveResumeState", () => {
 
     tempDir = await mkdtemp(path.join(os.tmpdir(), "prismcast-resume-test-"));
     initializeDataDir(tempDir);
-    mock.timers.enable({ apis: ["Date"], now: BASE_TIME_MS });
   });
 
   afterEach(async () => {
 
-    mock.timers.reset();
     await rm(tempDir, { force: true, recursive: true });
   });
 
@@ -387,13 +403,13 @@ describe("saveResumeState", () => {
       initVersion: 2,
       segmentIndex: 200,
       trackTimestamps: new Map([[ 1, 9000000n ]])
-    }]);
+    }], BASE_TIME_MS);
 
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
-    assertEqual(getResumeSegmentIndex("alpha"), 200, "saved entry recovered after load");
+    assertEqual(getResumeSegmentIndex("alpha", BASE_TIME_MS), 200, "saved entry recovered after load");
 
-    const data = peekResumeData("alpha");
+    const data = peekResumeData("alpha", BASE_TIME_MS);
 
     assert(data);
     assertEqual(data.initVersion, 3, "init version incremented on peek");
@@ -405,12 +421,12 @@ describe("saveResumeState", () => {
     // Boundary: empty input AND empty in-memory map -> no file. We first clear any in-memory state that prior tests in the suite may have left behind by issuing
     // deleteResumeData for every channel name those tests touched. Sibling tests cover the merge-with-carryforward path in isolation; this case is specifically
     // about the "nothing to save" branch.
-    for(const key of [ "alpha", "bar", "boundary", "cnn", "espn", "foo", "gone", "maybe", "ok", "same", "stale" ]) {
+    for(const key of [ "alpha", "bar", "boundary", "cnn", "espn", "expired", "foo", "fresh", "gone", "maybe", "ok", "same", "stale" ]) {
 
       deleteResumeData(key);
     }
 
-    saveResumeState([]);
+    saveResumeState([], BASE_TIME_MS);
 
     let threw = false;
 
@@ -434,7 +450,7 @@ describe("saveResumeState", () => {
       same: { initVersion: 1, segmentIndex: 1, timestamp: BASE_TIME_MS, trackTimestamps: {} }
     });
 
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
     saveResumeState([{
 
@@ -444,12 +460,12 @@ describe("saveResumeState", () => {
       initVersion: 9,
       segmentIndex: 999,
       trackTimestamps: new Map()
-    }]);
+    }], BASE_TIME_MS);
 
     // Reload to read what we just saved.
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
-    assertEqual(getResumeSegmentIndex("same"), 999, "active stream value won the merge");
+    assertEqual(getResumeSegmentIndex("same", BASE_TIME_MS), 999, "active stream value won the merge");
   });
 
   test("does not throw when the resume file path is unwritable (fs.writeFileSync fails)", () => {
@@ -478,7 +494,7 @@ describe("saveResumeState", () => {
         initVersion: 0,
         segmentIndex: 1,
         trackTimestamps: new Map()
-      }]);
+      }], BASE_TIME_MS);
     } catch {
 
       threw = true;
@@ -511,11 +527,11 @@ describe("saveResumeState", () => {
       initVersion: 1,
       segmentIndex: 100,
       trackTimestamps: new Map([[ 1, 12345n ]])
-    }]);
+    }], BASE_TIME_MS);
 
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
-    const peeked = peekResumeData("bytes");
+    const peeked = peekResumeData("bytes", BASE_TIME_MS);
 
     assert(peeked, "entry recovered after save -> load");
     assert(peeked.initSegment, "initSegment present after the base64 round-trip");
@@ -534,15 +550,12 @@ describe("saveResumeState", () => {
       stale: { initVersion: 0, segmentIndex: 50, timestamp: BASE_TIME_MS, trackTimestamps: {} }
     });
 
-    loadResumeState();
+    loadResumeState(BASE_TIME_MS);
 
-    // Advance virtual time past the 90-second TTL boundary so the in-memory entry now classifies as stale. The mock.timers harness above is enabled by
-    // beforeEach and reset in afterEach, so the advance survives until this test completes.
-    mock.timers.tick(91000);
-
+    // Save at an instant past the 90-second TTL boundary, so the in-memory entry classifies as stale to the carry-forward filter.
     // Save with NO active streams. The carry-forward filter should drop the stale entry, producing zero entries; saveResumeState's "Nothing to save" branch
     // skips the write entirely so the file does not exist on disk afterward.
-    saveResumeState([]);
+    saveResumeState([], BASE_TIME_MS + 91000);
 
     let fileExists = true;
 

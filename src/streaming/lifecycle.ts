@@ -7,7 +7,8 @@ import { LOG, formatDuration, formatError, getAbortController, unregisterAbortCo
 import { cancelPrerollTimer, getStream, unregisterStream } from "./registry.ts";
 import { formatKeyframeStatsSummary, formatSessionStatsSummary } from "./fmp4Segmenter.ts";
 import { formatRecoveryMetricsSummary, getTotalRecoveryAttempts } from "./recovery.ts";
-import { isGracefulShutdown, restartBrowserIfImpairedAndIdle, syncWindowVisibility, unregisterManagedPage } from "../browser/index.ts";
+import { isGracefulShutdown, restartBrowserIfImpairedAndIdle, setStreamTerminator, syncWindowVisibility, unregisterManagedPage } from "../browser/index.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import type { RecoveryMetrics } from "./recovery.ts";
 import type { StreamRegistryEntry } from "./registry.ts";
@@ -15,6 +16,7 @@ import { clearClients } from "./clients.ts";
 import { clearPretuneSafetyTimer } from "./pretuneTimers.ts";
 import { clearShowName } from "./showInfo.ts";
 import { emitStreamRemoved } from "./statusEmitter.ts";
+import { systemClock } from "homebridge-plugin-utils";
 
 /* This module provides the authoritative stream termination logic. All code paths that need to terminate a stream should call terminateStream() from this module. This
  * ensures consistent cleanup behavior including:
@@ -27,9 +29,20 @@ import { emitStreamRemoved } from "./statusEmitter.ts";
  * - Clearing client tracking data
  * - Emitting SSE events
  *
- * Callers are responsible for calling emitCurrentSystemStatus() after termination if they need to update the SSE system status. This is not done automatically to
- * avoid circular dependencies with the browser module.
+ * Callers own the SSE system status emission that follows a termination, calling emitCurrentSystemStatus() themselves when they need one. Leaving it to the
+ * caller is what lets a teardown that terminates a batch of streams emit once for the whole batch rather than once per stream, and what lets a caller whose
+ * clients are already gone - graceful shutdown - skip the emission entirely.
  */
+
+// Wiring.
+
+/* Inject this module's terminator into the browser module's readiness-loss path, which has to tear streams down through terminateStream so its cleanup matches
+ * every other termination path. Injecting the function rather than having browser/index.ts import it keeps the dependency one-directional: this module names
+ * browser/index.ts and browser/index.ts does not name it back, which is the same boundary setCaptureProbe draws between browser/index.ts and
+ * streaming/setup.ts. terminateStream is a hoisted function declaration, so this call reads it at module evaluation time regardless of where it sits in the
+ * file.
+ */
+setStreamTerminator(terminateStream);
 
 // State.
 
@@ -153,13 +166,14 @@ function disposeStreamResources(entry: StreamRegistryEntry): void {
  * to three readable phases: a prologue that snapshots the summary statistics while the resources are still live, disposeStreamResources() to tear down the stream's
  * owned resources, and the index/membership cleanup plus the termination log.
  *
- * Note: This function does NOT call emitCurrentSystemStatus() to avoid circular dependencies with the browser module. Callers should call emitCurrentSystemStatus()
- * after termination if they need to update the SSE system status.
+ * Note: this function does not emit SSE system status. Callers call emitCurrentSystemStatus() themselves when they need one, which lets a caller terminating a
+ * batch of streams emit once for the whole batch, and lets one whose clients are already gone, such as graceful shutdown, skip the emission.
  * @param streamId - The numeric stream ID.
  * @param channelName - The channel name for channel mapping cleanup.
  * @param reason - The reason for termination (e.g., "idle timeout", "circuit breaker").
+ * @param clock - The clock the termination summary's duration reads; defaults to the system clock.
  */
-export function terminateStream(streamId: number, channelName: string, reason: string): void {
+export function terminateStream(streamId: number, channelName: string, reason: string, clock: Clock = systemClock): void {
 
   // The guard makes redundant terminate calls a no-op (callers can issue them freely) and suppresses spurious warnings from in-flight segmenter/monitor callbacks.
   if(terminationInitiated.has(streamId)) {
@@ -170,7 +184,7 @@ export function terminateStream(streamId: number, channelName: string, reason: s
   terminationInitiated.add(streamId);
 
   const streamInfo = getStream(streamId);
-  const durationMs = streamInfo ? (Date.now() - streamInfo.startTime.getTime()) : 0;
+  const durationMs = streamInfo ? (clock.now() - streamInfo.startTime) : 0;
 
   // Prologue: snapshot every statistic the termination summary needs while the resources are still live. Each capture-mode resource is a node exposing a read
   // alongside its dispose - the segmenter (via the capture session), the native proxy, and the health monitor - read here, disposed below. The counters remain valid
@@ -206,18 +220,19 @@ export function terminateStream(streamId: number, channelName: string, reason: s
   unregisterStream(streamId);
 
   /* With the entry gone, the window-visibility policy can see whether anything is still capturing, so this is the moment the window settles. It lives here rather
-   * than at each caller for the same reason the rest of this cleanup does: nine paths reach termination, and a policy trigger any one of them could forget is a
-   * window left on screen for the rest of the session. Fire-and-forget, because the executor serializes and no caller of terminateStream waits on presentation.
+   * than at each caller for the same reason the rest of this cleanup does: every termination path arrives here, and a policy trigger any one of them could forget
+   * is a window left on screen for the rest of the session. Fire-and-forget, because the executor serializes and no caller of terminateStream waits on presentation.
    *
-   * This differs from the SSE emission the notes above keep caller-owned: that exclusion is about emitCurrentSystemStatus's own import graph, whereas the sync
-   * travels the module edge this file already has to browser/index.ts.
+   * This differs from the SSE emission the notes above keep caller-owned: a caller batches that emission across a multi-stream teardown or suppresses it when
+   * nobody is listening, while the window policy has to settle on every termination, so it belongs here.
    */
   void syncWindowVisibility();
 
   // With the entry gone, a browser that can no longer start captures may have nothing left to wait for, and this is the one line every termination path passes -
   // the same reason the window sync above lives here. The call reads the mark and the registry itself and returns at once when either says the moment has not
-  // arrived, so an ordinary stream end pays nothing beyond those reads.
-  restartBrowserIfImpairedAndIdle();
+  // arrived, so an ordinary stream end pays nothing beyond those reads. Fire-and-forget, because a termination has no use for the fresh browser the relaunch
+  // produces and nothing here waits on one.
+  void restartBrowserIfImpairedAndIdle();
 
   clearClients(streamId);
   clearPretuneSafetyTimer(streamId);

@@ -1,15 +1,17 @@
 /* Copyright(C) 2024-2026, HJD (https://github.com/hjdhjd). All rights reserved.
  *
- * login.test.ts: Unit tests for the login mode state machine in login.ts. The module owns its lifecycle exports plus two injection setters (setBrowserAccessors for
+ * login.test.ts: Unit tests for the login mode state machine in login.ts. The module owns its lifecycle exports plus two injection setters (setLoginDeps for
  * the browser-side dependencies, setLoginModeEndObserver for the composition root's login-end observer). Login mode is module-level singleton state, so each test
  * resets the slot via clearLoginState() and re-installs fresh accessors before running. Both window-presentation calls travel through the injected
  * syncWindowVisibility accessor rather than CDP, so the happy path runs with no real browser, target, or CDP session involved, and the fake accessor is where the
  * order of the login-state assignments against the sync is observed.
  */
 import type { Browser, Page } from "puppeteer-core";
-import { afterEach, beforeEach, describe, mock, test } from "node:test";
-import { clearLoginState, endLoginMode, getLoginPage, getLoginStatus, isLoginModeActive, setBrowserAccessors, setLoginModeEndObserver,
+import { TestClock, settle } from "homebridge-plugin-utils/testing";
+import { afterEach, beforeEach, describe, test } from "node:test";
+import { clearLoginState, endLoginMode, getLoginPage, getLoginStatus, isLoginModeActive, setLoginDeps, setLoginModeEndObserver,
   startLoginMode } from "./login.ts";
+import type { Clock } from "homebridge-plugin-utils";
 import type { Nullable } from "../types/index.ts";
 import assert from "node:assert/strict";
 
@@ -97,18 +99,20 @@ function makeBrowserStub(options: { connected?: boolean; newPageError?: Error; p
   } as unknown as Browser;
 }
 
-/* installAccessors installs a minimal browser-accessor pair and returns the record of window-sync calls a caller reads to verify them. The browser reference is
- * captured in a closure so tests can flip its connected flag mid-test by mutating the returned object.
+/* installLoginDeps installs a minimal login dependency set and returns the record of window-sync calls a caller reads to verify them. The browser reference is
+ * captured in a closure so tests can flip its connected flag mid-test by mutating the returned object. A row that drives login's timing passes a clock; the rest
+ * pass none and run on the system clock the port defaults to.
  *
  * The fake reads the module's live login state at the instant it is invoked and appends it to loginStateAtSync. That is what lets a test tell "state assigned,
  * then sync" apart from the reverse ordering: a bare call counter is identical under both, whereas the recorded flag is true under one and false under the other.
  */
-function installAccessors(browser: Nullable<Browser>): { loginStateAtSync: boolean[]; syncCalls: number } {
+function installLoginDeps(browser: Nullable<Browser>, clock?: Clock): { loginStateAtSync: boolean[]; syncCalls: number } {
 
   const counters: { loginStateAtSync: boolean[]; syncCalls: number } = { loginStateAtSync: [], syncCalls: 0 };
 
-  setBrowserAccessors({
+  setLoginDeps({
 
+    clock,
     getBrowserInstance: (): Nullable<Browser> => browser,
     syncWindowVisibility: async (): Promise<void> => {
 
@@ -141,7 +145,7 @@ describe("isLoginModeActive", () => {
 
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     const result = await startLoginMode("https://example.test/login");
 
@@ -153,7 +157,7 @@ describe("isLoginModeActive", () => {
 
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/login");
     await endLoginMode();
@@ -181,32 +185,25 @@ describe("getLoginStatus", () => {
 
   test("reports the URL and a populated startTime once login has started", async () => {
 
+    // The start instant comes from the injected clock, so the row states the epoch it seeded rather than mocking the global Date.
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }), new TestClock(1700000000000));
 
-    mock.timers.enable({ apis: ["Date"], now: 1700000000000 });
+    await startLoginMode("https://example.test/x");
 
-    try {
+    const status = getLoginStatus();
 
-      await startLoginMode("https://example.test/x");
-
-      const status = getLoginStatus();
-
-      assert.equal(status.active, true, "active");
-      assert.equal(status.url, "https://example.test/x", "stored URL surfaces");
-      assert.equal(status.startTime, 1700000000000, "startTime captured from Date.now()");
-    } finally {
-
-      mock.timers.reset();
-    }
+    assert.equal(status.active, true, "active");
+    assert.equal(status.url, "https://example.test/x", "stored URL surfaces");
+    assert.equal(status.startTime, 1700000000000, "startTime captured from the injected clock");
   });
 
   test("clears all status fields after endLoginMode", async () => {
 
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/x");
     await endLoginMode();
@@ -238,7 +235,7 @@ describe("getLoginPage", () => {
 
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/x");
 
@@ -249,7 +246,7 @@ describe("getLoginPage", () => {
 
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/x");
     await endLoginMode();
@@ -274,7 +271,7 @@ describe("startLoginMode", () => {
 
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     const result = await startLoginMode("https://example.test/login");
 
@@ -290,7 +287,7 @@ describe("startLoginMode", () => {
      * assignments move below the sync call rather than merely counting that both happened.
      */
     const pageStub = makePageStub();
-    const counters = installAccessors(makeBrowserStub({ pageStub }));
+    const counters = installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/login");
 
@@ -304,7 +301,7 @@ describe("startLoginMode", () => {
     const pageStub = makePageStub();
     const pages: unknown[] = [];
 
-    setBrowserAccessors({
+    setLoginDeps({
 
       getBrowserInstance: (): Nullable<Browser> => makeBrowserStub({ pageStub }),
       syncWindowVisibility: async (page?: Page): Promise<void> => {
@@ -322,7 +319,7 @@ describe("startLoginMode", () => {
 
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/first");
 
@@ -335,7 +332,7 @@ describe("startLoginMode", () => {
 
   test("returns failure when no browser accessors have been installed (browser unavailable)", async () => {
 
-    setBrowserAccessors({
+    setLoginDeps({
 
       getBrowserInstance: (): Nullable<Browser> => null,
       syncWindowVisibility: async (): Promise<void> => Promise.resolve()
@@ -350,7 +347,7 @@ describe("startLoginMode", () => {
 
   test("returns failure when the browser is disconnected", async () => {
 
-    installAccessors(makeBrowserStub({ connected: false }));
+    installLoginDeps(makeBrowserStub({ connected: false }));
 
     const result = await startLoginMode("https://example.test/x");
 
@@ -363,7 +360,7 @@ describe("startLoginMode", () => {
     // Negative test: if browser.newPage() rejects, the catch branch surfaces the formatted error and resets state. The page reference must not leak.
     const failure = new Error("synthetic newPage rejection");
 
-    installAccessors(makeBrowserStub({ newPageError: failure }));
+    installLoginDeps(makeBrowserStub({ newPageError: failure }));
 
     const result = await startLoginMode("https://example.test/x");
 
@@ -378,7 +375,7 @@ describe("startLoginMode", () => {
     // promise it kicks off resolves on the microtask queue.
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/x");
 
@@ -415,7 +412,7 @@ describe("startLoginMode", () => {
 
     try {
 
-      installAccessors(makeBrowserStub({ pageStub: pageA }));
+      installLoginDeps(makeBrowserStub({ pageStub: pageA }));
 
       await startLoginMode("https://example.test/session-a");
 
@@ -426,7 +423,7 @@ describe("startLoginMode", () => {
 
       const pageB = makePageStub();
 
-      installAccessors(makeBrowserStub({ pageStub: pageB }));
+      installLoginDeps(makeBrowserStub({ pageStub: pageB }));
 
       await startLoginMode("https://example.test/session-b");
 
@@ -465,7 +462,7 @@ describe("endLoginMode", () => {
 
     // Negative test: callers may invoke endLoginMode unconditionally during cleanup. The function must tolerate that without throwing or running browser
     // operations against an inactive session.
-    const counters = installAccessors(makeBrowserStub({ pageStub: makePageStub() }));
+    const counters = installLoginDeps(makeBrowserStub({ pageStub: makePageStub() }));
 
     await endLoginMode();
 
@@ -475,7 +472,7 @@ describe("endLoginMode", () => {
   test("closes the login page and settles the window against the policy when an active session exists", async () => {
 
     const pageStub = makePageStub();
-    const counters = installAccessors(makeBrowserStub({ pageStub }));
+    const counters = installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/x");
 
@@ -491,7 +488,7 @@ describe("endLoginMode", () => {
   test("skips closing the page when isClosed reports true (avoids redundant close)", async () => {
 
     const pageStub = makePageStub();
-    const counters = installAccessors(makeBrowserStub({ pageStub }));
+    const counters = installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/x");
 
@@ -509,7 +506,7 @@ describe("endLoginMode", () => {
     // Negative test: page.close() can throw "Target closed" when the tab is in transition. The catch branch must absorb that and let the rest of the cleanup
     // proceed.
     const pageStub = makePageStub({ closeShouldThrow: true });
-    const counters = installAccessors(makeBrowserStub({ pageStub }));
+    const counters = installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/x");
 
@@ -527,7 +524,7 @@ describe("endLoginMode", () => {
     // try to drive CDP against a dead connection.
     const pageStub = makePageStub();
     const browser = makeBrowserStub({ connected: true, pageStub });
-    const counters = installAccessors(browser);
+    const counters = installLoginDeps(browser);
 
     await startLoginMode("https://example.test/x");
 
@@ -540,6 +537,62 @@ describe("endLoginMode", () => {
 
     assert.equal(counters.syncCalls, 0, "no window sync attempted against a disconnected browser");
     assert.equal(isLoginModeActive(), false, "state still cleared");
+  });
+});
+
+describe("the fifteen-minute login timeout", () => {
+
+  // Fifteen minutes in milliseconds, the window LOGIN_TIMEOUT_MS names. Stated here because the constant is module-private in login.ts.
+  const LOGIN_TIMEOUT = 900000;
+
+  beforeEach(() => {
+
+    clearLoginState();
+  });
+
+  afterEach(() => {
+
+    clearLoginState();
+  });
+
+  test("ends the session and closes the page when the window elapses", async () => {
+
+    const clock = new TestClock();
+    const pageStub = makePageStub();
+
+    installLoginDeps(makeBrowserStub({ pageStub }), clock);
+
+    await startLoginMode("https://example.test/x");
+
+    assert.equal(clock.pending, 1, "the timeout is armed on the injected clock");
+    assert.deepEqual(clock.requested, [LOGIN_TIMEOUT], "the window is fifteen minutes");
+
+    clock.advance(LOGIN_TIMEOUT);
+    await settle();
+
+    assert.equal(isLoginModeActive(), false, "the timeout ended the session");
+    assert.equal(pageStub.closeCalls, 1, "the timeout closed the login page");
+  });
+
+  test("disposes the timeout when the session ends first, so a later elapse closes nothing", async () => {
+
+    // The disposal is what keeps a fired-after-the-fact timeout from reaching into a session that is already over: without it the advance below would run the
+    // handler against a cleared slot and close a second page.
+    const clock = new TestClock();
+    const pageStub = makePageStub();
+
+    installLoginDeps(makeBrowserStub({ pageStub }), clock);
+
+    await startLoginMode("https://example.test/x");
+    await endLoginMode();
+
+    assert.equal(clock.pending, 0, "the end disposed the pending timeout");
+    assert.equal(pageStub.closeCalls, 1, "the end closed the login page once");
+
+    clock.advance(LOGIN_TIMEOUT);
+    await settle();
+
+    assert.equal(pageStub.closeCalls, 1, "the elapsed window closed nothing further");
   });
 });
 
@@ -573,7 +626,7 @@ describe("setLoginModeEndObserver / login-end notification", () => {
      */
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/observer");
     await endLoginMode();
@@ -600,7 +653,7 @@ describe("setLoginModeEndObserver / login-end notification", () => {
       }
     };
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/reentrant");
     await endLoginMode();
@@ -617,7 +670,7 @@ describe("setLoginModeEndObserver / login-end notification", () => {
 
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/tab-close");
 
@@ -634,7 +687,7 @@ describe("setLoginModeEndObserver / login-end notification", () => {
 
   test("does not fire when endLoginMode runs with no active session (repeat-safe teardown)", async () => {
 
-    installAccessors(makeBrowserStub({ pageStub: makePageStub() }));
+    installLoginDeps(makeBrowserStub({ pageStub: makePageStub() }));
 
     await endLoginMode();
 
@@ -645,7 +698,7 @@ describe("setLoginModeEndObserver / login-end notification", () => {
 
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/twice");
     await endLoginMode();
@@ -658,7 +711,7 @@ describe("setLoginModeEndObserver / login-end notification", () => {
 
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/crash");
     clearLoginState();
@@ -678,7 +731,7 @@ describe("setLoginModeEndObserver / login-end notification", () => {
 
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/throws");
 
@@ -708,7 +761,7 @@ describe("clearLoginState", () => {
 
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/x");
 
@@ -724,7 +777,7 @@ describe("clearLoginState", () => {
     // The contract distinction between clearLoginState and endLoginMode: clearLoginState assumes the browser is gone, so it must not invoke any browser-touching
     // operations. We assert by counting close calls and window syncs.
     const pageStub = makePageStub();
-    const counters = installAccessors(makeBrowserStub({ pageStub }));
+    const counters = installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/x");
 
@@ -740,7 +793,7 @@ describe("clearLoginState", () => {
 
     const pageStub = makePageStub();
 
-    installAccessors(makeBrowserStub({ pageStub }));
+    installLoginDeps(makeBrowserStub({ pageStub }));
 
     await startLoginMode("https://example.test/x");
 

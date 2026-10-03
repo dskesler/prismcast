@@ -15,12 +15,12 @@
  *
  *   2. terminateStream's cleanup sequence (src/streaming/lifecycle.ts). Under the early-return-on-already-initiated guard: mark terminationInitiated -> prologue
  *      snapshots the summary stats while live (segmenter via the capture session, nativeProxy.getStats(), monitor.getMetrics()) -> disposeStreamResources(entry)
- *      [abort + unregister AbortController -> monitor.dispose() -> clearTimeout(prerollTimer) -> nativeProxy.stop() | captureSession.dispose() -> close page (if not
+ *      [abort + unregister AbortController -> monitor.dispose() -> dispose the prerollTimer handle -> nativeProxy.stop() | captureSession.dispose() -> close page (if not
  *      graceful shutdown)] -> index cleanup [remove channel mapping -> emit terminated + remove emitter listeners -> unregisterStream -> clearClients ->
  *      clearPretuneSafetyTimer -> clearShowName -> emitStreamRemoved -> delete terminationInitiated] -> log. Every step is synchronous from the caller's perspective.
  *
  *   3. Cleanup gap analysis. Reviewed each branch above for "what survives if termination interrupts an in-flight recovery":
- *        - prerollTimer: cleared via clearTimeout (no orphan timer).
+ *        - prerollTimer: the handle is disposed (no orphan timer).
  *        - AbortController: aborted then unregistered (no leaked controller).
  *        - monitor: getMetrics() read in the prologue, dispose() called once in disposeStreamResources (no leaked recovery interval).
  *        - segmentEmitter: removeAllListeners called after the "terminated" emit (no orphan listeners).
@@ -41,8 +41,12 @@ import { createIntegrationContext, initializePersistence } from "../../helpers/i
 import { describe, test } from "node:test";
 import { getChannelStreamId, isTerminationInitiated, setChannelStreamId, terminateStream } from "../../../src/streaming/lifecycle.ts";
 import { getStream, registerStream } from "../../../src/streaming/registry.ts";
+import { TestClock } from "homebridge-plugin-utils/testing";
 import assert from "node:assert/strict";
 import { makeRegistryEntry } from "../../../src/streaming/registry.helpers.ts";
+
+// The reference instant the seeded recovery attempts are stamped with, matching the baseline the sibling recovery suites anchor on.
+const BASE_TIME_MS = 1700000000000;
 
 /* Builds a fake MonitorHandle that simulates a stream mid-recovery. The closure captures the metrics object getMetrics() returns and an array recording every
  * dispose invocation. Using a fake handle (instead of starting a real monitor) is the right boundary here: this suite tests the lifecycle.ts teardown contract,
@@ -56,8 +60,8 @@ function makeMidRecoveryMonitor(): { invocations: number[]; metrics: RecoveryMet
   // Simulate an L2 (source reload) attempt in flight: the monitor recorded an L1 attempt, observed that L1 did not restore playback, escalated to L2 and is
   // currently waiting on L2's outcome when termination fires. currentRecoveryMethod and currentRecoveryStartTime are non-null - the unmistakable signal that
   // recovery is mid-flight.
-  recordRecoveryAttempt(metrics, getRecoveryMethod(1));
-  recordRecoveryAttempt(metrics, getRecoveryMethod(2));
+  recordRecoveryAttempt(metrics, getRecoveryMethod(1), BASE_TIME_MS);
+  recordRecoveryAttempt(metrics, getRecoveryMethod(2), BASE_TIME_MS);
 
   // Sanity: the seeded metrics object reflects the in-flight L2 state.
   if(metrics.currentRecoveryMethod !== RECOVERY_METHODS.sourceReload) {
@@ -99,14 +103,11 @@ describe("terminateStream during active recovery - cleanup contract", () => {
 
     const { invocations, monitor } = makeMidRecoveryMonitor();
 
-    // Schedule a real Timeout to stand in for an in-flight prerollTimer. We use a far-future delay so the timer does NOT fire on its own during the test - the
-    // assertion below is that terminateStream cleared it. unref() prevents the timer from holding the test-runner event loop open if the cleanup branch is
-    // ever broken (the test would still fail loudly via the assertion, but we do not want the suite to hang).
+    // Arm a timer on a virtual clock to stand in for an in-flight prerollTimer. The far-future delay means it does not come due on its own - the assertion below
+    // is that terminateStream disposed it - and the virtual clock keeps the row off real time entirely, so nothing can hold the test-runner event loop open.
     let prerollTimerFired = false;
-    const prerollTimer = setTimeout(() => { prerollTimerFired = true; }, 60000);
-
-    prerollTimer.unref();
-
+    const clock = new TestClock();
+    const prerollTimer = clock.schedule(() => { prerollTimerFired = true; }, 60000);
     const entry = makeRegistryEntry({ channelName: "abc", monitor });
 
     entry.hls.prerollTimer = prerollTimer;
@@ -120,13 +121,11 @@ describe("terminateStream during active recovery - cleanup contract", () => {
     // mean lifecycle.ts skipped the hook (e.g., a refactor that conditioned it on an unrelated field).
     assert.equal(invocations.length, 1, "the monitor handle must be disposed exactly once during termination");
 
-    // prerollTimer cleanup: the timer reference still exists, but lifecycle.ts cleared it. The clearest test is to wait past the firing window and assert the
-    // timer's callback never ran. Since we set 60_000ms above and unref'd it, the test does not need to wait for that - we can directly observe by polling
-    // synchronously: terminateStream is synchronous, so by the time it returns the timer must have been cleared. clearTimeout is safe to call more than once
-    // and silent, so the observable is "the timer never fires" - we can satisfy that by running through the event loop one tick and checking.
-    await new Promise((resolve) => setImmediate(resolve));
+    // prerollTimer cleanup: the handle reference still exists, but lifecycle.ts disposed it. Advancing the virtual clock past the full sixty-second window is the
+    // clearest observation available - a handle that was merely nulled on the entry would still be armed on the clock and would fire here.
+    clock.advance(60000);
 
-    assert.equal(prerollTimerFired, false, "the prerollTimer must have been cleared by terminateStream - the callback must never run");
+    assert.equal(prerollTimerFired, false, "the prerollTimer must have been disposed by terminateStream - the callback must never run");
 
     // Registry / index cleanup.
     assert.equal(getStream(entry.id), undefined, "the registry entry must be gone after termination");

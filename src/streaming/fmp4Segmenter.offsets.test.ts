@@ -180,7 +180,6 @@ describe("fMP4 segmenter per-track offset application", () => {
   afterEach(() => {
 
     unregisterStream(streamId);
-    mock.timers.reset();
   });
 
   test("applies each track's offset exactly once in a moof mixing an already-initialized track with a newly initializing one", async () => {
