@@ -145,40 +145,110 @@ function exportYttvLineup(): Nullable<PersistedLineupChannel[]> {
   }));
 }
 
+// One thumbnail endpoint as the guide renders it, read verbatim so that every decision about it is made outside the page where it can be tested.
+interface GuideTile {
+
+  // The thumbnail's href: "watch/..." for a channel that plays directly, "live" for one whose click opens a chooser, "browse/..." for an info page.
+  readonly href: string;
+
+  // The live watch endpoint carried by the chooser a "live" tile opens, when it carries one.
+  readonly joinLive: Nullable<{ params: string; videoId: string }>;
+
+  // The thumbnail's aria-label, e.g. "watch ESPN".
+  readonly label: string;
+}
+
 /**
- * Discovers all channels from the YouTube TV EPG grid in a single evaluate round-trip. For each thumbnail endpoint with a valid watch/ href, extracts the channel
- * name (from the aria-label, stripping the "watch " prefix) and the watch path. Channels with "live" or "browse/" hrefs are premium add-ons or info pages and are
- * excluded. Returns an empty array if no channels are found (e.g., guide in a degraded state) or if the evaluate is aborted.
+ * Reads every thumbnail endpoint in the YouTube TV EPG grid in a single evaluate round-trip. Nothing is filtered here: selectGuideChannels owns what the tiles
+ * mean. A tile whose current program can be restarted links to "live" and opens a "Join live" / "Start from beginning" chooser instead of a watch page; the
+ * chooser's live endpoint rides on the element's data, so it is read alongside the href. Returns an empty array if the grid is empty (e.g., guide in a degraded
+ * state) or if the evaluate is aborted.
+ * @param page - The Puppeteer page object positioned on the YouTube TV live guide.
+ * @returns Every tile in grid order.
+ */
+async function readGuideTiles(page: Page): Promise<GuideTile[]> {
+
+  return await evaluateWithAbort(page, (): GuideTile[] => {
+
+    interface ChooserItem {
+
+      unpluggedMenuItemRenderer?: { command?: { watchEndpoint?: { params?: string; videoId?: string } }; primaryIcon?: { iconType?: string } };
+    }
+
+    interface TileData {
+
+      unpluggedPopupEndpoint?: { popupRenderer?: { unpluggedSelectionMenuDialogRenderer?: { items?: ChooserItem[] } } };
+    }
+
+    return Array.from(document.querySelectorAll("ytu-endpoint.tenx-thumb[aria-label]")).map((thumb) => {
+
+      const items = (thumb as Element & { data?: TileData }).data?.unpluggedPopupEndpoint?.popupRenderer?.unpluggedSelectionMenuDialogRenderer?.items ?? [];
+      const live = items.find((item) => item.unpluggedMenuItemRenderer?.primaryIcon?.iconType === "LIVE")?.unpluggedMenuItemRenderer?.command?.watchEndpoint;
+
+      return {
+
+        href: thumb.querySelector("a")?.getAttribute("href") ?? "",
+        joinLive: live?.videoId ? { params: live.params ?? "", videoId: live.videoId } : null,
+        label: thumb.getAttribute("aria-label") ?? ""
+      };
+    });
+  }, []);
+}
+
+/**
+ * Resolves the guide's tiles to one watch path per channel name.
+ *
+ * Names are not unique in the guide. Alongside a network's own row, YouTube TV lists that network's individual events further down - each of them labeled with
+ * the network's name ("watch ESPN" over a U-12 soccer match) and each with a watch path of its own. The network's row comes first in grid order, so the first
+ * tile carrying a name owns it. A later tile can never take a name over, even when the owning tile could not be resolved: a name with no usable path is a
+ * failed tune, which a DVR can fall back from, while a name resolved to one of its events is the wrong program delivered as if it were right.
+ *
+ * A "live" tile resolves through its chooser's "Join live" endpoint. "browse/" tiles are info pages, and a "live" tile with no chooser is a premium add-on.
+ * @param tiles - Every tile from readGuideTiles(), in grid order.
+ * @returns The channels with a usable watch path, in grid order.
+ */
+export function selectGuideChannels(tiles: readonly GuideTile[]): { name: string; watchPath: string }[] {
+
+  const claimed = new Set<string>();
+  const results: { name: string; watchPath: string }[] = [];
+
+  for(const tile of tiles) {
+
+    if(!tile.label.startsWith("watch ")) {
+
+      continue;
+    }
+
+    const name = tile.label.slice(6);
+    const key = name.toLowerCase();
+
+    if(claimed.has(key)) {
+
+      continue;
+    }
+
+    claimed.add(key);
+
+    if(tile.href.startsWith("watch/")) {
+
+      results.push({ name, watchPath: tile.href });
+    } else if(tile.joinLive) {
+
+      results.push({ name, watchPath: "watch/" + tile.joinLive.videoId + (tile.joinLive.params ? "?vp=" + tile.joinLive.params : "") });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Discovers all channels from the YouTube TV EPG grid: one read of the tiles, resolved to one watch path per channel name.
  * @param page - The Puppeteer page object positioned on the YouTube TV live guide.
  * @returns Array of discovered channel names and watch paths.
  */
 async function discoverGuideChannels(page: Page): Promise<{ name: string; watchPath: string }[]> {
 
-  return await evaluateWithAbort(page, (): { name: string; watchPath: string }[] => {
-
-    const results: { name: string; watchPath: string }[] = [];
-
-    for(const thumb of Array.from(document.querySelectorAll("ytu-endpoint.tenx-thumb[aria-label]"))) {
-
-      const label = thumb.getAttribute("aria-label") ?? "";
-
-      if(!label.startsWith("watch ")) {
-
-        continue;
-      }
-
-      const anchor = thumb.querySelector("a");
-      const href = anchor?.getAttribute("href") ?? "";
-
-      // Only include channels with streamable watch URLs. Channels with "live" or "browse/" hrefs are premium add-ons or info pages.
-      if(href.startsWith("watch/")) {
-
-        results.push({ name: label.slice(6), watchPath: href });
-      }
-    }
-
-    return results;
-  }, []);
+  return selectGuideChannels(await readGuideTiles(page));
 }
 
 // Broadcast network names that have local affiliates displayed as "{Network} {Number}" (e.g., "NBC 5", "ABC 7") in the YouTube TV guide. Used to constrain

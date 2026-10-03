@@ -13,10 +13,10 @@
  */
 import type { ChannelSelectionProfile, DiscoveredChannel, Nullable } from "../../types/index.ts";
 import { afterEach, describe, test } from "node:test";
+import { selectGuideChannels, yttvProvider } from "./youtubeTv.ts";
 import type { Page } from "puppeteer-core";
 import assert from "node:assert/strict";
 import { makeProfile } from "../../config/profiles.helpers.ts";
-import { yttvProvider } from "./youtubeTv.ts";
 
 // One raw guide row as the strategy reads it out of the EPG grid: the name carried in the thumbnail's aria-label, and the relative watch path from its anchor.
 interface GuideRow {
@@ -42,7 +42,7 @@ interface GuidePage {
 
 /* makeGuidePage returns a Page-shaped stub carrying the three surfaces the provider touches - the grid wait, the evaluate that reads the lineup, and the
  * navigation to a watch URL - plus a record of what it did with them. evaluateWithAbort only ever calls .evaluate() on the context it is handed, so a stub whose
- * evaluate ignores the page function and returns the canned lineup is a faithful stand-in for the whole read.
+ * evaluate ignores the page function and returns the canned lineup as guide tiles is a faithful stand-in for the whole read.
  */
 function makeGuidePage(rows: GuideRow[] = []): GuidePage {
 
@@ -53,13 +53,14 @@ function makeGuidePage(rows: GuideRow[] = []): GuidePage {
 
   const page = {
 
-    evaluate: async (): Promise<GuideRow[]> => {
+    // The page hands back raw tiles; the rows are rendered as the plain watch tiles a guide shows for them.
+    evaluate: async (): Promise<{ href: string; joinLive: null; label: string }[]> => {
 
       reads++;
 
       await Promise.resolve();
 
-      return lineup;
+      return lineup.map((row) => ({ href: row.watchPath, joinLive: null, label: "watch " + row.name }));
     },
     goto: async (url: string): Promise<null> => {
 
@@ -266,5 +267,57 @@ describe("channel cache lifecycle", () => {
     yttvProvider.strategy.clearCache?.();
 
     assert.equal(yttvProvider.getCachedChannels(), null, "a cleared cache reports that no enumeration has happened rather than an empty lineup");
+  });
+});
+
+describe("guide tile selection", () => {
+
+  // A guide read taken from YouTube TV during College GameDay, trimmed to the tiles that matter: the network rows, then the ESPN events listed further down
+  // under the network's own name.
+  const tile = (label: string, href: string, joinLive: Nullable<{ params: string; videoId: string }> = null): { href: string; joinLive: typeof joinLive;
+    label: string; } => ({ href, joinLive, label });
+
+  test("resolves a restartable program's tile through its Join live endpoint", () => {
+
+    const channels = selectGuideChannels([tile("watch ESPN", "live", { params: "0gEEEgIwAQ%3D%3D", videoId: "PFuNFGzJDE4" })]);
+
+    assert.deepEqual(channels, [{ name: "ESPN", watchPath: "watch/PFuNFGzJDE4?vp=0gEEEgIwAQ%3D%3D" }]);
+  });
+
+  test("the network's own row owns its name, so events listed under that name never replace it", () => {
+
+    const channels = selectGuideChannels([
+      tile("watch ESPN", "live", { params: "0gEEEgIwAQ%3D%3D", videoId: "PFuNFGzJDE4" }),
+      tile("watch ESPN2", "watch/nIaQPNyNo34?vp=0gEEEgIwAQ%3D%3D"),
+      tile("watch ESPN", "watch/8gnK8oOnS-4?vp=0gEEEgIwAQ%3D%3D"),
+      tile("watch ESPN", "watch/TpDgOIYAwmU?vp=0gEEEgIwAQ%3D%3D"),
+      tile("watch ESPN", "browse/UCakwQ1jKQnYJcUMghvnp-Yw")
+    ]);
+
+    assert.deepEqual(channels, [
+      { name: "ESPN", watchPath: "watch/PFuNFGzJDE4?vp=0gEEEgIwAQ%3D%3D" },
+      { name: "ESPN2", watchPath: "watch/nIaQPNyNo34?vp=0gEEEgIwAQ%3D%3D" }
+    ]);
+  });
+
+  test("a network row that cannot be resolved still keeps its events from claiming the name", () => {
+
+    // A failed tune is something a DVR can fall back from. One of the network's events delivered as the network is not.
+    const channels = selectGuideChannels([ tile("watch ESPN", "live"), tile("watch ESPN", "watch/8gnK8oOnS-4?vp=0gEEEgIwAQ%3D%3D") ]);
+
+    assert.deepEqual(channels, []);
+  });
+
+  test("ignores info pages, premium add-ons, and tiles that are not watch endpoints", () => {
+
+    const channels = selectGuideChannels([ tile("watch Showtime", "live"), tile("watch Hallmark", "browse/UC123"), tile("info", "watch/x"),
+      tile("watch CNN", "watch/cnn") ]);
+
+    assert.deepEqual(channels, [{ name: "CNN", watchPath: "watch/cnn" }]);
+  });
+
+  test("names are claimed case-insensitively, matching the cache's keys", () => {
+
+    assert.deepEqual(selectGuideChannels([ tile("watch ESPNews", "watch/a"), tile("watch ESPNEWS", "watch/b") ]), [{ name: "ESPNews", watchPath: "watch/a" }]);
   });
 });
