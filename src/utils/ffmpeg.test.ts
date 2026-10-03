@@ -12,17 +12,21 @@
  *
  * 4. classifyFfmpegExit - the pure exit-code and signal classifier. Tested by calling it directly with synthetic (code, signal, label) combinations.
  *
- * The two spawner functions (spawnFFmpeg, spawnMpegTsRemuxer) drive real subprocesses and are not exercised here - they are thin wrappers around the spawn()
- * primitive plus the arg builders above. Their integration with the real FFmpeg binary belongs in e2e coverage.
+ * 5. spawnFFmpeg's kill() - the one spawner contract that cannot be read off the argv: a killed child must actually exit even when nothing ever read its output.
+ *    Exercised against a stand-in executable that behaves the way FFmpeg does on SIGTERM (flush a large tail of output, then exit), so the test needs a POSIX
+ *    shell and is skipped on Windows. Integration with the real FFmpeg binary otherwise belongs in e2e coverage.
  *
  * resolveFFmpegPath, resolvePrerollFFmpegPath, and isFFmpegAvailable are the production-cached singletons that probe the real filesystem; they offer no way for
  * tests to substitute their dependencies and take no parameters because their caching contract is intentionally sealed.
  */
-import { buildMpegTsRemuxerArgs, buildSpawnFFmpegArgs, classifyFfmpegExit, probeFFmpegPath, probePrerollFFmpegPath } from "./ffmpeg.ts";
+import { buildMpegTsRemuxerArgs, buildSpawnFFmpegArgs, classifyFfmpegExit, probeFFmpegPath, probePrerollFFmpegPath, spawnFFmpeg } from "./ffmpeg.ts";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { describe, test } from "node:test";
 import type { FFmpegContext } from "./ffmpeg.ts";
 import assert from "node:assert/strict";
 import { join } from "node:path";
+import { once } from "node:events";
+import { tmpdir } from "node:os";
 
 /* makeFFmpegContext builds an FFmpegContext literal with sensible defaults. probe results are driven by an existsSet (paths recorded as existing) and a
  * probeResults map (paths that should report success when probed). Tests override only the fields they care about. The default platform is "linux" with no
@@ -592,5 +596,54 @@ describe("buildMpegTsRemuxerArgs", () => {
     // The function is pure; consecutive calls produce structurally equal arrays. Tests assert this to lock the contract for production callers that may cache the
     // result locally.
     assert.deepEqual(buildMpegTsRemuxerArgs(), buildMpegTsRemuxerArgs());
+  });
+});
+
+describe("spawnFFmpeg kill", { skip: process.platform === "win32" }, () => {
+
+  /* A stand-in for FFmpeg's SIGTERM behavior: on the signal it writes a tail far larger than any pipe buffer, and only exits once that write completes. It
+   * announces on stderr once the trap is installed, so the test never signals a shell that has yet to arm it - a signal that early would take the default action
+   * and pass the test for the wrong reason.
+   */
+  const FAKE_FFMPEG = [
+    "#!/bin/sh",
+    "trap 'head -c 4194304 /dev/zero; exit 0' TERM",
+    "echo ready >&2",
+    "while :; do sleep 0.05; done"
+  ].join("\n") + "\n";
+
+  test("a child killed before anything read its output still exits", async () => {
+
+    const dir = await mkdtemp(join(tmpdir(), "prismcast-ffmpeg-test-"));
+
+    try {
+
+      const bin = join(dir, "ffmpeg");
+
+      await writeFile(bin, FAKE_FFMPEG);
+      await chmod(bin, 0o755);
+
+      const errors: Error[] = [];
+      const ffmpeg = spawnFFmpeg(bin, 256000, (error) => errors.push(error));
+      const exited = once(ffmpeg.process, "exit");
+
+      await once(ffmpeg.process.stderr!, "data");
+
+      // No consumer is ever attached to stdout - the shape of a tune that fails between the spawn and the segmenter being wired.
+      ffmpeg.kill();
+
+      const outcome = await Promise.race([ exited.then(() => "exited"), new Promise((resolve) => setTimeout(() => resolve("hung"), 5000).unref()) ]);
+
+      if(outcome === "hung") {
+
+        ffmpeg.process.kill("SIGKILL");
+      }
+
+      assert.equal(outcome, "exited");
+      assert.deepEqual(errors, []);
+    } finally {
+
+      await rm(dir, { force: true, recursive: true });
+    }
   });
 });

@@ -353,10 +353,18 @@ function spawnFFmpegProcess({ args, ffmpegBin, label, onError, streamId }: {
     onError(error);
   });
 
-  // Kill function for graceful shutdown. Sets the shuttingDown flag before sending SIGTERM so that any exit is treated as normal termination.
+  /* Kill function for graceful shutdown. Sets the shuttingDown flag before sending SIGTERM so that any exit is treated as normal termination.
+   *
+   * FFmpeg answers SIGTERM by finishing its output - flushing the audio encoder and writing the last fragment - and only then exits. That flush goes to stdout,
+   * so stdout has to be read for the exit to happen at all. A teardown that arrives before any consumer was attached (a tune that fails after the spawn but before
+   * the segmenter is wired) leaves stdout paused: Node stops reading once its buffer fills, FFmpeg blocks on the write, and the process lives forever. Draining
+   * here makes the exit independent of whoever was, or never was, reading. The output is unwanted by definition once teardown has been requested.
+   */
   const kill = (): void => {
 
     shuttingDown = true;
+
+    ffmpeg.stdout.resume();
 
     if(!ffmpeg.killed) {
 
