@@ -10,7 +10,7 @@ import type { NativeStreamIdentity, StreamRegistryEntry } from "./registry.ts";
 import type { Nullable, ResolvedSiteProfile, VideoState } from "../types/index.ts";
 import { RECOVERY_METHODS, checkCircuitBreaker, classifyNativeSegmentHealth, computeNextRecoveryLevel, createRecoveryMetrics, deriveStreamHealth,
   describeResolutionOutcome, formatIssueType, formatRecoveryDuration, getIssueCategory, getIssueDescription, getRecoveryMethod, isResolutionDegraded,
-  nextNativeIssueRecord, recordRecoveryAttempt, recordRecoverySuccess, resetCircuitBreaker, resolutionAreaRatio, shouldTriggerRecovery,
+  isUndersizedSegment,  nextNativeIssueRecord, recordRecoveryAttempt, recordRecoverySuccess, resetCircuitBreaker, resolutionAreaRatio, shouldTriggerRecovery,
   updateResolutionPeak } from "./recovery.ts";
 import type { StreamHealthStatus, StreamStatus } from "./statusEmitter.ts";
 import { applyNativeQualityRefresh, getLastSegmentHasVideo, getLastSegmentSize, getStream, getStreamMemoryUsage, getStreamSegmenter, isCaptureIdentity,
@@ -1659,8 +1659,9 @@ export function monitorPlaybackHealth(
       segmentState.lastSegmentAdvanceTime = now;
 
       const segmentSize = getLastSegmentSize(sizeCheckEntry) ?? 0;
+      const hasVideo = getLastSegmentHasVideo(sizeCheckEntry);
 
-      if(segmentSize < TINY_SEGMENT_THRESHOLD) {
+      if(isUndersizedSegment({ backend: CONFIG.streaming.captureBackend, hasVideo, size: segmentSize, threshold: TINY_SEGMENT_THRESHOLD })) {
 
         segmentState.consecutiveTinySegments++;
         segmentState.wasInTinyState = true;
@@ -1668,7 +1669,6 @@ export function monitorPlaybackHealth(
         // Check track composition to determine the effective threshold. Dead capture pipelines produce audio-only segments (hasVideo=false) and always use the
         // default count for fast detection. Segments with video trafs present use the service-specific threshold, which may be higher for services with extended
         // static content (e.g., Xfinity commercial placeholders lasting several minutes).
-        const hasVideo = getLastSegmentHasVideo(sizeCheckEntry);
         const effectiveThreshold = (hasVideo === false) ? TINY_SEGMENT_COUNT_TRIGGER : providerTinySegmentThreshold;
 
         LOG.debug("recovery:tracks", "Below-threshold segment: %d bytes, hasVideo=%s, consecutive=%d, threshold=%d.",
@@ -1699,10 +1699,8 @@ export function monitorPlaybackHealth(
         }
       } else {
 
-        // Valid segment size. Check for spontaneous recovery from tiny segment state.
+        // A segment that does not count toward the trigger. Check for spontaneous recovery from tiny segment state.
         if(segmentState.wasInTinyState) {
-
-          const hasVideo = getLastSegmentHasVideo(sizeCheckEntry);
 
           LOG.debug("recovery:segments", "Segment production self-healed (%d bytes, hasVideo=%s).", segmentSize, String(hasVideo));
         }

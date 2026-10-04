@@ -6,6 +6,7 @@ import type { Frame, Page } from "puppeteer-core";
 import type { Nullable, VideoState } from "../types/index.ts";
 import { CAPTURE_SOURCE_UNAVAILABLE_MESSAGE } from "../types/index.ts";
 import { CONFIG } from "../config/index.ts";
+import type { CaptureBackend } from "../types/config.ts";
 import type { StreamHealthStatus } from "./statusEmitter.ts";
 
 /* Recovery metrics are tracked throughout each stream's lifetime. The playback health monitor accumulates these counters during recovery attempts, and the
@@ -761,6 +762,34 @@ export function classifyNativeSegmentHealth(inputs: {
   }
 
   return { action: "none", health: "stalled", issueType: "segment stall" };
+}
+
+/**
+ * Decides whether a segment the capture pipeline just produced counts toward the tiny-segment trigger, the monitor's check for a capture that has died while the
+ * page plays on.
+ *
+ * A segment below the size threshold that carries no video is the dead-pipeline signature on every backend: the picture has stopped and only audio, or nothing,
+ * is arriving. A small segment that still carries video means something only when the encoder targets a bitrate. The extension backend's MediaRecorder does, so
+ * its segments stay near the preset's rate whatever is on screen, and one that falls far below it is a capture that has stopped producing pictures.
+ *
+ * The vaapi backend does not. Its encoder runs at a constant quantizer - the only rate control the hardware offers - so a segment's size follows the picture:
+ * a held scoreboard graphic, a slate, or a quiet studio shot encodes to a fraction of what motion does, comfortably below the threshold, for as long as it is held.
+ * The grab also delivers every frame whether or not the page repaints, so a capture that has frozen and a scene that is simply still produce the same stream and
+ * cannot be told apart by size at all. Counting them sends a healthy stream through a tab replacement whenever a broadcast holds a still picture for twenty
+ * seconds, and that replacement - the page reloading in the captured window - is what reaches the recording. A vaapi capture that genuinely dies stops the
+ * FFmpeg process that both grabs and encodes, which the segment-staleness check catches, so the only small segments that count here are those carrying no video.
+ * Pure and total.
+ * @param inputs - The capture backend, whether the segment carries video (null when the segmenter cannot say), its size in bytes, and the size threshold.
+ * @returns True when the segment counts toward the tiny-segment trigger.
+ */
+export function isUndersizedSegment(inputs: { backend: CaptureBackend; hasVideo: Nullable<boolean>; size: number; threshold: number }): boolean {
+
+  if(inputs.size >= inputs.threshold) {
+
+    return false;
+  }
+
+  return (inputs.backend !== "vaapi") || (inputs.hasVideo === false);
 }
 
 /**

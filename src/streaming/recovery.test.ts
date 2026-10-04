@@ -6,8 +6,8 @@
  */
 import { CAPTURE_PROBE_TIMEOUT_MESSAGE, STREAM_INIT_TIMEOUT_MESSAGE } from "./setup.ts";
 import { RECOVERY_METHODS, classifyNativeSegmentHealth, computeNextRecoveryLevel, deriveStreamHealth, describeResolutionOutcome, formatIssueType,
-  getIssueCategory, getIssueDescription, getRecoveryMethod, isCaptureInfrastructureError, isResolutionDegraded, nextNativeIssueRecord, resolutionAreaRatio,
-  shouldTriggerRecovery, updateResolutionPeak } from "./recovery.ts";
+  getIssueCategory, getIssueDescription, getRecoveryMethod, isCaptureInfrastructureError, isResolutionDegraded, isUndersizedSegment, nextNativeIssueRecord,
+  resolutionAreaRatio, shouldTriggerRecovery, updateResolutionPeak } from "./recovery.ts";
 import { TAB_NOT_FOUND_MESSAGE, TAB_NOT_SELECTED_MESSAGE } from "../browser/tabSelection.ts";
 import { describe, test } from "node:test";
 import { CaptureTurnTimeoutError } from "./captureLock.ts";
@@ -357,6 +357,34 @@ describe("computeNextRecoveryLevel", () => {
 
     assert.equal(computeNextRecoveryLevel({ currentEscalationLevel: 2, issueCategory: "buffering", sourceReloadAttempted: true }), 3);
     assert.equal(computeNextRecoveryLevel({ currentEscalationLevel: 2, issueCategory: "paused", sourceReloadAttempted: true }), 3);
+  });
+});
+
+describe("isUndersizedSegment", () => {
+
+  const threshold = 512000;
+
+  test("a segment at or above the threshold never counts, on either backend", () => {
+
+    for(const backend of [ "extension", "vaapi" ] as const) {
+
+      assert.equal(isUndersizedSegment({ backend, hasVideo: false, size: threshold, threshold }), false, backend + " at the threshold");
+      assert.equal(isUndersizedSegment({ backend, hasVideo: true, size: 2000000, threshold }), false, backend + " well above it");
+    }
+  });
+
+  test("a small segment counts on the extension backend whatever its tracks, because its encoder targets a bitrate", () => {
+
+    assert.equal(isUndersizedSegment({ backend: "extension", hasVideo: true, size: 150000, threshold }), true, "video-bearing");
+    assert.equal(isUndersizedSegment({ backend: "extension", hasVideo: false, size: 16, threshold }), true, "video-free");
+    assert.equal(isUndersizedSegment({ backend: "extension", hasVideo: null, size: 16, threshold }), true, "tracks unknown");
+  });
+
+  test("a small segment counts on the vaapi backend only when it carries no video, because its size follows the picture", () => {
+
+    assert.equal(isUndersizedSegment({ backend: "vaapi", hasVideo: true, size: 150000, threshold }), false, "a held picture");
+    assert.equal(isUndersizedSegment({ backend: "vaapi", hasVideo: null, size: 150000, threshold }), false, "tracks unknown");
+    assert.equal(isUndersizedSegment({ backend: "vaapi", hasVideo: false, size: 16, threshold }), true, "the dead-pipeline signature");
   });
 });
 

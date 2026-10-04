@@ -15,6 +15,7 @@ import { closePuppeteerStreamWssOnIdle, flushMicrotasks, makeFakePage } from "..
 import { makeNativeIdentity, makeRegistryEntry } from "./registry.helpers.ts";
 import { makePendingCaptureIdentity, registerStream, unregisterStream } from "./registry.ts";
 import { CONFIG } from "../config/index.ts";
+import type { CaptureBackend } from "../types/config.ts";
 import type { CaptureCodec } from "./codec.ts";
 import type { CaptureImpairment } from "../browser/browserSupervisor.ts";
 import type { CaptureSession } from "./captureSession.ts";
@@ -745,6 +746,97 @@ describe("monitorPlaybackHealth: a dead pipeline on a browser that can start no 
     assert.equal(countMessages(subjectMessages, TERMINATION_LINE), 0, "and terminated nothing, because the stream it would terminate has already ended");
     assert.equal(breaks, 0, "so the breaker was never reached");
     assert.equal(replacements, 0, "and no replacement was attempted");
+  });
+
+  /**
+   * Builds a segmenter double whose segment index advances on every read and whose segments are small but carry video, which is what a constant-quantizer
+   * encoder makes of a held picture: a scoreboard graphic or a slate encodes to a fraction of what motion does, with every frame still present.
+   * @returns The segmenter double.
+   */
+  function makeStillPictureSegmenter(): FMP4SegmenterResult {
+
+    let index = 0;
+
+    return {
+
+      getLastSegmentHasVideo: (): boolean => true,
+      getLastSegmentSize: (): number => 150000,
+      getSegmentIndex: (): number => ++index,
+      pipe: (): void => { /* Nothing consumes this double. */ },
+      stop: (): void => { /* Nothing to stop. */ }
+    } as unknown as FMP4SegmenterResult;
+  }
+
+  /**
+   * Monitors a stream on the supplied backend for long enough that the tiny-segment trigger would fire several times over if its segments counted, and reports what
+   * the monitor did. The drive stops on the first termination, so a row that expects one reads it at the tick it landed.
+   * @param t - The row's test context.
+   * @param backend - The capture backend the configuration names for the run.
+   * @param numericStreamId - The id the monitor and registry agree on.
+   * @param segmenter - The segmenter double the session exposes.
+   * @returns The counts the rows assert on.
+   */
+  async function runOnBackend(t: TestContext, backend: CaptureBackend, numericStreamId: number,
+    segmenter: FMP4SegmenterResult): Promise<{ breaks: number; detections: number; terminations: number }> {
+
+    const originalBackend = CONFIG.streaming.captureBackend;
+
+    CONFIG.streaming.captureBackend = backend;
+
+    try {
+
+      const clock = new TestClock();
+
+      registerCapturing(numericStreamId, segmenter);
+
+      const messages = captureLogs(t);
+      const fake = makeFakePage({ clock });
+
+      let breaks = 0;
+
+      handle = monitorPlaybackHealth(fake.page, fake.page, makeProfile(), "https://two-phase.test/watch", "backend-" + String(numericStreamId),
+        streamInfo(numericStreamId, clock), (): void => { breaks++; }, async (): Promise<Nullable<TabReplacementResult>> => null, makeMarkedDeps(clock));
+
+      for(let tick = 0; (tick < 80) && (countMessages(messages, TERMINATION_LINE) === 0); tick++) {
+
+        // Sequential by definition: the trigger's own state advances one tick at a time.
+        // eslint-disable-next-line no-await-in-loop
+        await driveHealthyTicks(clock, fake, 1);
+      }
+
+      return { breaks, detections: countMessages(messages, "Detected"), terminations: countMessages(messages, TERMINATION_LINE) };
+    } finally {
+
+      CONFIG.streaming.captureBackend = originalBackend;
+    }
+  }
+
+  test("a held picture on the vaapi backend is not a dead pipeline", async (t) => {
+
+    /* Eighty ticks of small, video-bearing segments: eight times the count the trigger needs. On the vaapi backend a segment's size follows the picture, so none of
+     * them counts, and the stream runs on untouched - no warning, no breaker, no termination.
+     */
+    const outcome = await runOnBackend(t, "vaapi", 9330, makeStillPictureSegmenter());
+
+    assert.deepEqual(outcome, { breaks: 0, detections: 0, terminations: 0 }, "the monitor left the stream alone");
+  });
+
+  test("the same segments on the extension backend still reach the trigger", async (t) => {
+
+    /* The control that keeps the row above meaningful. The double and the drive are identical and the backend is the only difference: a bitrate-targeted encoder
+     * producing segments this small has stopped producing pictures, so the trigger fires and, on a browser that can start no replacement, terminates.
+     */
+    const outcome = await runOnBackend(t, "extension", 9331, makeStillPictureSegmenter());
+
+    assert.deepEqual(outcome, { breaks: 1, detections: 1, terminations: 1 }, "the trigger fired once and terminated the stream");
+  });
+
+  test("video-free segments on the vaapi backend still reach the trigger", async (t) => {
+
+    // The dead-pipeline signature does not depend on the encoder: segments with no video in them mean the picture has stopped on every backend.
+    const outcome = await runOnBackend(t, "vaapi", 9332, makeStarvingSegmenter());
+
+    assert.deepEqual(outcome, { breaks: 1, detections: 1, terminations: 1 }, "the trigger fired once and terminated the stream");
   });
 });
 
