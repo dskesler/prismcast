@@ -98,12 +98,24 @@ export function getPrerollSegmentDuration(codec: CaptureCodec, index: number): n
 }
 
 /**
- * Returns the total duration of all preroll segments in seconds. Used by the fmp4Segmenter to compute PTS offsets that make Chrome's real content timestamps continue
- * from where the preroll ended, eliminating the PTS discontinuity at the preroll-to-live boundary.
+ * Returns the total duration of all preroll segments in seconds.
  * @param codec - The preroll codec variant.
  * @returns The sum of all preroll segment durations in seconds.
  */
 export function getPrerollTotalDurationSec(codec: CaptureCodec): number {
+
+  return getPrerollLeadingDurationSec(codec, Infinity);
+}
+
+/**
+ * Returns the duration of the first count preroll segments in seconds - the media time a client has played once it has played those segments. Used by the
+ * fmp4Segmenter to compute PTS offsets that make Chrome's real content timestamps continue from where the preroll the client saw ended, eliminating the PTS
+ * discontinuity at the preroll-to-live boundary.
+ * @param codec - The preroll codec variant.
+ * @param count - How many leading segments to sum. Counts past the end sum the whole preroll.
+ * @returns The sum of the leading preroll segment durations in seconds.
+ */
+export function getPrerollLeadingDurationSec(codec: CaptureCodec, count: number): number {
 
   const variant = prerollVariants.get(codec);
 
@@ -114,7 +126,7 @@ export function getPrerollTotalDurationSec(codec: CaptureCodec): number {
 
   let total = 0;
 
-  for(const duration of variant.durations) {
+  for(const duration of variant.durations.slice(0, count)) {
 
     total += duration;
   }
@@ -482,9 +494,11 @@ function splitPrerollBuffers(data: Buffer): Nullable<PrerollVariant> {
 
 // Preroll Compositor.
 
-// Maximum number of preroll entries allowed in a composite playlist window. When the composite playlist first appears, the client may be mid-stream in the progressive
-// preroll playlist at a low segment index. Limiting preroll entries forces MEDIA-SEQUENCE past the client's current position, causing it to seek forward to near the
-// live edge rather than playing through many seconds of remaining preroll before reaching real content.
+// Maximum number of preroll entries allowed in a composite playlist window, so a client joining at the transition starts near the live edge rather than playing
+// through seconds of black first. The cap must never place MEDIA-SEQUENCE past a client already polling the progressive preroll: a playlist that skips sequence
+// numbers the client is waiting for reads as a stream reset, and Channels DVR's recorder abandons the recording on it ("Playlist skipped to a higher sequence").
+// Capture-mode streams satisfy that by numbering real content right after the preroll clients were shown (claimPrerollBoundary), which leaves a polling client at
+// most a segment or so behind the boundary - well inside this cap.
 const MAX_PREROLL_IN_WINDOW = 3;
 
 /**
@@ -659,6 +673,10 @@ export interface PrerollPlaylistOptions extends ProgressiveRevealOptions {
   // The server's external URL (e.g., "http://192.168.1.100:5589").
   readonly baseUrl: string;
 
+  // The most segments to reveal, whatever the elapsed time. Set once real content has claimed the boundary, so the preroll stops growing into the index the first
+  // real segment occupies. Absent, the reveal follows elapsed time alone.
+  readonly revealLimit?: number;
+
   // The MEDIA-SEQUENCE offset. Zero for fresh starts. For resume streams, this is the saved segment index so the preroll playlist continues from the prior
   // session's sequence range rather than restarting at 0.
   readonly startingSequence: number;
@@ -682,7 +700,7 @@ export interface PrerollPlaylistOptions extends ProgressiveRevealOptions {
  */
 export function generatePrerollPlaylist(options: PrerollPlaylistOptions): string {
 
-  const { baseUrl, codec, startingSequence } = options;
+  const { baseUrl, codec, revealLimit = Infinity, startingSequence } = options;
 
   if(!isPrerollReady(codec)) {
 
@@ -690,7 +708,7 @@ export function generatePrerollPlaylist(options: PrerollPlaylistOptions): string
   }
 
   // The wider object satisfies the narrower reveal options, so the two instants reach the reveal math under their own names.
-  const revealCount = computeProgressiveReveal(options);
+  const revealCount = Math.min(computeProgressiveReveal(options), revealLimit);
   const entries = buildPrerollEntries({ baseUrl, codec, extension: ".m4s", prerollSegmentCount: revealCount, startIndex: 0 });
 
   return buildPlaylist({

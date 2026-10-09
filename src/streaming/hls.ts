@@ -11,10 +11,10 @@ import { StreamSetupError, createPageWithCapture, generateStreamId, reestablishC
 import { applyNativeQualityRefresh, cancelPrerollTimer, createHLSState, getAllStreams, getNextStreamId, getStream, getStreamCount, isCaptureIdentity,
   makePendingCaptureIdentity, registerStream, updateLastAccess } from "./registry.ts";
 import { buildProbeCacheStamp, clearProbeCache } from "../native/probe.ts";
+import { computeProgressiveReveal, generatePrerollPlaylist, getPrerollCodec, getPrerollSegmentCount, isPrerollReady } from "./preroll.ts";
 import { createInitialStreamStatus, emitStreamAdded } from "./statusEmitter.ts";
 import { deleteResumeData, getResumeSegmentIndex, peekResumeData } from "./hlsResume.ts";
 import { emitCurrentSystemStatus, isLoginModeActive, syncWindowVisibility, unregisterManagedPage } from "../browser/index.ts";
-import { generatePrerollPlaylist, getPrerollCodec, getPrerollSegmentCount, isPrerollReady } from "./preroll.ts";
 import { getAllChannels, getChannelLogo, isPredefinedChannelDisabled } from "../config/userChannels.ts";
 import { getAudioPlaylist, getAudioSegment, getInitSegment, getNamedInitSegment, getPlaylist, getSegment, getVideoPlaylist,
   waitForPlaylist } from "./hlsSegments.ts";
@@ -690,8 +690,17 @@ async function sendPlaylistResponse(streamId: number, clientAddress: string, res
 
     if(stream.hls.prerollBaseUrl && stream.hls.prerollCodec && (stream.hls.prerollStartTime !== null)) {
 
-      playlist = generatePrerollPlaylist({ baseUrl: stream.hls.prerollBaseUrl, codec: stream.hls.prerollCodec, now,
-        prerollStartTime: stream.hls.prerollStartTime, startingSequence: stream.hls.resumeSegmentIndex });
+      const prerollOptions = { baseUrl: stream.hls.prerollBaseUrl, codec: stream.hls.prerollCodec, now, prerollStartTime: stream.hls.prerollStartTime,
+        startingSequence: stream.hls.resumeSegmentIndex };
+
+      // Record how far this serve reveals, which is where real content will be numbered from - unless real content has already claimed the boundary, in which
+      // case the reveal holds there so no client is shown a preroll segment whose index the first real segment occupies.
+      if(!stream.hls.prerollClaimed) {
+
+        stream.hls.prerollRevealedCount = Math.max(stream.hls.prerollRevealedCount, computeProgressiveReveal(prerollOptions));
+      }
+
+      playlist = generatePrerollPlaylist({ ...prerollOptions, revealLimit: stream.hls.prerollRevealedCount });
     }
 
     LOG.debug("streaming:preroll", "Serving preroll playlist for stream %d.", streamId);
@@ -1188,6 +1197,7 @@ function registerPendingStream(channelName: string, channel: ResolvedChannel, cl
       const firedAt = systemClock.now();
 
       hls.prerollStartTime = firedAt;
+      hls.prerollRevealedCount = computeProgressiveReveal({ codec, now: firedAt, prerollStartTime: firedAt });
       hls.playlist = generatePrerollPlaylist({ baseUrl, codec, now: firedAt, prerollStartTime: firedAt, startingSequence: hls.resumeSegmentIndex });
       hls.signalPlaylistReady();
     }, PREROLL_DELAY_MS);

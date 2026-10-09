@@ -12,7 +12,7 @@ import type { KeyframeStats, SessionStats } from "./fmp4Segmenter.ts";
 import { afterEach, beforeEach, describe, mock, test } from "node:test";
 import { computeDiscontinuitySequence, createFMP4Segmenter, formatKeyframeStatsSummary, formatSessionStatsSummary, pruneDiscontinuityIndices } from "./fmp4Segmenter.ts";
 import { getInitSegment, getPlaylist, getSegment, getSegmentCount } from "./hlsSegments.ts";
-import { registerStream, unregisterStream } from "./registry.ts";
+import { getStream, registerStream, unregisterStream } from "./registry.ts";
 import { CONFIG } from "../config/index.ts";
 import { LOG } from "../utils/index.ts";
 import { PassThrough } from "node:stream";
@@ -918,5 +918,125 @@ describe("createFMP4Segmenter", () => {
     assert.equal(snapshot.startingInitVersion, 9);
     assert.deepEqual(snapshot.priorSessionStats, segmenter.getSessionStats(), "the snapshot's statistics are the segmenter's own");
     assert.notEqual(snapshot.priorSessionStats, segmenter.getSessionStats(), "handed over as a copy, so a successor cannot mutate this segmenter's state");
+  });
+});
+
+/* The preroll-to-live boundary. A client polling the progressive preroll playlist has been shown preroll segments [0, n) and next asks for sequence n, so the first
+ * real segment must take index n: numbering it after the whole generated preroll makes the composite playlist jump past sequences the client is waiting for, and
+ * Channels DVR's recorder abandons the recording on "Playlist skipped to a higher sequence (4 -> 12)". Each row registers a stream whose preroll timer has (or has
+ * not) fired with a given reveal, constructs the segmenter the way createCaptureSegmenter does - provisionally numbered after the whole preroll - and drives the
+ * first real segment out.
+ */
+describe("createFMP4Segmenter preroll boundary", () => {
+
+  const PREROLL_BASE_URL = "http://prismcast.test:5589";
+  const PREROLL_LENGTH = 15;
+
+  let streamId: number;
+
+  beforeEach(() => {
+
+    ({ streamId } = makeAndRegisterStream());
+  });
+
+  afterEach(() => {
+
+    unregisterStream(streamId);
+  });
+
+  /* drivePrerollStream seeds the stream's preroll state, then emits the first real segment through a segmenter constructed with the full preroll length, and
+   * returns the stored playlist with its MEDIA-SEQUENCE and segment URIs pulled out for the assertions.
+   */
+  function drivePrerollStream(options: { base?: number; revealed: number; timerFired: boolean }): { mediaSequence: number; playlist: string; uris: string[] } {
+
+    const hls = getStream(streamId)?.hls;
+
+    assert.ok(hls, "the stream is registered");
+
+    hls.prerollBaseUrl = PREROLL_BASE_URL;
+    hls.prerollCodec = "h264";
+    hls.prerollSegmentCount = PREROLL_LENGTH;
+    hls.prerollStartTime = options.timerFired ? 1000 : null;
+    hls.prerollRevealedCount = options.timerFired ? options.revealed : 0;
+
+    const base = options.base ?? 0;
+    const segmenter = createFMP4Segmenter({
+
+      continuity: { startingSegmentIndex: base + PREROLL_LENGTH },
+      onError: mock.fn(),
+      onStop: mock.fn(),
+      pendingDiscontinuity: true,
+      prerollBaseUrl: PREROLL_BASE_URL,
+      prerollCodec: "h264",
+      prerollSegmentCount: PREROLL_LENGTH,
+      streamId
+    });
+    const readable = new PassThrough();
+
+    segmenter.pipe(readable);
+
+    readable.write(makeFtyp());
+    readable.write(makeMoov());
+    readable.write(makeTestMoof());
+    readable.write(makeMdat("first-real"));
+    readable.write(makeTestMoof());
+
+    const playlist = getPlaylist(streamId) ?? "";
+    const mediaSequence = Number(/#EXT-X-MEDIA-SEQUENCE:(\d+)/.exec(playlist)?.[1]);
+    const uris = playlist.split("\n").filter((line) => (line.length > 0) && !line.startsWith("#"));
+
+    return { mediaSequence, playlist, uris };
+  }
+
+  test("numbers the first real segment right after the preroll a client was shown, so the playlist never skips the sequence it waits for", () => {
+
+    // The recorded failure: the tune completed a moment after the preroll timer fired, so the client had been shown segments 0-3 and asked next for 4.
+    const { mediaSequence, uris } = drivePrerollStream({ revealed: 4, timerFired: true });
+
+    assert.ok(getSegment(streamId, "segment4.m4s"), "the first real segment takes index 4, the next sequence the client asks for");
+    assert.ok(mediaSequence <= 4, "MEDIA-SEQUENCE " + String(mediaSequence) + " does not skip past the client's next sequence (4)");
+    const prerollUri = (index: number): string => PREROLL_BASE_URL + "/preroll/h264/segment" + String(index) + ".m4s";
+
+    assert.deepEqual(uris, [ prerollUri(1), prerollUri(2), prerollUri(3), "segment4.m4s" ],
+      "the window holds the trailing preroll the client saw, then the first real segment");
+    assert.equal(getStream(streamId)?.hls.prerollClaimed, true, "the boundary is claimed, freezing the progressive reveal");
+  });
+
+  test("continues the real timeline in sequence from the prior session's index on a resumed stream", () => {
+
+    const { mediaSequence, uris } = drivePrerollStream({ base: 100, revealed: 4, timerFired: true });
+
+    assert.ok(getSegment(streamId, "segment104.m4s"), "the first real segment follows the resumed preroll the client was shown (sequences 100-103)");
+    assert.equal(mediaSequence, 101, "the window starts at the resumed sequence range, not at the preroll's file indices");
+    assert.equal(uris[0], PREROLL_BASE_URL + "/preroll/h264/segment1.m4s", "the preroll entry for sequence 101 is preroll file 1");
+    assert.equal(uris.at(-1), "segment104.m4s");
+  });
+
+  test("keeps the full preroll ahead of real content when the tune outlasted the whole preroll", () => {
+
+    const { mediaSequence, uris } = drivePrerollStream({ revealed: PREROLL_LENGTH, timerFired: true });
+
+    assert.ok(getSegment(streamId, "segment15.m4s"), "every preroll segment was shown, so real content follows all of them");
+    assert.equal(mediaSequence, 12, "the preroll cap still trims the window to the last three preroll entries");
+    assert.equal(uris.length, 4);
+  });
+
+  test("starts real content at the base index with no preroll entries when the preroll timer never fired, and disarms the timer", () => {
+
+    const hls = getStream(streamId)?.hls;
+    const dispose = mock.fn();
+
+    assert.ok(hls, "the stream is registered");
+
+    hls.prerollTimer = { [Symbol.dispose]: dispose };
+
+    const { mediaSequence, playlist, uris } = drivePrerollStream({ revealed: 0, timerFired: false });
+
+    assert.ok(getSegment(streamId, "segment0.m4s"), "no preroll was shown, so real content owns sequence 0");
+    assert.equal(mediaSequence, 0);
+    assert.deepEqual(uris, ["segment0.m4s"]);
+    assert.doesNotMatch(playlist, /preroll/, "no preroll entries in the window");
+    assert.equal(dispose.mock.calls.length, 1, "the pending preroll timer is disarmed so it cannot start a preroll real content already overtook");
+    assert.equal(hls.prerollTimer, null);
   });
 });

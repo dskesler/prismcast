@@ -2,7 +2,8 @@
  *
  * fmp4Segmenter.ts: fMP4 HLS segmentation for PrismCast.
  */
-import { buildPrerollEntries, computePrerollWindow, getPrerollTotalDurationSec } from "./preroll.ts";
+import { buildPrerollEntries, computePrerollWindow, getPrerollLeadingDurationSec } from "./preroll.ts";
+import { claimPrerollBoundary, getStream } from "./registry.ts";
 import { createMP4BoxParser, detectMoofKeyframe, offsetMoofTimestamps, parseMoovCodecConfig, parseMoovTrackInfo } from "./mp4Parser.ts";
 import { getSegmentCount, storeInitSegment, storeSegment, updatePlaylist } from "./hlsSegments.ts";
 import { CONFIG } from "../config/index.ts";
@@ -14,7 +15,6 @@ import type { Nullable } from "../types/index.ts";
 import type { PlaylistSegmentEntry } from "./playlistBuilder.ts";
 import type { Readable } from "node:stream";
 import { buildPlaylist } from "./playlistBuilder.ts";
-import { getStream } from "./registry.ts";
 import { systemClock } from "homebridge-plugin-utils";
 
 /* This module transforms a puppeteer-stream MP4 capture into HLS fMP4 segments. The overall flow is: (1) receive MP4 data from puppeteer-stream (the configured
@@ -271,12 +271,16 @@ interface SegmenterState {
   // modified - the preroll content is generated once at startup and shared across all streams.
   readonly prerollBaseUrl: Nullable<string>;
 
+  // The segment index preroll segment 0 occupies: zero on a fresh stream, the prior session's index on a resume, matching the progressive preroll playlist's
+  // MEDIA-SEQUENCE offset. Preroll segment n is at index prerollBaseIndex + n and real content begins at prerollBaseIndex + prerollSegmentCount.
+  readonly prerollBaseIndex: number;
+
   // The preroll codec variant for this segmenter's composite playlist. Used for duration lookups and URL path construction.
   readonly prerollCodec: CaptureCodec;
 
-  // Number of preroll segments preceding this segmenter's real content. When non-zero, generatePlaylist() includes preroll entries for indices below this value that
-  // are still within the sliding window. Set at construction and never modified.
-  readonly prerollSegmentCount: number;
+  // Number of preroll segments preceding this segmenter's real content. When non-zero, generatePlaylist() includes preroll entries for those indices that are still
+  // within the sliding window. Constructed as the full preroll length, then settled when the init segment arrives to the count clients were actually shown.
+  prerollSegmentCount: number;
 
   // Actual media-time durations for each segment in seconds, computed from accumulated trun sample durations divided by the track timescale. Falls back to wall-clock
   // time when media-time data is unavailable (e.g., moov timescale parsing failed). Used by generatePlaylist() for accurate #EXTINF values. Pruned to keep only
@@ -537,6 +541,7 @@ export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4Segmente
     nonKeyframeCount: 0,
     normalizedReferencePositionSec: null,
     pendingDiscontinuity: pendingDiscontinuity ?? false,
+    prerollBaseIndex: (startingSegmentIndex ?? 0) - (prerollSegmentCount ?? 0),
     prerollBaseUrl: prerollBaseUrl ?? null,
     prerollCodec: prerollCodec ?? "h264",
     prerollSegmentCount: prerollSegmentCount ?? 0,
@@ -592,9 +597,10 @@ export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4Segmente
 
     if(prerollActive) {
 
-      startIndex = computePrerollWindow({
+      // The compositor works in preroll-relative indices, so a resumed stream's base offset comes off before the window is computed and goes back on after.
+      startIndex = state.prerollBaseIndex + computePrerollWindow({
 
-        currentSegmentIndex: state.segmentIndex,
+        currentSegmentIndex: state.segmentIndex - state.prerollBaseIndex,
         maxSegments: CONFIG.hls.maxSegments,
         prerollSegmentCount: state.prerollSegmentCount,
         realSegmentCount
@@ -607,17 +613,19 @@ export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4Segmente
     // Build preroll entries for preroll indices still in the window. Only included when the deferred preroll timer has fired and the client is watching preroll.
     let prerollEntries: PlaylistSegmentEntry[] = [];
 
-    if(prerollActive && state.prerollBaseUrl && (startIndex < state.prerollSegmentCount)) {
+    const realBoundaryIndex = state.prerollBaseIndex + state.prerollSegmentCount;
+
+    if(prerollActive && state.prerollBaseUrl && (startIndex < realBoundaryIndex)) {
 
       prerollEntries = buildPrerollEntries({ baseUrl: state.prerollBaseUrl, codec: state.prerollCodec, extension: ".m4s", prerollSegmentCount: state.prerollSegmentCount,
-        startIndex });
+        startIndex: startIndex - state.prerollBaseIndex });
     }
 
     // Build real segment entries from the segmenter's state. Each entry carries its duration, optional discontinuity marker with init re-emission, and wall-clock
     // timestamp for PROGRAM-DATE-TIME. The real range starts at either the window start (when no preroll) or the preroll segment count (when preroll entries cover
     // the earlier indices).
     const realEntries: PlaylistSegmentEntry[] = [];
-    const realStartIndex = Math.max(startIndex, state.prerollSegmentCount);
+    const realStartIndex = Math.max(startIndex, realBoundaryIndex);
 
     for(let i = realStartIndex; i < state.segmentIndex; i++) {
 
@@ -1012,14 +1020,26 @@ export function createFMP4Segmenter(options: FMP4SegmenterOptions): FMP4Segmente
             }
           }
 
-          // When preroll is active, override the normalized reference position with the total preroll duration in seconds. This makes Chrome's real content PTS
-          // continue from where the preroll ended, eliminating the PTS discontinuity at the preroll-to-live boundary. Without this, Chrome's MediaRecorder starts at
-          // PTS 0, causing CDVR's remuxer to detect a PTS reset and apply a sentinel pts_offset (1152921504606840.75) that breaks the Apple TV's timeline display.
-          // With continuous PTS, the remuxer sees smooth progression and computes a normal offset. This overrides any resume-based reference because the new session's
-          // preroll PTS timeline takes precedence over the old session's timestamps.
+          // Real content has begun, so settle the preroll-to-live boundary at the preroll clients were actually shown. Real segments were provisionally numbered
+          // after the whole preroll, but a client that has seen only part of it waits for the next preroll index, and a playlist that jumps past that index reads as
+          // a stream reset - Channels DVR's recorder abandons the recording on "Playlist skipped to a higher sequence". This runs before any segment is output, so
+          // renumbering moves nothing that a client has seen. A segmenter whose stream is no longer registered keeps the provisional numbering.
+          const prerollStream = (state.prerollSegmentCount > 0) ? getStream(streamId) : undefined;
+
+          if(prerollStream) {
+
+            state.prerollSegmentCount = Math.min(state.prerollSegmentCount, claimPrerollBoundary(prerollStream.hls));
+            state.segmentIndex = state.prerollBaseIndex + state.prerollSegmentCount;
+          }
+
+          // When preroll is active, override the normalized reference position with the duration of the preroll clients were shown. This makes Chrome's real
+          // content PTS continue from where that preroll ended, eliminating the PTS discontinuity at the preroll-to-live boundary. Without this, Chrome's
+          // MediaRecorder starts at PTS 0, causing CDVR's remuxer to detect a PTS reset and apply a sentinel pts_offset (1152921504606840.75) that breaks the Apple
+          // TV's timeline display. With continuous PTS, the remuxer sees smooth progression and computes a normal offset. This overrides any resume-based reference
+          // because the new session's preroll PTS timeline takes precedence over the old session's timestamps.
           if(state.prerollSegmentCount > 0) {
 
-            state.normalizedReferencePositionSec = getPrerollTotalDurationSec(state.prerollCodec);
+            state.normalizedReferencePositionSec = getPrerollLeadingDurationSec(state.prerollCodec, state.prerollSegmentCount);
           }
 
           // Suppress the discontinuity marker when codec parameters are unchanged (byte-identical init). This avoids an unnecessary decoder flush on the client.

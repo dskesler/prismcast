@@ -147,11 +147,19 @@ export interface HLSState {
   // The base URL for constructing absolute preroll segment URIs in the composite playlist (e.g., "http://192.168.1.100:5589"). Null when no preroll is active.
   prerollBaseUrl: Nullable<string>;
 
+  // Whether real content has claimed the preroll-to-live boundary (see claimPrerollBoundary). Once claimed, the progressive preroll playlist stops revealing new
+  // segments, because the segment that would have been revealed next is the index the first real segment now occupies.
+  prerollClaimed: boolean;
+
   // The preroll codec variant for this stream. Determines which preroll variant is served and referenced in playlists. Null when no preroll is active.
   prerollCodec: Nullable<CaptureCodec>;
 
-  // Number of preroll segments that precede real content. Zero when no preroll is active. The segmenter uses this to know which indices in the playlist sliding
-  // window are preroll entries vs real entries.
+  // The most preroll segments any served preroll playlist has listed. A client's next expected media sequence can never be past this count, so it is the index the
+  // first real segment takes: a later boundary would skip sequence numbers the client is waiting for, which Channels DVR's recorder treats as a transcoder reset.
+  prerollRevealedCount: number;
+
+  // Number of preroll segments generated for this stream's codec, which bounds how far the progressive reveal can run. Zero when no preroll is active. The first
+  // real segment follows only the segments clients were shown (prerollRevealedCount), which is this count only when a tune outlasts the whole preroll.
   prerollSegmentCount: number;
 
   // The epoch millisecond instant the preroll timer fired and the progressive preroll playlist began. Compared against the instant of each playlist poll so the
@@ -511,7 +519,9 @@ export function createHLSState(): HLSState {
     playlist: "",
     playlistReady,
     prerollBaseUrl: null,
+    prerollClaimed: false,
     prerollCodec: null,
+    prerollRevealedCount: 0,
     prerollSegmentCount: 0,
     prerollStartTime: null,
     prerollTimer: null,
@@ -528,9 +538,9 @@ export function createHLSState(): HLSState {
 
 /**
  * Disarms a stream's deferred preroll timer and clears the handle. This is the single disarm point for the preroll timer: every path that invalidates preroll state -
- * the first real playlist arriving (updatePlaylist in hlsSegments.ts), a native-mode commit that nulls the preroll fields (startNativeProxy in hls.ts), and stream
- * teardown (terminateStream in lifecycle.ts) - routes through here so the timer can never fire against state that has already moved on. Safe to call when no timer is
- * armed: the handle is already null and the call is a no-op.
+ * the first real playlist arriving (updatePlaylist in hlsSegments.ts), a capture segmenter claiming the boundary (claimPrerollBoundary), a native-mode commit
+ * that nulls the preroll fields (startNativeProxy in hls.ts), and stream teardown (terminateStream in lifecycle.ts) - routes through here so the timer can never
+ * fire against state that has already moved on. Safe to call when no timer is armed: the handle is already null and the call is a no-op.
  * @param hls - The HLS state whose preroll timer to disarm.
  */
 export function cancelPrerollTimer(hls: HLSState): void {
@@ -540,6 +550,22 @@ export function cancelPrerollTimer(hls: HLSState): void {
     hls.prerollTimer[Symbol.dispose]();
     hls.prerollTimer = null;
   }
+}
+
+/**
+ * Claims the preroll-to-live boundary for a stream whose real content has just begun, and returns how many preroll segments precede it. The answer is the number of
+ * preroll segments clients have actually been shown, not the number generated: a client that has seen segments [0, n) next asks for sequence n, and real content
+ * numbered anywhere past n reads to it as a playlist that skipped ahead. Claiming freezes the progressive reveal at that count, and disarms a preroll timer that has
+ * not yet fired so it cannot begin a preroll the real content has already overtaken. A stream whose timer never fired has shown no preroll and claims zero.
+ * @param hls - The HLS state of the stream whose real content has begun.
+ * @returns The number of preroll segments that precede the first real segment.
+ */
+export function claimPrerollBoundary(hls: HLSState): number {
+
+  cancelPrerollTimer(hls);
+  hls.prerollClaimed = true;
+
+  return (hls.prerollStartTime === null) ? 0 : hls.prerollRevealedCount;
 }
 
 // Memory Usage.

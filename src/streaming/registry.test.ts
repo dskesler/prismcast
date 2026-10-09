@@ -6,9 +6,9 @@
  * arithmetic in getStreamMemoryUsage, the capture-activity predicate the browser window's visibility policy reads, the established-stream predicate the impaired
  * browser's relaunch waits on, and the shape of a freshly-minted HLSState.
  */
-import { applyNativeQualityRefresh, cancelPrerollTimer, createHLSState, getAllStreams, getLastSegmentHasVideo, getLastSegmentSize, getNextStreamId, getStream,
-  getStreamCount, getStreamMemoryUsage, getTotalSegmentMemory, hasActiveCaptureStreams, hasEstablishedStreams, makePendingCaptureIdentity, registerStream,
-  unregisterStream, updateLastAccess } from "./registry.ts";
+import { applyNativeQualityRefresh, cancelPrerollTimer, claimPrerollBoundary, createHLSState, getAllStreams, getLastSegmentHasVideo, getLastSegmentSize,
+  getNextStreamId, getStream, getStreamCount, getStreamMemoryUsage, getTotalSegmentMemory, hasActiveCaptureStreams, hasEstablishedStreams, makePendingCaptureIdentity,
+  registerStream, unregisterStream, updateLastAccess } from "./registry.ts";
 import { beforeEach, describe, test } from "node:test";
 import { makeNativeIdentity, makeRegistryEntry } from "./registry.helpers.ts";
 import type { FMP4SegmenterResult } from "./fmp4Segmenter.ts";
@@ -508,6 +508,44 @@ describe("cancelPrerollTimer", () => {
     });
 
     assert.equal(state.prerollTimer, null, "the handle stays null after a no-op cancel");
+  });
+});
+
+describe("claimPrerollBoundary", () => {
+
+  test("answers the count of preroll segments clients were shown once the preroll has begun, and marks the boundary claimed", () => {
+
+    const state = createHLSState();
+
+    state.prerollSegmentCount = 15;
+    state.prerollStartTime = 1000;
+    state.prerollRevealedCount = 6;
+
+    assert.equal(claimPrerollBoundary(state), 6, "real content follows the six segments shown, not the fifteen generated");
+    assert.equal(state.prerollClaimed, true, "claiming freezes the progressive reveal");
+  });
+
+  test("answers zero and disarms the pending timer when real content beats the preroll", () => {
+
+    // A tune that finishes inside the preroll delay has shown nothing, so real content owns the first index - and the timer must not fire afterward and start a
+    // preroll that would reuse the indices real content already holds.
+    const clock = new TestClock();
+    const state = createHLSState();
+
+    let fired = false;
+
+    state.prerollSegmentCount = 15;
+    state.prerollTimer = clock.schedule(() => {
+
+      fired = true;
+    }, 20);
+
+    assert.equal(claimPrerollBoundary(state), 0);
+
+    clock.advance(60);
+
+    assert.equal(fired, false, "the pending preroll never starts");
+    assert.equal(state.prerollTimer, null);
   });
 });
 
